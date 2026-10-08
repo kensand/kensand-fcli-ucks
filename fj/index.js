@@ -142,42 +142,141 @@ function daemonCall(req, socketPath) {
   });
 }
 
-/** Resolve a token: --token > FORGEJO_TOKEN > creds (host-keyed). When no flag
- *  or env token is set, uses credsApi.wait() to block up to `timeout` ms for the
- *  cred to be supplied in another terminal (also waits for unlock). The cred
- *  name is the base-URL host as-is (e.g. `forgejo.kensand.net`), with a
- *  port-stripped fallback when the host includes a port. */
-async function resolveToken(flagToken, base, credsApi, timeout) {
+/** True when the creds daemon is up with time left on its ttl.
+ *
+ * Reads the lockfile the creds uck writes (~/.f/.creds-daemon: {pid, start,
+ * ttl, socket}) rather than asking the daemon, so this is a file read plus a
+ * liveness check and never blocks. Same three conditions the creds uck itself
+ * applies in unlockedState(): a live pid, and a ttl that has not elapsed. */
+function credsUnlocked() {
+  let lf;
+  try {
+    lf = JSON.parse(fs.readFileSync(path.join(F, ".creds-daemon"), "utf8"));
+  } catch {
+    return null;
+  }
+  if (!lf || !lf.pid || !lf.start || !lf.ttl) return null;
+  try {
+    process.kill(lf.pid, 0); // liveness only; throws if dead or not ours
+  } catch {
+    return null;
+  }
+  const remainingMs = lf.start + lf.ttl * 1000 - Date.now();
+  return remainingMs > 0 ? { remainingMs, socket: lf.socket } : null;
+}
+
+/**
+ * Resolve a token: --token > FORGEJO_TOKEN > creds (host-keyed). The cred name
+ * is the base-URL host as-is (e.g. `forgejo.kensand.net`), with a port-stripped
+ * fallback when the host includes a port.
+ *
+ * NEVER BLOCKS. It used to call credsApi.wait() for up to `timeout` (default
+ * 300s) so the user could supply a token in another terminal while the command
+ * sat there. That turned every credential problem into a five-minute hang, and
+ * a hang is strictly worse than an error: nothing is printed, so "waiting for
+ * you" is indistinguishable from "working", "found nothing" and "network stuck".
+ * It fired on the most common failure of all -- the creds ttl is 10 minutes --
+ * and `f fj version` answering instantly beside it made the token look rejected
+ * rather than absent. `--wait` opts back in for the one case it helped: a
+ * long-running job that wants to park until a human sets a cred.
+ *
+ * The three ways to get here are distinguished, because they need different
+ * fixes and all three previously reported the same nothing:
+ *   locked        store is not unlocked        -> `f creds unlock`
+ *   unset         unlocked, cred absent        -> `f creds set <host> <token>`
+ *   no creds uck  daemon unreachable outright  -> raw socket get also failed
+ */
+async function resolveToken(flagToken, base, credsApi, opts = {}) {
   if (flagToken) return { token: flagToken, src: "--token" };
   if (process.env.FORGEJO_TOKEN) return { token: process.env.FORGEJO_TOKEN, src: "FORGEJO_TOKEN" };
-  // creds: cred named after the host (try with-port first, then stripped)
-  if (!base) return { token: null, src: null };
+  if (!base) return { token: null, src: null, reason: "no-base" };
   const host = hostFromUrl(base);
   const names = host.includes(":") ? [host, host.split(":")[0]] : [host];
-  // Prefer the blocking wait (via the creds uck) so the user can supply the
-  // token in another terminal while f blocks. Fall back to a one-shot raw get
-  // if the creds uck isn't available.
-  const waitFor = async (name) => {
-    if (credsApi && typeof credsApi.wait === "function") {
-      return credsApi.wait(name, { timeout });
-    }
-    // fallback: immediate get (no blocking)
-    try {
-      const r = await daemonCall({ op: "get", name }, CRED_SOCKET);
-      if (r && r.ok && r.value != null && r.value !== "") return r.value;
-    } catch {}
-    return null;
-  };
-  for (const name of names) {
-    try {
-      const v = await waitFor(name);
-      if (v != null && v !== "") return { token: v, src: `creds:${name}` };
-    } catch (e) {
-      // timed out or daemon issue — keep trying the next name, then give up
-      if (e && /timed out/.test(e.message)) return { token: null, src: null, error: e.message };
-    }
+
+  const state = credsUnlocked();
+  if (!state && !opts.waitMs) {
+    return { token: null, src: null, reason: "locked", host };
   }
-  return { token: null, src: null };
+
+  // Opt-in blocking, and only via the creds uck: it owns the waiter registry
+  // that `f creds waiters` / `f creds fill` read, so a hand-rolled poll loop
+  // here would block invisibly with nothing for the other terminal to see.
+  // With --wait and no creds uck we fall through to the one-shot reads below,
+  // which is the old non-blocking behavior, not a silent lie about waiting.
+  if (!state && opts.waitMs && credsApi && typeof credsApi.wait === "function") {
+    try {
+      for (const name of names) {
+        const v = await credsApi.wait(name, { timeout: opts.waitMs });
+        if (v != null && v !== "") return { token: v, src: `creds:${name} (waited)` };
+      }
+    } catch {
+      /* timed out -- report the reason below rather than a stack */
+    }
+    return { token: null, src: null, reason: "wait-timeout", host };
+  }
+
+  // One-shot reads. Note `credsApi.get` throws "creds locked" on its own, which
+  // is why the lockfile is consulted first: catching that exception would work
+  // but cannot distinguish "locked" from "that cred is not set".
+  const read = async (name) => {
+    if (credsApi && typeof credsApi.get === "function") {
+      try {
+        return await credsApi.get(name);
+      } catch (e) {
+        // "not found" for this name is expected when the port-stripped host is
+        // tried second; anything else is worth surfacing rather than swallowing.
+        if (e && /locked/i.test(e.message)) return { locked: true };
+        return null;
+      }
+    }
+    try {
+      const r = await daemonCall({ op: "get", name }, state.socket || CRED_SOCKET);
+      if (r && r.ok) return r.value;
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  for (const name of names) {
+    const v = await read(name);
+    if (v && v.locked) return { token: null, src: null, reason: "locked", host };
+    if (v != null && v !== "") return { token: v, src: `creds:${name}` };
+  }
+  return { token: null, src: null, reason: "unset", host };
+}
+
+/**
+ * A dead store or an absent cred must stop the command, not degrade it. The
+ * check lives here rather than at each call site because a uck that calls the
+ * API anonymously returns whatever the instance exposes publicly and looks
+ * fine: `f fj whoami` reported `user does not exist [uid: 0]` for the whole
+ * session that the token was never being sent. `urls` is the exception -- it
+ * REPORTS the token state, so an empty one is its answer, not an error.
+ */
+function needToken(tok) {
+  if (tok.token) return tok.token;
+  if (tok.reason === "locked")
+    err(
+      `creds are locked (no token for ${tok.host})\n` +
+        `  unlock it: f creds unlock\n` +
+        `  or send one now: f fj --token <pat> ... / FORGEJO_TOKEN=...\n` +
+        `  or wait for one to be set: f fj --wait ...`,
+    );
+  if (tok.reason === "unset" || tok.reason === "wait-timeout")
+    err(
+      tok.reason === "wait-timeout"
+        ? `no credential for ${tok.host} appeared while waiting\n` +
+            `  store it: f creds set ${tok.host} <pat>\n` +
+            `  names already stored: f creds ls`
+        : `no credential stored for ${tok.host}\n` +
+            `  store it: f creds set ${tok.host} <pat>\n` +
+            `  or send one now: f fj --token <pat> ... / FORGEJO_TOKEN=...\n` +
+            `  names already stored: f creds ls`,
+    );
+  if (tok.reason === "no-base")
+    err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
+  err(`no token available (${tok.reason ?? "unknown"})`);
 }
 
 async function makeClient(url, token) {
@@ -303,9 +402,10 @@ function usage() {
     "  urls                     show resolved base url + token source\n" +
     "  --url <base>             override base (default: FORGEJO_URL > git origin > fj.defaultHost)\n" +
     "  --token <tok>            override token (default: FORGEJO_TOKEN, then creds)\n" +
-    "  --timeout <sec>          creds wait window (default 300s); only used when\n" +
-    "                           no --token/FORGEJO_TOKEN — fj blocks that long for\n" +
-    "                           you to set the cred in another terminal"
+    "  --wait [sec]             block until a cred appears (default 300s). Off by\n" +
+    "                           default: without a token fj fails immediately and\n" +
+    "                           says whether creds are locked or simply unset.\n" +
+    "  --timeout <sec>          deprecated alias for --wait <sec>"
   );
 }
 
@@ -384,13 +484,13 @@ async function cmdLs(query) {
   process.stdout.write(lines.join("\n") + (lines.length ? "\n" : ""));
 }
 
-async function cmdCall(name, params, rawUrl, rawMethod, credsApi, timeout) {
+async function cmdCall(name, params, rawUrl, rawMethod, credsApi, opts = {}) {
   const base = resolveBaseUrl(null);
   if (!base) err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
-  const tok = await resolveToken(null, base, credsApi, timeout);
+  const tok = await resolveToken(null, base, credsApi, opts);
   const url = apiUrl(base);
   await sdk();
-  const client = await makeClient(url, tok.token);
+  const client = await makeClient(url, needToken(tok));
 
   if (rawMethod) {
     // raw passthrough: client.<method>({ url: path, query/body, throwOnError:false })
@@ -415,6 +515,14 @@ function finish(res) {
   if (res && res.error) {
     const e = res.error;
     const status = e.status ?? e.response?.status;
+    // A 2xx with no body is success, not a missing target. The SDK reports an
+    // empty body through the same error channel as a real 404, so the 204/404
+    // probe endpoints (repoPullRequestIsMerged is GET .../pulls/{index}/merge,
+    // 204 = merged / 404 = not) always read as "The target couldn't be found."
+    // and a successful merge check looked like a failure. Guard on the status
+    // actually being successful -- an absent status is NOT proof of one, so
+    // genuine errors still fall through to the normal report.
+    if (typeof status === "number" && status >= 200 && status < 300) return out(null);
     const msg = e.response?.data?.message || e.message || e.code || "request failed";
     err(`API error ${status ?? ""} ${msg}`.trim());
   }
@@ -431,18 +539,29 @@ export function register(_ctx) {
       // pull out global flags
       let flagUrl = null;
       let flagToken = null;
-      let timeoutSec = 300; // default creds-wait window (5 min)
+      // Opt-in only. The default is a fast failure (see resolveToken); --wait
+      // restores blocking so a long-running job can park until a human sets the
+      // cred elsewhere. --timeout sets that window; 0 makes --wait a no-op.
+      let waitSec = 0;
       const pos = [];
       for (let i = 0; i < _.length; i++) {
         const a = _[i];
         if (a === "--url") { flagUrl = _[++i]; continue; }
         if (a === "--token") { flagToken = _[++i]; continue; }
-        if (a === "--timeout") { timeoutSec = Number(_[++i]); continue; }
+        if (a === "--wait") {
+          // Accepts a bare --wait (block up to 300s) or --wait 600. A value is
+          // only consumed if it is a number, so `f fj --wait push` does not eat
+          // the subcommand as a timeout.
+          const nxt = Number(_[i + 1]);
+          waitSec = Number.isFinite(nxt) && nxt > 0 ? (_[++i], nxt) : 300;
+          continue;
+        }
+        if (a === "--timeout") { waitSec = Number(_[++i]); continue; } // deprecated alias
         pos.push(a);
       }
       const [cmd, ...rest] = pos;
-      const timeout = timeoutSec * 1000;
-      // creds uck (for blocking wait), if available
+      const opts = { waitMs: waitSec * 1000 };
+      // creds uck (for the opt-in blocking wait), if available
       const credsApi = (ctx && ctx.registry && ctx.registry.creds && ctx.registry.creds.credsApi) || null;
 
       if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") return usage();
@@ -453,12 +572,14 @@ export function register(_ctx) {
 
       if (cmd === "urls") {
         const base = resolveBaseUrl(flagUrl);
-        // diagnostic — don't block on creds; just report what's immediately available
-        const tok = await resolveToken(flagToken, base, null, timeout);
+        // Diagnostic: an absent token IS this command's answer, so it must not
+        // error the way an API call would. It also never waits, even under
+        // --wait, because its whole job is to report the current state.
+        const tok = await resolveToken(flagToken, base, null, { waitMs: 0 });
         out({
           base: base ?? "(none)",
           api: apiUrl(base),
-          token: tok.token ? (tok.src + " (len " + String(tok.token).length + ")") : "(none)",
+          token: tok.token ? (tok.src + " (len " + String(tok.token).length + ")") : `(none: ${tok.reason})`,
         });
         return;
       }
@@ -466,7 +587,7 @@ export function register(_ctx) {
       if (cmd === "version") {
         const base = resolveBaseUrl(flagUrl);
         if (!base) err("no base url (not in a git clone, no --url/FORGEJO_URL, no fj.defaultHost)");
-        const client = await makeClient(apiUrl(base), (await resolveToken(flagToken, base, credsApi, timeout)).token);
+        const client = await makeClient(apiUrl(base), (await resolveToken(flagToken, base, credsApi, opts)).token);
         await sdk();
         const fn = _sdk.getVersion;
         const res = await fn({ client, throwOnError: false });
@@ -476,11 +597,8 @@ export function register(_ctx) {
       if (cmd === "whoami") {
         const base = resolveBaseUrl(flagUrl);
         if (!base) err("no base url (not in a git clone; pass --url)");
-        const tok = await resolveToken(flagToken, base, credsApi, timeout);
-        if (!tok.token) {
-          const detail = tok.error ? `\n${tok.error}` : "";
-          err("no token found for " + hostFromUrl(base) + " — set one via: f creds set " + hostFromUrl(base) + " <token>" + detail);
-        }
+        const tok = await resolveToken(flagToken, base, credsApi, opts);
+        if (!tok.token) return needToken(tok);
         const client = await makeClient(apiUrl(base), tok.token);
         await sdk();
         const res = await _sdk.userGetCurrent({ client, throwOnError: false });
@@ -538,7 +656,7 @@ export function register(_ctx) {
             }
           }
         }
-        const res = await cmdCall(name, params, null, null, credsApi, timeout);
+        const res = await cmdCall(name, params, null, null, credsApi, opts);
         return res;
       }
 
@@ -550,7 +668,7 @@ export function register(_ctx) {
         let params = {};
         const maybeJson = rest[1];
         if (maybeJson && maybeJson.trim().startsWith("{")) params = parseJsonArg(maybeJson);
-        return cmdCall(null, params, rawUrl.startsWith("/") ? rawUrl : "/" + rawUrl, method, credsApi, timeout);
+        return cmdCall(null, params, rawUrl.startsWith("/") ? rawUrl : "/" + rawUrl, method, credsApi, opts);
       }
 
       usage();
