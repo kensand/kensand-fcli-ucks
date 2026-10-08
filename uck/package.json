@@ -1,0 +1,7 @@
+{
+  "name": "@fcli/uck-uck",
+  "version": "0.1.0",
+  "description": "f uck: publish a store bucket to its git repo (bucket name = target name)",
+  "type": "module",
+  "main": "index.js"
+}
