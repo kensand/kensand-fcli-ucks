@@ -142,23 +142,40 @@ function daemonCall(req, socketPath) {
   });
 }
 
-/** Resolve a token: --token > FORGEJO_TOKEN > creds daemon (host-keyed).
- *  The cred name is the base-URL host as-is (e.g. `forgejo.kensand.net`), with
- *  a port-stripped fallback when the host includes a port. */
-async function resolveToken(flagToken, base) {
+/** Resolve a token: --token > FORGEJO_TOKEN > creds (host-keyed). When no flag
+ *  or env token is set, uses credsApi.wait() to block up to `timeout` ms for the
+ *  cred to be supplied in another terminal (also waits for unlock). The cred
+ *  name is the base-URL host as-is (e.g. `forgejo.kensand.net`), with a
+ *  port-stripped fallback when the host includes a port. */
+async function resolveToken(flagToken, base, credsApi, timeout) {
   if (flagToken) return { token: flagToken, src: "--token" };
   if (process.env.FORGEJO_TOKEN) return { token: process.env.FORGEJO_TOKEN, src: "FORGEJO_TOKEN" };
-  // creds daemon: cred named after the host (try with-port first, then stripped)
+  // creds: cred named after the host (try with-port first, then stripped)
   if (!base) return { token: null, src: null };
   const host = hostFromUrl(base);
   const names = host.includes(":") ? [host, host.split(":")[0]] : [host];
-  try {
-    for (const name of names) {
-      const r = await daemonCall({ op: "get", name }, CRED_SOCKET);
-      if (r && r.ok && r.value != null && r.value !== "") return { token: r.value, src: `creds:${name}` };
+  // Prefer the blocking wait (via the creds uck) so the user can supply the
+  // token in another terminal while f blocks. Fall back to a one-shot raw get
+  // if the creds uck isn't available.
+  const waitFor = async (name) => {
+    if (credsApi && typeof credsApi.wait === "function") {
+      return credsApi.wait(name, { timeout });
     }
-  } catch {
-    /* daemon not running or not unlocked — treat as no token */
+    // fallback: immediate get (no blocking)
+    try {
+      const r = await daemonCall({ op: "get", name }, CRED_SOCKET);
+      if (r && r.ok && r.value != null && r.value !== "") return r.value;
+    } catch {}
+    return null;
+  };
+  for (const name of names) {
+    try {
+      const v = await waitFor(name);
+      if (v != null && v !== "") return { token: v, src: `creds:${name}` };
+    } catch (e) {
+      // timed out or daemon issue — keep trying the next name, then give up
+      if (e && /timed out/.test(e.message)) return { token: null, src: null, error: e.message };
+    }
   }
   return { token: null, src: null };
 }
@@ -220,7 +237,10 @@ function usage() {
     "  version                  getVersion (no auth)\n" +
     "  urls                     show resolved base url + token source\n" +
     "  --url <base>             override base (default: FORGEJO_URL > git origin > fj.defaultHost)\n" +
-    "  --token <tok>            override token (default: FORGEJO_TOKEN, then creds)"
+    "  --token <tok>            override token (default: FORGEJO_TOKEN, then creds)\n" +
+    "  --timeout <sec>          creds wait window (default 300s); only used when\n" +
+    "                           no --token/FORGEJO_TOKEN — fj blocks that long for\n" +
+    "                           you to set the cred in another terminal"
   );
 }
 
@@ -280,10 +300,10 @@ async function cmdLs(query) {
   process.stdout.write(lines.join("\n") + (lines.length ? "\n" : ""));
 }
 
-async function cmdCall(name, params, rawUrl, rawMethod) {
+async function cmdCall(name, params, rawUrl, rawMethod, credsApi, timeout) {
   const base = resolveBaseUrl(null);
   if (!base) err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
-  const tok = await resolveToken(null, base);
+  const tok = await resolveToken(null, base, credsApi, timeout);
   const url = apiUrl(base);
   await sdk();
   const client = await makeClient(url, tok.token);
@@ -318,19 +338,24 @@ export function register(_ctx) {
   return {
     name: "fj",
     desc: "Forgejo/Gitea API via @llamaduck/forgejo-ts (ls/call/<METHOD> <path>); base from git origin, token from creds",
-    run: async (_argv, args) => {
+    run: async (_argv, args, ctx) => {
       const _ = args._ ?? [];
       // pull out global flags
       let flagUrl = null;
       let flagToken = null;
+      let timeoutSec = 300; // default creds-wait window (5 min)
       const pos = [];
       for (let i = 0; i < _.length; i++) {
         const a = _[i];
         if (a === "--url") { flagUrl = _[++i]; continue; }
         if (a === "--token") { flagToken = _[++i]; continue; }
+        if (a === "--timeout") { timeoutSec = Number(_[++i]); continue; }
         pos.push(a);
       }
       const [cmd, ...rest] = pos;
+      const timeout = timeoutSec * 1000;
+      // creds uck (for blocking wait), if available
+      const credsApi = (ctx && ctx.registry && ctx.registry.creds && ctx.registry.creds.credsApi) || null;
 
       if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") return usage();
 
@@ -340,7 +365,8 @@ export function register(_ctx) {
 
       if (cmd === "urls") {
         const base = resolveBaseUrl(flagUrl);
-        const tok = await resolveToken(flagToken, base);
+        // diagnostic — don't block on creds; just report what's immediately available
+        const tok = await resolveToken(flagToken, base, null, timeout);
         out({
           base: base ?? "(none)",
           api: apiUrl(base),
@@ -350,8 +376,9 @@ export function register(_ctx) {
       }
 
       if (cmd === "version") {
-        const base = resolveBaseUrl(flagUrl) ?? process.env.FORGEJO_URL ?? "https://forgejo.kensand.net";
-        const client = await makeClient(apiUrl(base), (await resolveToken(flagToken, base)).token);
+        const base = resolveBaseUrl(flagUrl);
+        if (!base) err("no base url (not in a git clone, no --url/FORGEJO_URL, no fj.defaultHost)");
+        const client = await makeClient(apiUrl(base), (await resolveToken(flagToken, base, credsApi, timeout)).token);
         await sdk();
         const fn = _sdk.getVersion;
         const res = await fn({ client, throwOnError: false });
@@ -361,8 +388,11 @@ export function register(_ctx) {
       if (cmd === "whoami") {
         const base = resolveBaseUrl(flagUrl);
         if (!base) err("no base url (not in a git clone; pass --url)");
-        const tok = await resolveToken(flagToken, base);
-        if (!tok.token) err("no token found for " + hostFromUrl(base) + " — set one via: f creds set " + hostFromUrl(base) + " <token>");
+        const tok = await resolveToken(flagToken, base, credsApi, timeout);
+        if (!tok.token) {
+          const detail = tok.error ? `\n${tok.error}` : "";
+          err("no token found for " + hostFromUrl(base) + " — set one via: f creds set " + hostFromUrl(base) + " <token>" + detail);
+        }
         const client = await makeClient(apiUrl(base), tok.token);
         await sdk();
         const res = await _sdk.userGetCurrent({ client, throwOnError: false });
@@ -396,7 +426,7 @@ export function register(_ctx) {
             params = parseJsonArg(maybeJson);
           }
         }
-        const res = await cmdCall(name, params, null, null);
+        const res = await cmdCall(name, params, null, null, credsApi, timeout);
         return res;
       }
 
@@ -408,7 +438,7 @@ export function register(_ctx) {
         let params = {};
         const maybeJson = rest[1];
         if (maybeJson && maybeJson.trim().startsWith("{")) params = parseJsonArg(maybeJson);
-        return cmdCall(null, params, rawUrl.startsWith("/") ? rawUrl : "/" + rawUrl, method);
+        return cmdCall(null, params, rawUrl.startsWith("/") ? rawUrl : "/" + rawUrl, method, credsApi, timeout);
       }
 
       usage();
