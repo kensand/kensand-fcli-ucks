@@ -11,7 +11,8 @@
 //   - explicit --url or FORGEJO_URL env win over git origin.
 //
 // Auth token (in order): --token, FORGEJO_TOKEN env, then the `creds` uck
-// (credsApi) using a cred named `forgejo.<host>` (e.g. forgejo.kensand.net).
+// (credsApi) using a cred named after the base-URL host as-is
+// (e.g. `forgejo.kensand.net`).
 // So: f creds set forgejo.kensand.net <token>   then f fj call userGetCurrent
 //
 // Commands:
@@ -113,15 +114,16 @@ function daemonCall(req, socketPath) {
   });
 }
 
-/** Resolve a token: --token > FORGEJO_TOKEN > creds daemon (host-keyed). */
+/** Resolve a token: --token > FORGEJO_TOKEN > creds daemon (host-keyed).
+ *  The cred name is the base-URL host as-is (e.g. `forgejo.kensand.net`), with
+ *  a port-stripped fallback when the host includes a port. */
 async function resolveToken(flagToken, base) {
   if (flagToken) return { token: flagToken, src: "--token" };
   if (process.env.FORGEJO_TOKEN) return { token: process.env.FORGEJO_TOKEN, src: "FORGEJO_TOKEN" };
-  // creds daemon: cred named `forgejo.<host>` (try the bare host first, then
-  // host with port)
+  // creds daemon: cred named after the host (try with-port first, then stripped)
   if (!base) return { token: null, src: null };
   const host = hostFromUrl(base);
-  const names = host.includes(":") ? [`forgejo.${host}`, `forgejo.${host.split(":")[0]}`] : [`forgejo.${host}`];
+  const names = host.includes(":") ? [host, host.split(":")[0]] : [host];
   try {
     for (const name of names) {
       const r = await daemonCall({ op: "get", name }, CRED_SOCKET);
@@ -332,7 +334,7 @@ export function register(_ctx) {
         const base = resolveBaseUrl(flagUrl);
         if (!base) err("no base url (not in a git clone; pass --url)");
         const tok = await resolveToken(flagToken, base);
-        if (!tok.token) err("no token found for " + hostFromUrl(base) + " — set one via: f creds set forgejo." + hostFromUrl(base) + " <token>");
+        if (!tok.token) err("no token found for " + hostFromUrl(base) + " — set one via: f creds set " + hostFromUrl(base) + " <token>");
         const client = await makeClient(apiUrl(base), tok.token);
         await sdk();
         const res = await _sdk.userGetCurrent({ client, throwOnError: false });
