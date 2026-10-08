@@ -63,7 +63,10 @@ function gitOriginUrl(cwd) {
     // For a repo clone the origin is <host>/<org>/<repo>.git. We only want the
     // instance origin (the Forgejo host root), so drop the org/repo path.
     if (out.includes("://")) {
-      try { return new URL(out).origin; } catch { return null; }
+      // URL form: https://host/... or ssh://[user@]host/.... .origin is only
+      // defined for http(s), so build the base from https:// + host (the API
+      // is always https, even when the git remote is ssh://).
+      try { const u = new URL(out); return u.host ? "https://" + u.host : null; } catch { return null; }
     }
     // scp-like: [user@]host:org/repo.git -> host
     const m = out.match(/^(?:[\w.]+@)?([^:]+):/);
@@ -78,7 +81,29 @@ function hostFromUrl(u) {
   try { return new URL(u).host; } catch { return u.replace(/^https?:\/\//, "").replace(/\/.*$/, ""); }
 }
 
-/** Resolve the base API URL: --url > FORGEJO_URL > git origin (walk up from cwd). */
+/** Read fj.defaultHost from f.config.json (project then global). Returns a
+ *  string or null. Used as the last-resort base when not in a repo and no
+ *  --url / FORGEJO_URL was given. */
+function configDefaultHost() {
+  const read = (p) => {
+    try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; }
+  };
+  // project: walk up from cwd; global: ~/.f/f.config.json
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    const d = read(path.join(dir, "f.config.json"));
+    if (d && d.fj && typeof d.fj.defaultHost === "string") return d.fj.defaultHost;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const g = read(path.join(process.env.HOME ?? "", ".f", "f.config.json"));
+  if (g && g.fj && typeof g.fj.defaultHost === "string") return g.fj.defaultHost;
+  return null;
+}
+
+/** Resolve the base API URL: --url > FORGEJO_URL > git origin (walk up from cwd)
+ *  > fj.defaultHost config (last resort, when not in a repo). */
 function resolveBaseUrl(flagUrl) {
   if (flagUrl) return flagUrl.replace(/\/$/, "");
   const env = process.env.FORGEJO_URL;
@@ -91,6 +116,9 @@ function resolveBaseUrl(flagUrl) {
     if (parent === dir) break;
     dir = parent;
   }
+  // Last resort: config default host (only reached when not in a git repo).
+  const def = configDefaultHost();
+  if (def) return def.replace(/\/$/, "");
   return null;
 }
 
@@ -191,7 +219,7 @@ function usage() {
     "  whoami                   userGetCurrent (needs auth)\n" +
     "  version                  getVersion (no auth)\n" +
     "  urls                     show resolved base url + token source\n" +
-    "  --url <base>             override base (default: git origin of cwd)\n" +
+    "  --url <base>             override base (default: FORGEJO_URL > git origin > fj.defaultHost)\n" +
     "  --token <tok>            override token (default: FORGEJO_TOKEN, then creds)"
   );
 }
@@ -254,7 +282,7 @@ async function cmdLs(query) {
 
 async function cmdCall(name, params, rawUrl, rawMethod) {
   const base = resolveBaseUrl(null);
-  if (!base) err("no base url (not in a git clone; pass --url https://host)");
+  if (!base) err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
   const tok = await resolveToken(null, base);
   const url = apiUrl(base);
   await sdk();
