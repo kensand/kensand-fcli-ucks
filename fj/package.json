@@ -1,0 +1,10 @@
+{
+  "name": "@fcli/uck-fj",
+  "version": "0.1.0",
+  "description": "f fj: call the Forgejo/Gitea API via @llamaduck/forgejo-ts",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@llamaduck/forgejo-ts": "^15.0.9"
+  }
+}
