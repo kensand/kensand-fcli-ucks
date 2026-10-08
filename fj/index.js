@@ -432,8 +432,17 @@ function usage() {
   );
 }
 
-/** Rank named endpoints by relevance to a query (name + camelCase words). */
-function searchEndpoints(sdk, query) {
+/** Rank named endpoints by relevance to a query.
+ *
+ * Scores the NAME and, since this was written, the URL TEMPLATE too. The name
+ * alone made `f fj ls actions` and `ls Logs` return nothing useful even though
+ * the SDK ships actionRun (/repos/{owner}/{repo}/actions/runs/{run_id}) and
+ * listActionRuns -- you could not discover them by what they are for, so you
+ * ended up guessing REST paths by hand and reading 404s as permission failures.
+ * Paths are also what `ls` prints, so a query that cannot match them makes the
+ * tool unable to answer its own output.
+ * */
+function searchEndpoints(sdk, query, pathMap) {
   const fns = Object.keys(sdk).filter((k) => typeof sdk[k] === "function");
   if (!query) return fns;
   const q = query.toLowerCase();
@@ -449,6 +458,18 @@ function searchEndpoints(sdk, query) {
       else if (lower.includes(t)) score += 40;
       if (words.some((w) => w === t)) score += 30;
       else if (words.some((w) => w.startsWith(t))) score += 12;
+    }
+    // Path segments, scored below every name hit so "repoGet" still wins over a
+    // endpoint that merely lives under /repos/. A segment match is what people
+    // type when they know the URL but not the operation name.
+    const url = pathMap?.get(name)?.url;
+    if (url) {
+      const segs = url.toLowerCase().replace(/[{}]/g, " ").split(/[^a-z0-9]+/).filter(Boolean);
+      for (const t of tokens) {
+        if (segs.some((s) => s === t)) score += 28;
+        else if (segs.some((s) => s.startsWith(t))) score += 10;
+        else if (url.toLowerCase().includes(t)) score += 6;
+      }
     }
     if (score > 0) scored.push({ name, score });
   }
@@ -498,14 +519,59 @@ async function buildPathMap() {
 
 async function cmdLs(query) {
   const mod = await sdk();
-  const names = searchEndpoints(mod, query);
+  // Build the path map FIRST: ranking needs the URL templates, not just names.
   const pm = await buildPathMap();
+  const names = searchEndpoints(mod, query, pm);
+  if (query && !names.length) {
+    // Silence was the bug. `ls <query>` printed nothing for a query matching no
+    // endpoint, indistinguishable from "nothing found" -- the same failure shape
+    // as a locked creds store printing nothing. Only claim a near miss when one
+    // is real: dropping a suffix (repoListPullRequestFiles -> repoGetPullRequest)
+    // is not a typo correction, and suggesting a query that also returns nothing
+    // sends the caller in circles. So: report the empty result, and say plainly
+    // that this SDK may simply not expose the operation.
+    //
+    // Genuinely absent from the 491 generated operations, verified: any Actions
+    // *log* endpoint. `ls runs` finds listActionRuns/actionRun, but there is no
+    // /logs path in the spec -- fetching a log means a raw GET (see the ACTIONS
+    // note below), not a named endpoint.
+    err(
+      `no endpoint matches '${query}' among ${Object.keys(mod).filter((k) => typeof mod[k] === "function").length} generated operations.\n` +
+        `  search by a path word instead (f fj ls runs | pulls | secrets | runners)\n` +
+        `  some operations are absent from the spec -- Actions LOGS are: call the raw path instead\n` +
+        `  (f fj GET /repos/<owner>/<repo>/actions/runs/<run_id>/logs, see 'f fj ls runs' for the run id)`,
+    );
+  }
   const lines = names.map((n) => {
     const info = pm.get(n);
     return info ? `${info.method.padEnd(5)} ${n}  ${info.url}` : `${n}`;
   });
   process.stdout.write(lines.join("\n") + (lines.length ? "\n" : ""));
 }
+
+/**
+ * ACTIONS RUN ID -- read this before hand-writing an /actions/runs/... path.
+ * Three different numbers identify one run, and mixing them up looks exactly
+ * like a permissions failure:
+ *
+ *   listActionRuns[].id        3583   what /actions/runs/{run_id} and its /logs
+ *                                     child endpoint accept. THIS is the one.
+ *   listActionTasks[].id       43     per-ATTEMPT row id. Not a run id.
+ *   listActionTasks[].run_number 10   what the WEB UI URL shows (/runs/10).
+ *
+ * /repos/{o}/{r}/actions/tasks is not in the 491 generated operations by that
+ * name (listActionTasks is, and it is the same endpoint), and its `id` is the
+ * trap: feeding it to /actions/runs/{run_id} returns
+ *   {"message":"resource does not exist"}
+ * with no status code (the SDK gives none), which reads as "your token cannot
+ * read Actions" when it only means "wrong number". Resolve the id with
+ * `f fj call listActionRuns owner=... repo=...` and use .id.
+ *
+ * Logs: GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs returns a ZIP
+ * (one <job>-<jobid>-attempt-N.log per job), not text. Per-job
+ * /jobs/{id}/logs does NOT exist on this instance -- 404. There is no named
+ * endpoint for logs at all, so it must be a raw GET.
+ * */
 
 async function cmdCall(name, params, rawUrl, rawMethod, credsApi, opts = {}) {
   const base = resolveBaseUrl(null);
@@ -537,17 +603,22 @@ async function cmdCall(name, params, rawUrl, rawMethod, credsApi, opts = {}) {
 function finish(res) {
   if (res && res.error) {
     const e = res.error;
-    const status = e.status ?? e.response?.status;
-    // A 2xx with no body is success, not a missing target. The SDK reports an
-    // empty body through the same error channel as a real 404, so the 204/404
-    // probe endpoints (repoPullRequestIsMerged is GET .../pulls/{index}/merge,
-    // 204 = merged / 404 = not) always read as "The target couldn't be found."
-    // and a successful merge check looked like a failure. Guard on the status
-    // actually being successful -- an absent status is NOT proof of one, so
-    // genuine errors still fall through to the normal report.
-    if (typeof status === "number" && status >= 200 && status < 300) return out(null);
+    // This SDK discards the status code: on error, `response` is an empty object
+    // and the only fields are {message, url}. Everything below is therefore
+    // keyed on message text and on whether data came back, NOT on status.
+    //
+    // A 204 needs no special case, because the SDK does not report it as an
+    // error at all: measured against this instance, GET .../pulls/21/merge (a
+    // merged PR) yields {error: false, data: ""} and the unmerged one yields
+    // {error: true, message: "The target couldn't be found."}. An earlier
+    // revision of this function carried a `status >= 200 && < 300` guard for
+    // exactly that case; it could never fire, since `status` is always undefined
+    // here. Verified by deleting the guard: the merged check still passed. It is
+    // gone rather than commented, because a guard that cannot execute is worse
+    // than none -- it advertises protection for a case that is actually handled
+    // one branch up, by the `res.error` test itself.
     const msg = e.response?.data?.message || e.message || e.code || "request failed";
-    err(`API error ${status ?? ""} ${msg}`.trim());
+    err(`API error ${msg}`.trim());
   }
   out(res?.data !== undefined ? res.data : res);
 }
