@@ -313,6 +313,22 @@ function parseJsonArg(s) {
   try { return JSON.parse(s); } catch { throw new Error("json arg is not valid JSON: " + s.slice(0, 80)); }
 }
 
+// Coerce a parsed param object when it came through as a single JSON string.
+// Most common cause: the caller wrapped the payload in quotes, e.g.
+// `f fj call ep '{"owner":...}'` or `-f "$(cat file.json)"`. The first
+// JSON.parse then yields the string `{"owner":...}` rather than the object.
+// Re-parsing that string restores the intended object; anything else stays
+// a hard error.
+function ensureJsonObject(obj, src) {
+  if (obj && typeof obj === "object") return obj;
+  if (typeof obj === "string") {
+    try { return JSON.parse(obj); } catch {
+      err("" + src + " did not yield a JSON object (got a string that is not itself valid JSON)");
+    }
+  }
+  err("" + src + " did not yield a JSON object");
+}
+
 /** Split a flat param object into { path, query, body } for the SDK.
  *
  *  `urlTemplate` is the endpoint's path template (e.g. "/repos/{owner}/{repo}")
@@ -335,7 +351,14 @@ function splitParams(obj, urlTemplate) {
     ? new Set([...urlTemplate.matchAll(/\{([^{}/]+?)(?:\*)?\}/g)].map((m) => m[1]))
     : null;
   for (const [k, v] of Object.entries(obj)) {
-    if (k === "body") continue;
+    if (k === "body") {
+      // A body that arrived as a JSON string (quoted inline arg or -f file)
+      // is the caller's intent to send the parsed object, not a raw string.
+      if (typeof body === "string" && body.trim()) {
+        try { body = JSON.parse(body); } catch { /* keep the string body */ }
+      }
+      continue;
+    }
     if (!wants) {
       // No template (raw <METHOD> <path> calls): nothing to substitute, so
       // everything except body is a query param and `path` stays empty.
@@ -625,11 +648,12 @@ export function register(_ctx) {
           } catch (e) {
             err("" + file + " is not valid JSON: " + e.message);
           }
+          params = ensureJsonObject(params, file);
           rest.splice(fi, 2);
         } else {
           const maybeJson = rest[1];
           if (maybeJson && maybeJson.trim().startsWith("{")) {
-            params = parseJsonArg(maybeJson);
+            params = ensureJsonObject(parseJsonArg(maybeJson), "json arg");
           } else {
             // key=value pairs. The usage string has always advertised
             // `call <name> [json = {key:val,...}]`, and `f fj ls` prints
