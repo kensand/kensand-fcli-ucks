@@ -183,7 +183,28 @@ async function resolveToken(flagToken, base, credsApi, timeout) {
 async function makeClient(url, token) {
   await sdk();
   const cfg = { baseURL: url };
-  if (token) cfg.auth = token; // apiKey scheme -> sent as `Authorization: <token>`
+  // Send the credential as an explicit Authorization header.
+  //
+  // NOT `cfg.auth = token`, which is what this used to do and which made every
+  // authenticated call fail. Two independent reasons `auth` cannot work here:
+  //
+  //   1. `auth` is inert unless `security` is set on the request. In
+  //      dist/client/index.js, beforeRequest() calls setAuthParams() only
+  //      inside `if (opts.security)`, and createConfig() never sets
+  //      `security`. So the token never reaches any request and every call
+  //      goes out ANONYMOUSLY. The failure looked like a creds problem --
+  //      "token is malformed: token contains an invalid number of segments /
+  //      access token is empty" / "user does not exist [uid: 0]" -- while
+  //      `f fj version` (no auth needed) worked fine, which is exactly what
+  //      made it look like the token was bad rather than unsent.
+  //   2. Even with `security` set, getAuthToken() prefixes `Bearer `/`Basic `
+  //      only when the auth object declares a scheme; a bare string is sent
+  //      raw, and Forgejo rejects a raw personal access token.
+  //
+  // Forgejo accepts both `token <pat>` (the Gitea-native spelling, and the
+  // form the SDK's own README documents) and `Bearer <pat>`; verified against
+  // this instance with each. `token` is used.
+  if (token) cfg.headers = { Authorization: "token " + token };
   return _clientMod.createClient(_clientMod.createConfig(cfg));
 }
 
@@ -193,22 +214,66 @@ function parseJsonArg(s) {
   try { return JSON.parse(s); } catch { throw new Error("json arg is not valid JSON: " + s.slice(0, 80)); }
 }
 
-/** Split a flat param object into { path, query, body } for the SDK. */
-function splitParams(obj) {
+/** Split a flat param object into { path, query, body } for the SDK.
+ *
+ *  `urlTemplate` is the endpoint's path template (e.g. "/repos/{owner}/{repo}")
+ *  when known. It is required, not a convenience: the SDK fills `{placeholders}`
+ *  from `path` using the names IN THE TEMPLATE, and the API's declared parameter
+ *  names are not always those. repoGet's template is /repos/{owner}/{repo} while
+ *  its parameters are ownerName/repoName, so a caller who passes
+ *  ownerName=kensand.net repoName=foo fills nothing, the braces go out literally,
+ *  and Forgejo answers by looking up a user literally named "{owner}" --
+ *  GetUserByName. Renaming on our side is how the two halves are reconciled;
+ *  guessing it from key shape (the previous heuristic here) cannot work, and
+ *  leaking template-only keys into the query string is why `?ownerName=...` used
+ *  to ride along on every call.
+ */
+function splitParams(obj, urlTemplate) {
   const path = {};
   const query = {};
   let body = obj.body;
+  const wants = urlTemplate
+    ? new Set([...urlTemplate.matchAll(/\{([^{}/]+?)(?:\*)?\}/g)].map((m) => m[1]))
+    : null;
   for (const [k, v] of Object.entries(obj)) {
     if (k === "body") continue;
-    // keys that look like path params (owner, repo, index, id, ...) — we don't
-    // know the schema, so: put "known-ish" scalar/ident keys in query, and let
-    // the SDK's url template fill path params by name. Strategy: try path first
-    // if the template has {k}; else query. We can't introspect the template
-    // easily, so: heuristic — short identifier keys -> path, the rest -> query.
-    // Simpler + robust: pass everything except `body` as query; also pass as
-    // path so the template substitution picks up {owner}/{repo} etc.
-    path[k] = v;
-    query[k] = v;
+    if (!wants) {
+      // No template (raw <METHOD> <path> calls): nothing to substitute, so
+      // everything except body is a query param and `path` stays empty.
+      query[k] = v;
+      continue;
+    }
+    if (wants.has(k)) path[k] = v;
+    else query[k] = v;
+  }
+  // Fail loudly on a template slot nobody filled: a literal "{owner}" in the
+  // URL produces a confusing server-side lookup error, not a 404 on our side.
+  if (wants) {
+    // Template slot names and the API's declared parameter names disagree for
+    // the whole /repos/{owner}/{repo} family: the template says `owner`/`repo`,
+    // the operation's parameters are `ownerName`/`repoName`. So accept either
+    // spelling for these two, and prefer whichever the caller actually gave.
+    const aliases = { owner: ["owner", "ownerName"], repo: ["repo", "repoName"] };
+    for (const [slot, names] of Object.entries(aliases)) {
+      if (path[slot] !== undefined) continue;
+      const hit = names.map((n) => [n, obj[n]]).find(([, v]) => v !== undefined);
+      if (hit) {
+        path[hit[0]] = hit[1];
+        delete query[hit[0]]; // it is a path segment, not a query param
+        // Rename onto the slot name so the serializer substitutes it. A caller
+        // who wrote ownerName=... should not have to know the template differs.
+        if (slot !== hit[0] && wants.has(slot)) {
+          path[slot] = hit[1];
+          delete path[hit[0]];
+        }
+      }
+    }
+    const missing = [...wants].filter((w) => path[w] === undefined);
+    if (missing.length)
+      err(
+        `missing path parameter(s): ${missing.join(", ")} for ${urlTemplate}` +
+          ` -- pass them as key=value (see: f fj ls <endpoint>)`,
+      );
   }
   return { path, query, body };
 }
@@ -275,9 +340,28 @@ async function buildPathMap() {
   _pathMap = new Map();
   try {
     const src = fs.readFileSync(path.join(__dirname, "node_modules/@llamaduck/forgejo-ts/dist/index.mjs"), "utf8");
-    // Each endpoint: `var name = (options) => (options?.client ?? client).METHOD({ ..., url: "/x/{a}", ...})`
-    // Walk blocks: find `var NAME = (options) =>` then the next `url:` and `responseType`/method call.
-    const re = /var\s+([A-Za-z0-9_]+)\s*=\s*\(options\)\s*=>\s*\(options\?\.client\s*\?\?\s*client\)\.([a-z]+)\(\s*\{[\s\S]*?url:\s*"([^"]*)"/g;
+    // Each endpoint is emitted as one of two spellings, and BOTH occur in the
+    // shipped dist/index.mjs:
+    //   var userGetCurrent = (options) => (options?.client ?? client).get({ ... })
+    //   var repoGet        = (options) => (options.client  ?? client).get({ ... })
+    // so the group is `(?:\?)?\.?` — optional `?`, optional `.`.
+    //
+    // It used to be `(?:\?\.)?`, which reads as "optionally the two-character
+    // sequence ?." — that accepts `options?.client` and even `optionsclient`, but
+    // REJECTS the plain `options.client` that repoGet/repoListPullRequests/
+    // repoCreatePullRequest are generated with. Consequence: the map held 76 of
+    // 491 endpoints, and a missing entry fails SILENTLY — cmdCall gets
+    // urlTemplate=null and routes path params into the query string, so
+    // `call repoGet ownerName=… repoName=…` requested
+    // `/repos/{owner}/{repo}?ownerName=…` and Forgejo replied by looking up a
+    // user literally named "{owner}": the unhelpful `GetUserByName` error.
+    // `f fj ls` still printed 491 names, which is what hid this.
+    //
+    // If you touch this, print the parse count: it must equal the number of
+    // endpoints `ls` lists (491 today), and spot-check a templated one such as
+    // repoGet -> "/repos/{owner}/{repo}".
+    const re =
+      /var\s+([A-Za-z0-9_]+)\s*=\s*\(options\)\s*=>\s*\(options(?:\?)?\.?client\s*\?\?\s*client\)\.([a-z]+)\(\s*\{[\s\S]*?url:\s*"([^"]*)"/g;
     let m;
     while ((m = re.exec(src)) !== null) {
       const [, name, method, url] = m;
@@ -310,7 +394,8 @@ async function cmdCall(name, params, rawUrl, rawMethod, credsApi, timeout) {
 
   if (rawMethod) {
     // raw passthrough: client.<method>({ url: path, query/body, throwOnError:false })
-    const { path: _ignore, query, body } = splitParams(params);
+    // A caller-supplied path is already resolved, so there is no template here.
+    const { path: _ignore, query, body } = splitParams(params, null);
     const method = rawMethod.toLowerCase();
     const res = await client[method]({ url: rawUrl, query, body, throwOnError: false });
     return finish(res);
@@ -318,7 +403,10 @@ async function cmdCall(name, params, rawUrl, rawMethod, credsApi, timeout) {
 
   const fn = _sdk[name];
   if (typeof fn !== "function") err(`unknown endpoint '${name}'. Try: f fj ls ${name}`);
-  const { path, query, body } = splitParams(params);
+  // Look up this endpoint's path template so path/query split by real name.
+  const pm = await buildPathMap();
+  const urlTemplate = pm.get(name)?.url || null;
+  const { path, query, body } = splitParams(params, urlTemplate);
   const res = await fn({ client, path, query, body, throwOnError: false });
   return finish(res);
 }
@@ -402,7 +490,7 @@ export function register(_ctx) {
       if (cmd === "call") {
         const name = rest[0];
         if (!name) err("call requires an endpoint name. Try: f fj ls <query>");
-        // json param: last token that parses as json, or -f file
+        // json param: a {...} token, -f file, or repeated key=value pairs.
         let params = {};
         const fi = rest.indexOf("-f");
         if (fi !== -1) {
@@ -424,6 +512,30 @@ export function register(_ctx) {
           const maybeJson = rest[1];
           if (maybeJson && maybeJson.trim().startsWith("{")) {
             params = parseJsonArg(maybeJson);
+          } else {
+            // key=value pairs. The usage string has always advertised
+            // `call <name> [json = {key:val,...}]`, and `f fj ls` prints
+            // templates like /repos/{owner}/{repo}, so a caller naturally types
+            // `call repoGet ownerName=x repoName=y`. That form was never
+            // implemented: params stayed {} and the call went out with its
+            // {owner}/{repo} braces unsubstituted, which surfaced as the opaque
+            // `GetUserByName` rather than "you passed no parameters".
+            //
+            // Values are JSON-parsed so numbers/bools/nested bodies work
+            // (`index=3`, `merged=true`, `body={...}`); a value that is not
+            // valid JSON is kept as the literal string, which is what `head=main`
+            // needs (JSON.parse would otherwise reject it, not coerce it).
+            for (const tok of rest.slice(1)) {
+              const eq = tok.indexOf("=");
+              if (eq <= 0) continue; // not key=value; ignore, like before
+              const k = tok.slice(0, eq);
+              const raw = tok.slice(eq + 1);
+              let v = raw;
+              if (raw !== "" && /^[[{\d-]|^(true|false|null)$/.test(raw)) {
+                try { v = JSON.parse(raw); } catch { /* keep as string */ }
+              }
+              params[k] = v;
+            }
           }
         }
         const res = await cmdCall(name, params, null, null, credsApi, timeout);
