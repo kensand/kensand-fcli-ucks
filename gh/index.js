@@ -1,4 +1,4 @@
-// f github — GitHub REST API via @octokit/rest: repos, issues, PRs, releases,
+// f gh — GitHub REST API via @octokit/rest: repos, issues, PRs, releases,
 // search, raw passthrough.
 //
 // Dep: @octokit/rest (installed in this uck's own node_modules; lazy-imported).
@@ -12,15 +12,15 @@
 //   Repo: --repo <owner>/<repo>, else the git origin of the current directory.
 //
 // Commands:
-//   f github whoami                 current user (needs auth)
-//   f github ls [query]             list/search endpoint names (subset)
-//   f github repo [ls]              list repos (default: current repo)
-//   f github issue [ls|new|<n>]    list / create / show issues
-//   f github pr [ls|<n>]           list / show PRs
-//   f github release [ls|new]      list / create releases
-//   f github search <query>        code/repo search
-//   f github <METHOD> <path> [json] raw call, e.g. GET /repos/octocat/hello-world
-//   f github info                   rate limit + auth check
+//   f gh whoami                 current user (needs auth)
+//   f gh ls [query]             list/search endpoint names (subset)
+//   f gh repo [ls]              list repos (default: current repo)
+//   f gh issue [ls|new|<n>]    list / create / show issues
+//   f gh pr [ls|<n>]           list / show PRs
+//   f gh release [ls|new]      list / create releases
+//   f gh search <query>        code/repo search
+//   f gh <METHOD> <path> [json] raw call, e.g. GET /repos/octocat/hello-world
+//   f gh info                   rate limit + auth check
 
 import fs from "node:fs";
 import path from "node:path";
@@ -40,7 +40,7 @@ function out(o) {
   process.stdout.write(JSON.stringify(o, null, 2) + "\n");
 }
 function outLines(lines) { if (lines.length) process.stdout.write(lines.join("\n") + "\n"); }
-function err(msg) { process.stderr.write("f github: " + msg + "\n"); process.exit(1); }
+function err(msg) { process.stderr.write("f gh: " + msg + "\n"); process.exit(1); }
 
 // ---- octokit (lazy) ----
 let _Octokit = null;
@@ -123,7 +123,7 @@ async function resolveCreds(flagToken, flagUrl, credsApi, opts = {}) {
 function needToken(c) {
   if (c.token) return c;
   if (c.reason === "locked")
-    err("creds are locked\n  unlock it: f creds unlock\n  or: f github --token <tok> ... / GITHUB_TOKEN=...");
+    err("creds are locked\n  unlock it: f creds unlock\n  or: f gh --token <tok> ... / GITHUB_TOKEN=...");
   err("no token (f creds set gh-token <token>, or --token <tok>, or GITHUB_TOKEN)\n  names tried: gh-token, github-token, gh");
 }
 
@@ -321,7 +321,7 @@ async function cmdRaw(method, pathStr, json, c) {
 
 function usage() {
   err(
-    "usage: f github <cmd>\n" +
+    "usage: f gh <cmd>\n" +
     "  whoami                     current user\n" +
     "  info                       rate limit + auth\n" +
     "  ls [query]                 list/search endpoint names\n" +
@@ -339,8 +339,8 @@ function usage() {
 
 export function register(_ctx) {
   return {
-    name: "github",
-    skills: [{ name: "f-github", path: path.join(__dirname, "SKILL.md") }],
+    name: "gh",
+    skills: [{ name: "f-gh", path: path.join(__dirname, "SKILL.md") }],
     desc: "GitHub API via @octokit/rest (whoami/repo/issue/pr/release/search/raw); token from creds (gh-token)",
     run: async (_argv, args, ctx) => {
       const _ = args._ ?? [];
