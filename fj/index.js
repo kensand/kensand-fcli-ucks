@@ -428,6 +428,10 @@ function usage() {
     "  --wait [sec]             block until a cred appears (default 300s). Off by\n" +
     "                           default: without a token fj fails immediately and\n" +
     "                           says whether creds are locked or simply unset.\n" +
+    "  runs [newest|<run_id>]   list recent action runs (id status event sha ref) / show one\n" +
+    "  runs <run_id> --joblogs [grep] [--job <n>] [--out dir]  download+grep a run's job logs\n" +
+    "  joblogs <run_id> ...     same as `runs <run_id> --joblogs`\n" +
+    "  --repo <owner>/<repo>    (runs/joblogs) target repo; default: git origin\n" +
     "  --timeout <sec>          deprecated alias for --wait <sec>"
   );
 }
@@ -573,6 +577,228 @@ async function cmdLs(query) {
  * endpoint for logs at all, so it must be a raw GET.
  * */
 
+// ---- actions (runs / joblogs) ----
+//
+// The run ids that appear in these commands are the listActionRuns[].id
+// values (e.g. 3583). The web UI's /actions/runs/10 uses run_number (a
+// different counter); /actions/tasks ids are per-attempt row ids. Only
+// the former work with /actions/runs/{run_id}.
+
+async function actionsBase(flagUrl) {
+  const base = resolveBaseUrl(flagUrl);
+  if (!base) err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
+  return apiUrl(base);
+}
+
+async function actionsClient(flagUrl, flagToken, credsApi, opts) {
+  const base = resolveBaseUrl(flagUrl);
+  if (!base) err("no base url (not in a git clone; pass --url)");
+  const tok = await resolveToken(flagToken, base, credsApi, opts);
+  needToken(tok);
+  await sdk();
+  // A raw-path client: the actions endpoints we need (run listing, run detail,
+  // run jobs, run logs) take the repo as ownerName/repoName in their declared
+  // parameters, but the named SDK fns bind the TEMPLATE names {owner}/{repo},
+  // so passing ownerName=... through splitParams leaves the braces unfilled
+  // and Forgejo 404s looking up a user literally named "{owner}".
+  return makeClient(apiUrl(base), tok.token);
+}
+
+function parseKvPairs(tokens) {
+  const out = {};
+  for (const t of tokens) {
+    const eq = t.indexOf("=");
+    if (eq <= 0) continue;
+    const k = t.slice(0, eq);
+    let v = t.slice(eq + 1);
+    if (v !== "" && /^[[{\d-]|^(true|false|null)$/.test(v)) {
+      try { v = JSON.parse(v); } catch { /* keep as string */ }
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
+function parseRepoPath(p) {
+  const m = p.match(/^\/repos\/([^/]+)\/([^/]+)\/?(.*)$/);
+  if (!m) err(`expected /repos/<owner>/<repo>[/...] or <owner>/<repo>[/...]`);
+  return { owner: m[1], repo: m[2], rest: m[3] || null };
+}
+
+function repoPathFromCwd() {
+  // <owner>/<repo> from the git origin of the current directory.
+  try {
+    const out = execSync("git remote get-url origin", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    if (!out) err("no git origin in current directory; pass <owner>/<repo>");
+    // https://host/owner/repo(.git) or [user@]host:owner/repo(.git)
+    const m = out.match(/[:/]([^/:\s]+)\/([^/:\s]+?)(?:\.git)?$/);
+    if (!m) err(`cannot parse owner/repo from git origin: ${out}`);
+    return `${m[1]}/${m[2]}`;
+  } catch {
+    err("no git origin in current directory; pass <owner>/<repo>");
+  }
+}
+
+function repoPathArg(rest) {
+  // Explicit --repo value wins, else the first bare owner/repo token, else
+  // the git origin of the current directory. Tokens with '=' or '-' are
+  // key=value pairs or flags and are never candidates.
+  const i = rest.indexOf("--repo");
+  if (i !== -1) {
+    const v = rest[i + 1];
+    if (!v || v.includes("/")) return v;
+    err("--repo needs <owner>/<repo>");
+  }
+  const p = rest.find((t) => !t.startsWith("-") && !t.includes("=") && t !== "newest" && !/^\d+$/.test(t) && t.includes("/"));
+  return p ? p : repoPathFromCwd();
+}
+
+function runLine(r) {
+  const sha = String(r.commit_sha || "").slice(0, 8);
+  const ref = r.prettyref || r.head_branch || "";
+  const concl = r.conclusion || r.status || "";
+  const dur = r.duration ? ` ${Math.round(r.duration / 60000000000)}m` : "";
+  const id = r.id != null ? r.id : "?";
+  return `${id}\t${concl.padEnd(10)}\t${r.event || "".padEnd(14)}\t${sha}\t${ref}${dur}`;
+}
+
+async function cmdActionsRuns(sub, rest, flagUrl, flagToken, credsApi, opts) {
+  const i = rest.indexOf("--joblogs");
+  if (i !== -1) return cmdJoblogs(rest.filter((_, j) => j !== i), flagUrl, flagToken, credsApi, opts);
+  if (i === -1 && sub === "joblogs") return cmdJoblogs(rest, flagUrl, flagToken, credsApi, opts);
+  if (sub !== "runs" && sub !== "run") err("usage: f fj runs [newest|<run_id>] [--repo <owner>/<repo>] [--watch] [--joblogs] | f fj runs <run_id> --joblogs [--job <name>] [grep]");
+
+  const repoPath = repoPathArg(rest);
+  const { owner, repo } = parseRepoPath("/repos/" + repoPath);
+  const client = await actionsClient(flagUrl, flagToken, credsApi, opts);
+  await sdk();
+
+  const idArg = rest.find((t) => /^\d+$/.test(t));
+  const newest = rest.includes("newest") || !idArg;
+
+  if (!newest) {
+    const rRes = await client.get({ url: `/repos/${owner}/${repo}/actions/runs/${idArg}`, throwOnError: false });
+    if (rRes?.error) return finish(rRes);
+    const r = rRes.data;
+    const jobsRes = await client.get({ url: `/repos/${owner}/${repo}/actions/runs/${idArg}/jobs`, throwOnError: false });
+    if (jobsRes?.error && jobsRes.data?.message) {
+      process.stderr.write("  (jobs: " + jobsRes.data.message + ")\n");
+    } else {
+      for (const j of jobsRes?.data || []) {
+        process.stdout.write(`  job ${j.id}\t${(j.status || "").padEnd(10)}\t${j.name}\n`);
+      }
+    }
+    return process.stdout.write(runLine(r) + "\n");
+  }
+
+  const fetchLatest = async () => {
+    const res = await client.get({ url: `/repos/${owner}/${repo}/actions/runs`, query: { limit: 10 }, throwOnError: false });
+    if (res?.error) return finish(res);
+    return res.data?.workflow_runs || [];
+  };
+
+  if (rest.includes("--watch")) {
+    const seen = new Set();
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const runs = await fetchLatest();
+      for (const r of runs) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        process.stdout.write(runLine(r) + "\n");
+      }
+      await new Promise((r) => setTimeout(r, 20000));
+    }
+  }
+
+  const runs = await fetchLatest();
+  for (const r of runs) process.stdout.write(runLine(r) + "\n");
+}
+
+async function cmdJoblogs(rest, flagUrl, flagToken, credsApi, opts) {
+  // f fj joblogs <run_id> [--job <name|substring>] [grep] [--out <dir>]
+  const idArg = rest.find((t) => /^\d+$/.test(t));
+  if (!idArg) err("usage: f fj joblogs <run_id> [--job <name|substring>] [grep] [--out <dir>]");
+  const jobI = rest.indexOf("--job");
+  const jobFilter = jobI !== -1 ? rest[jobI + 1] : null;
+  const outI = rest.indexOf("--out");
+  const outDir = outI !== -1 ? rest[outI + 1] : null;
+  const known = new Set([idArg, "--job", jobFilter, "--out", outDir]);
+  const grep = rest.filter((t) => !known.has(t)).join(" ");
+  if (!grep && !outDir) err("nothing to do: pass a grep pattern and/or --out <dir> to keep the raw logs");
+
+  const repoPath = repoPathArg(rest);
+  const { owner, repo } = parseRepoPath("/repos/" + repoPath);
+  const client = await actionsClient(flagUrl, flagToken, credsApi, opts);
+
+  const res = await client.get({
+    url: `/repos/${owner}/${repo}/actions/runs/${idArg}/logs`,
+    responseType: "arraybuffer",
+    throwOnError: false,
+  });
+  if (res?.error) {
+    const msg = res.error?.response?.data?.message || res.error?.message || "request failed";
+    err(`log download failed: ${msg} (need read access to repo actions)`);
+  }
+  const buf = Buffer.from(res?.data ?? Buffer.alloc(0));
+  // Minimal ZIP central-directory reader (stored + deflate entries via
+  // node:zlib.inflateRawSync). The Actions logs endpoint returns a zip with
+  // one <job>-<jobid>-attempt-N.log per job.
+  const zlib = await import("node:zlib");
+  const files = {};
+  const end = buf.indexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (end < 0) err("log download is not a zip archive");
+  const cdOff = buf.readUInt32LE(end + 16);
+  let p = cdOff;
+  while (p + 46 <= buf.length && buf.readUInt32LE(p) === 0x02014b50) {
+    const method = buf.readUInt16LE(p + 10);
+    const cSize = buf.readUInt32LE(p + 20);
+    const nLen = buf.readUInt16LE(p + 28);
+    const xLen = buf.readUInt16LE(p + 30);
+    const cLen = buf.readUInt16LE(p + 32);
+    const lOff = buf.readUInt32LE(p + 42);
+    const name = buf.toString("utf8", p + 46, p + 46 + nLen);
+    const nlLen = buf.readUInt16LE(lOff + 26);
+    const xlLen = buf.readUInt16LE(lOff + 28);
+    const dStart = lOff + 30 + nlLen + xlLen;
+    const raw = buf.subarray(dStart, dStart + cSize);
+    files[name] = method === 0 ? raw : zlib.inflateRawSync(raw);
+    p += 46 + nLen + xLen + cLen;
+  }
+  const names = Object.keys(files);
+  if (!names.length) err("log zip is empty");
+
+  const jobFiles = jobFilter ? names.filter((n) => n.toLowerCase().includes(jobFilter.toLowerCase())) : names;
+  if (jobFilter && !jobFiles.length) {
+    process.stderr.write("matching jobs: " + names.join(" | ") + "\n");
+    err(`no log matches --job '${jobFilter}'`);
+  }
+
+  if (outDir) {
+    fs.mkdirSync(outDir, { recursive: true });
+    for (const n of jobFiles) {
+      fs.writeFileSync(path.join(outDir, n), files[n]);
+      process.stdout.write(`saved ${n} -> ${path.join(outDir, n)}\n`);
+    }
+  }
+
+  if (grep) {
+    let re;
+    try { re = new RegExp(grep, "i"); } catch { re = new RegExp(grep.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); }
+    let hits = 0;
+    for (const n of jobFiles) {
+      const text = files[n].toString("utf8");
+      text.split("\n").forEach((line, i) => {
+        if (re.test(line)) {
+          hits++;
+          process.stdout.write(`${n}:${i + 1}:${line}\n`);
+        }
+      });
+    }
+    if (!hits) process.stderr.write(`no lines matching /${grep}/\n`);
+  }
+}
+
 async function cmdCall(name, params, rawUrl, rawMethod, credsApi, opts = {}) {
   const base = resolveBaseUrl(null);
   if (!base) err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
@@ -697,6 +923,10 @@ export function register(_ctx) {
         await sdk();
         const res = await _sdk.userGetCurrent({ client, throwOnError: false });
         return finish(res);
+      }
+
+      if (cmd === "runs" || cmd === "joblogs") {
+        return cmdActionsRuns(cmd, rest, flagUrl, flagToken, credsApi, opts);
       }
 
       if (cmd === "call") {
