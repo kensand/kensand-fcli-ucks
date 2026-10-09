@@ -712,7 +712,9 @@ async function cmdActionsRuns(sub, rest, flagUrl, flagToken, credsApi, opts) {
   }
 
   const runs = await fetchLatest();
-  for (const r of runs) process.stdout.write(runLine(r) + "\n");
+  for (const r of runs) {
+    try { process.stdout.write(runLine(r) + "\n"); } catch { break; } // EPIPE: consumer (e.g. head) went away
+  }
 }
 
 async function cmdJoblogs(rest, flagUrl, flagToken, credsApi, opts) {
