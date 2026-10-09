@@ -1,0 +1,10 @@
+{
+  "name": "@fcli/uck-github",
+  "version": "0.1.0",
+  "description": "f github: GitHub REST API via @octokit/rest",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@octokit/rest": "^22.0.0"
+  }
+}
