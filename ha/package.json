@@ -1,0 +1,7 @@
+{
+  "name": "@fcli/uck-ha",
+  "version": "0.1.0",
+  "description": "f ha: Home Assistant REST API (states, services, scenes, automations, history, weather, calendars)",
+  "type": "module",
+  "main": "index.js"
+}
