@@ -38,6 +38,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
+import { fileURLToPath as _f2p } from "node:url";
+const _here = path.dirname(_f2p(import.meta.url));
 
 const F = path.join(process.env.HOME ?? "", ".f");
 const CRED_SOCKET = path.join(F, ".creds.sock");
@@ -536,6 +538,7 @@ function usage() {
 export function register(_ctx) {
   return {
     name: "ha",
+    skills: [{ name: "f-ha", path: path.join(_here, "SKILL.md") }],
     desc: "Home Assistant: states, service calls, scenes, automations, history, weather, calendars; creds: <host>-host + <host>-token (or combined <host> = url|token)",
     run: async (_argv, args, ctx) => {
       const _ = args._ ?? [];

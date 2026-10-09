@@ -949,9 +949,13 @@ function finish(res) {
 }
 
 // ---- entry ----
+import { fileURLToPath as _f2p } from "node:url";
+const _here = path.dirname(_f2p(import.meta.url));
+
 export function register(_ctx) {
   return {
     name: "fj",
+    skills: [{ name: "f-fj", path: path.join(_here, "SKILL.md") }],
     desc: "Forgejo/Gitea API via @llamaduck/forgejo-ts (ls/call/<METHOD> <path>); base from git origin, token from creds",
     run: async (_argv, args, ctx) => {
       const _ = args._ ?? [];
