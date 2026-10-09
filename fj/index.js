@@ -413,6 +413,99 @@ function err(msg) {
 }
 
 // ---- commands ----
+const PR_ICONS = { success: "+", failure: "x", pending: "o", error: "x", cancelled: "-" };
+
+function prStatusLines(s) {
+  const st = (s.statuses || []).map((x) =>
+    `${PR_ICONS[x.status] ?? "?"} ${x.context || "?"}${x.description ? ` — ${x.description}` : ""}${x.target_url ? ` (${x.target_url})` : ""}`,
+  );
+  const lines = [
+    `  ci: ${s.state}${st.length ? ` (${s.total_count} context${s.total_count === 1 ? "" : "s"})` : ""}`,
+  ];
+  for (const l of st) lines.push(`    ${l}`);
+  return lines;
+}
+
+async function cmdPr(sub, rest, flagUrl, flagToken, credsApi, opts) {
+  const repoPath = repoPathArg(rest);
+  const { owner, repo } = parseRepoPath("/repos/" + repoPath);
+  const client = await actionsClient(flagUrl, flagToken, credsApi, opts);
+
+  // -m/--style for merge
+  let style = "squash";
+  const mi = rest.indexOf("-m");
+  const mi2 = rest.indexOf("--style");
+  if (mi !== -1) style = rest[mi + 1];
+  if (mi2 !== -1) style = rest[mi2 + 1];
+  // number is the first bare integer token
+  const numberArg = rest.find((t) => /^\d+$/.test(t));
+  const number = numberArg ? Number(numberArg) : null;
+
+  const getJson = async (url, query) => {
+    const res = await client.get({ url, query, throwOnError: false });
+    if (res?.error) return { res, data: res.data };
+    return { res, data: res.data };
+  };
+
+  if (sub === "check" || sub === "ci") {
+    let n = number;
+    if (!n) {
+      const branch = execSync("git rev-parse --abbrev-ref HEAD", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+      const r = (await getJson(`/repos/${owner}/${repo}/pulls`, { state: "open", limit: 50 })).data;
+      const hit = Array.isArray(r) ? r.find((p) => p.head && (p.head.label === branch || p.head.ref === branch)) : null;
+      if (!hit) return err(`no open PR for branch ${branch} in ${owner}/${repo}`);
+      n = hit.number;
+    }
+    const pr = (await getJson(`/repos/${owner}/${repo}/pulls/${n}`)).data;
+    if (!pr || pr.message) return err(`pr ${n}: ${pr?.message ?? "not found"}`);
+    const merge = pr.merged ? "merged" : pr.has_conflicts ? "CONFLICTS" : pr.mergeable ? "mergeable" : "unknown";
+    const lines = [`#${n} ${pr.title} [${pr.state}]`, `  merge: ${merge}`];
+    const commits = (await getJson(`/repos/${owner}/${repo}/pulls/${n}/commits`)).data;
+    if (Array.isArray(commits) && commits.length) {
+      const head = commits[commits.length - 1].sha;
+      const cs = (await getJson(`/repos/${owner}/${repo}/commits/${head}/status`)).data;
+      if (cs && cs.state) lines.push(...prStatusLines(cs));
+    }
+    return process.stdout.write(lines.join("\n") + "\n");
+  }
+
+  if (sub === "status") {
+    // ref = first positional token that is not the --repo value
+    const repoIdx = rest.indexOf("--repo");
+    const repoVal = repoIdx !== -1 ? rest[repoIdx + 1] : null;
+    const ref = rest.find((t, i) => !t.startsWith("-") && i !== repoIdx + 1 && t !== repoVal) || "HEAD";
+    let sha;
+    try {
+      sha = execSync(`git rev-parse --verify --quiet ${ref}^{commit}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    } catch { sha = ""; }
+    if (!sha) return err(`cannot resolve ref: ${ref}`);
+    const cs = (await getJson(`/repos/${owner}/${repo}/commits/${sha}/status`)).data;
+    if (!cs || cs.message) return err(`status for ${sha.slice(0, 7)}: ${cs?.message ?? "not found"}`);
+    const lines = [`${sha.slice(0, 7)}: ${cs.state}${(cs.statuses || []).length ? ` (${cs.total_count} context${cs.total_count === 1 ? "" : "s"})` : ""}`];
+    for (const l of prStatusLines(cs)) lines.push(l.replace(/^    /, "  "));
+    return process.stdout.write(lines.join("\n") + "\n");
+  }
+
+  if (sub === "merge" || sub === "m") {
+    if (!number) return err("pr merge needs a PR number");
+    const res = await client.put({ url: `/repos/${owner}/${repo}/pulls/${number}/merge`, body: { merge_style: style, run_status_checks: false }, throwOnError: false });
+    if (res?.error) {
+      const msg = res.data?.message || res.data?.error || res.error?.message || "merge failed";
+      return err(`merge #${number} failed: ${msg}`);
+    }
+    return process.stdout.write(`merged #${number} (${style})\n`);
+  }
+
+  if (sub === "open" || sub === "ls") {
+    const r = (await getJson(`/repos/${owner}/${repo}/pulls`, { state: "open", limit: 30 })).data;
+    if (!Array.isArray(r)) return err(`list failed`);
+    if (!r.length) return process.stdout.write("no open PRs\n");
+    return process.stdout.write(r.map((p) => `#${p.number} ${p.title} [${(p.head && p.head.label) || (p.head && p.head.ref)}]`).join("\n") + "\n");
+  }
+
+  err("usage: f fj pr <check [number]|merge [number] [-m style]|status <sha|ref>|open>");
+}
+
 function usage() {
   err(
     "usage: f fj <cmd>\n" +
@@ -431,7 +524,11 @@ function usage() {
     "  runs [newest|<run_id>]   list recent action runs (id status event sha ref) / show one\n" +
     "  runs <run_id> --joblogs [grep] [--job <n>] [--out dir]  download+grep a run's job logs\n" +
     "  joblogs <run_id> ...     same as `runs <run_id> --joblogs`\n" +
-    "  --repo <owner>/<repo>    (runs/joblogs) target repo; default: git origin\n" +
+    "  pr check [number]        PR + CI status (default: PR of head branch)\n" +
+    "  pr merge [number] [-m squash|merge|rebase]   merge a PR (default squash)\n" +
+    "  pr status <sha|ref>      commit CI status (e.g. HEAD, origin/main)\n" +
+    "  pr open                  list open PRs of the current repo\n" +
+    "  --repo <owner>/<repo>    (runs/joblogs/pr) target repo; default: git origin\n" +
     "  --timeout <sec>          deprecated alias for --wait <sec>"
   );
 }
@@ -929,6 +1026,11 @@ export function register(_ctx) {
 
       if (cmd === "runs" || cmd === "joblogs") {
         return cmdActionsRuns(cmd, rest, flagUrl, flagToken, credsApi, opts);
+      }
+
+      if (cmd === "pr") {
+        const [sub, ...prRest] = rest;
+        return cmdPr(sub, prRest, flagUrl, flagToken, credsApi, opts);
       }
 
       if (cmd === "call") {
