@@ -213,7 +213,7 @@ async function cmdRepo(rest, c) {
   if (sub === "ls" || !sub) {
     // no repo → list user's repos; with repo → show repo
     if (!repo) {
-      const { data } = await ok.repos.list({ type: "owner", per_page: 100 });
+      const { data } = await ok.repos.listForAuthenticatedUser({ affiliation: "owner", per_page: 100 });
       outLines(data.map((r) => `${r.owner.login}/${r.name}  ${r.private ? "private" : "public"}  ${r.description || ""}`.trimEnd()));
       return;
     }
@@ -276,11 +276,13 @@ async function cmdRelease(rest, c) {
   const sub = rest.find((t) => !t.startsWith("-") && t !== repo);
   if (sub === "new" || sub === "create") {
     const params = parseParams(rest.filter((t, i) => t !== "new" && t !== "create" && t !== repo));
-    const { data } = await ok.releases.create({ owner, repo: name, tag_name: params.tag_name, name: params.name, body: params.body, draft: !!params.draft, prerelease: !!params.prerelease });
+    const res = await ok.request("POST /repos/{owner}/{repo}/releases", { owner, repo: name, ...params, draft: !!params.draft, prerelease: !!params.prerelease });
+    const data = res.data;
     out({ tag: data.tag_name, name: data.name, draft: data.draft, url: data.html_url });
     return;
   }
-  const { data } = await ok.releases.list({ owner, repo: name, per_page: 20 });
+  const res = await ok.request("GET /repos/{owner}/{repo}/releases", { owner, repo: name, per_page: 20 });
+  const data = res.data;
   outLines(data.map((r) => `${r.tag_name}  ${r.draft ? "draft" : r.prerelease ? "prerelease" : "release"}  ${r.name || ""}  ${r.published_at || ""}`.trimEnd()));
 }
 
