@@ -536,7 +536,7 @@ function usage() {
 export function register(_ctx) {
   return {
     name: "ha",
-    desc: "Home Assistant: states, service calls, scenes, automations, history, weather, calendars; token from creds (host-keyed)",
+    desc: "Home Assistant: states, service calls, scenes, automations, history, weather, calendars; creds: <host>-host + <host>-token (or combined <host> = url|token)",
     run: async (_argv, args, ctx) => {
       const _ = args._ ?? [];
       let flagUrl = null;
