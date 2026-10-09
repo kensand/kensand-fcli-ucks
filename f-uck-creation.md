@@ -1,6 +1,6 @@
 ---
 name: f-uck-creation
-description: Create and publish new f ucks. Trigger: a command has been used multiple times and has no covering uck.
+description: Create and publish new f ucks. Trigger - a command has been used multiple times and has no covering uck.
 ---
 
 # Creating ucks
