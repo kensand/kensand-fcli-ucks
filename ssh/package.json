@@ -1,0 +1,8 @@
+{
+  "name": "@fcli/uck-ssh",
+  "version": "0.1.0",
+  "description": "f ssh: ssh hosts, config and authorized_keys, carried between machines via 'f creds files'",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {}
+}
