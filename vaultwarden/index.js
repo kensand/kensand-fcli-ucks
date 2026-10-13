@@ -1,0 +1,896 @@
+#!/usr/bin/env node
+// f vaultwarden — read (and patch) secrets from a Vaultwarden vault, and act as
+// a credential provider for `f creds`.
+//
+// ## How it fits together
+//
+//   ~/.f/f.config.json          server + email (non-secret)
+//   creds: vaultwarden.client-id / .client-secret   API key (optional)
+//   creds: vaultwarden.master-password              the master password
+//   creds: mirror:<name>        vault values mirrored locally, with an expiry
+//
+// `f creds get <name>` reaches this uck through the provider table when it has
+// no local value; see creds/providers.js. That path runs `index.js resolve`, so
+// importing this module must stay side-effect free — hence uckMain().
+//
+// ## The constraint that shapes every decision here
+//
+// An API key (grant_type=client_credentials) only buys an access token. It
+// cannot decrypt: Bitwarden's vault is end-to-end encrypted with a key derived
+// from the master password, so the master password is required for any read
+// (bitwarden/clients#18097). The API key's real value is that it bypasses 2FA
+// and avoids the interactive login dance.
+//
+// Consequently this uck does NOT do a password login when an API key is
+// configured, even though it could. A password grant with 2FA enabled fails, and
+// failing that way would look like a broken password.
+
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+import readline from "node:readline";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+
+import { uckMain } from "../../fcli-ucks/lib/uckmain.js";
+import {
+  VaultwardenApi,
+  deriveKeys,
+  decryptVault,
+  decryptString,
+  encryptString,
+  CIPHER_TYPE,
+} from "./lib/vwclient.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const F = path.join(process.env.HOME ?? "", ".f");
+const CONFIG = path.join(F, "f.config.json");
+
+// cred names inside the store
+const C_SERVER = "vaultwarden.server";
+const C_EMAIL = "vaultwarden.email";
+const C_CLIENT_ID = "vaultwarden.client-id";
+const C_CLIENT_SECRET = "vaultwarden.client-secret";
+const C_MASTER = "vaultwarden.master-password";
+const C_TOKEN = "vaultwarden.access-token";
+const C_REFRESH = "vaultwarden.refresh-token";
+const C_KEY_CACHE = "vaultwarden.key-cache";
+
+/** How long a mirrored value may sit before `f creds` re-asks the vault. */
+const MIRROR_TTL_SEC = 3600;
+/** How long derived vault keys may be kept, so reads do not redo PBKDF2. */
+const KEY_CACHE_TTL_SEC = 8 * 3600;
+
+/* --------------------------------------------------------------- config */
+
+function readJson(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function writeJson(p, obj) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", { mode: 0o600 });
+  fs.chmodSync(p, 0o600);
+}
+
+/** Server + email live in f.config.json; secrets live in the creds store. */
+function vwConfig() {
+  const cfg = readJson(CONFIG);
+  const v = cfg.vaultwarden ?? cfg.vault ?? {};
+  return {
+    server: v.server ?? null,
+    email: v.email ?? null,
+    // Optional override; the store's value wins when present.
+    masterPasswordCred: v.masterPasswordCred ?? C_MASTER,
+    allowInsecureHttp: !!v.allowInsecureHttp,
+    timeoutMs: Number(v.timeoutMs ?? 20000),
+    map: v.map ?? {},          // cred name -> "Item Name::password"
+    extraNames: v.extraNames ?? {}, // vault item name -> [extra cred names]
+  };
+}
+
+function saveVwConfig(patch) {
+  const cfg = readJson(CONFIG);
+  cfg.vaultwarden = { ...(cfg.vaultwarden ?? {}), ...patch };
+  writeJson(CONFIG, cfg);
+  return cfg.vaultwarden;
+}
+
+/* ---------------------------------------------------- creds store access */
+
+/** Ask `f creds` for a value. Returns null when locked/absent; throws on a real
+ *  provider error so it is never mistaken for "not set". */
+function credsGet(name) {
+  try {
+    const out = execFileSync("f", ["creds", "get", name, "--secrets", "--local"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return out.replace(/\n$/, "");
+  } catch (e) {
+    const err = (e?.stderr ?? "").toString();
+    if (/no such cred/.test(err)) return null;
+    if (/locked/.test(err)) throw new Error("creds are locked — run: f creds unlock");
+    throw new Error(err.trim() || `f creds get ${name} failed`);
+  }
+}
+
+function credsSet(name, value) {
+  // Deliberately NOT `f creds set <name> <value>`: that puts the secret in argv,
+  // where any process can read it from `ps` for the lifetime of the command. The
+  // daemon's socket takes the value in a JSON body instead.
+  const sock = (() => {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(F, ".creds-daemon"), "utf8")).socket;
+    } catch {
+      throw new Error("creds are locked — run: f creds unlock");
+    }
+  })();
+  return new Promise((resolve, reject) => {
+    const c = net.connect(sock, () => c.write(JSON.stringify({ op: "set", name, value: String(value) })));
+    let buf = "";
+    c.on("data", (d) => (buf += d));
+    c.on("end", () => {
+      try {
+        const r = JSON.parse(buf);
+        r.ok ? resolve(true) : reject(new Error(r.error));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    c.on("error", reject);
+  });
+}
+
+function credsRm(name) {
+  try {
+    execFileSync("f", ["creds", "rm", name], { stdio: ["ignore", "ignore", "pipe"], timeout: 10000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function credsStatus() {
+  try {
+    const out = execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
+    return { unlocked: /^unlocked/m.test(out), text: out.trim().split("\n")[0] };
+  } catch {
+    return { unlocked: false, text: "locked" };
+  }
+}
+
+/* -------------------------------------------------------- secret prompt */
+
+/** Read a secret from the TTY without echoing. */
+async function promptSecret(label) {
+  if (!process.stdin.isTTY) {
+    const rl = readline.createInterface({ input: process.stdin });
+    const line = await new Promise((r) => rl.question(label, (a) => { rl.close(); r(a); }));
+    return line;
+  }
+  return new Promise((resolve) => {
+    const stdin = process.stdin;
+    const wasRaw = stdin.isRaw;
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    process.stderr.write(label);
+    let buf = "";
+    const cleanup = () => {
+      stdin.removeListener("data", onData);
+      stdin.setRawMode(wasRaw ?? false);
+      stdin.pause();
+    };
+    const onData = (ch) => {
+      for (const c of ch.toString()) {
+        if (c === "\n" || c === "\r") { cleanup(); process.stderr.write("\n"); resolve(buf); return; }
+        if (c === "\x7f" || c === "\x08") { if (buf.length) buf = buf.slice(0, -1); }
+        else if (c === "\x03") { cleanup(); process.stderr.write("\n"); process.exit(1); }
+        else buf += c;
+      }
+    };
+    stdin.on("data", onData);
+  });
+}
+
+/* -------------------------------------------------------- name matching */
+
+/** Host part of a cred name: `forgejo.kensand.net` or `github.com:443`. */
+function nameHost(name) {
+  const s = String(name ?? "").trim().toLowerCase();
+  if (!s) return null;
+  // A cred name is a bare host, or a vault item name. Only the host form gets
+  // uri matching; item names are matched by name elsewhere.
+  return /^[a-z0-9._-]+(:\d+)?$/.test(s) ? s.split(":")[0] : null;
+}
+
+/** Normalize a vault uri ("https://x.y/path") to a comparable host. */
+function uriHost(uri) {
+  if (!uri) return null;
+  const s = String(uri).trim().toLowerCase();
+  if (!s) return null;
+  try {
+    return new URL(s).hostname;
+  } catch {
+    return s.replace(/^[a-z0-9+.-]+:\/\//, "").split(/[/?#]/)[0].split("@").pop() || null;
+  }
+}
+
+/** Does an item uri stand for this host? Supports Bitwarden's wildcard form. */
+function uriMatchesHost(uri, host) {
+  const uh = uriHost(uri);
+  if (!uh || !host) return false;
+  if (uh === host) return true;
+  if (uh.startsWith("*.")) {
+    const base = uh.slice(2);
+    return host === base || host.endsWith(`.${base}`);
+  }
+  return false;
+}
+
+/** Map a vault item to the cred names it can answer. */
+function namesForItem(item, cfg) {
+  const out = new Set();
+  // 1. explicit map entries whose target names this item
+  for (const [credName, selector] of Object.entries(cfg.map ?? {})) {
+    const target = String(selector).split("::")[0].trim().toLowerCase();
+    if (target && (target === item.name.trim().toLowerCase() || target === item.id.toLowerCase())) out.add(credName);
+  }
+  // 2. declared aliases
+  for (const [vaultName, extras] of Object.entries(cfg.extraNames ?? {})) {
+    if (vaultName.trim().toLowerCase() === item.name.trim().toLowerCase()) for (const e of extras ?? []) out.add(e);
+  }
+  // 3. the item's own name and id (ids are unique; names are not)
+  out.add(item.name.trim());
+  out.add(item.id);
+  // 4. its uris' hosts
+  for (const uri of item.uriList()) {
+    const h = uriHost(uri);
+    if (h) out.add(h);
+  }
+  return [...out];
+}
+
+/* ------------------------------------------------------ session handling */
+
+/**
+ * Get an authenticated, decrypted view of the vault.
+ *
+ * Order: cached derived keys -> API-key token + master password -> error with
+ * the exact thing to fix. Never attempts a password grant (see file header).
+ */
+async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp = false } = {}) {
+  const cfg = vwConfig();
+  if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
+  if (!cfg.email) throw new Error(`no email configured\n  f vaultwarden config --email you@example.com`);
+  const status = credsStatus();
+  if (!status.unlocked) throw new Error(`creds are locked (the vault's master password lives in the store)\n  f creds unlock`);
+
+  const api = new VaultwardenApi({
+    server: cfg.server,
+    email: cfg.email,
+    timeoutMs: cfg.timeoutMs,
+    allowInsecureHttp: allowInsecureHttp || cfg.allowInsecureHttp,
+  });
+
+  // Fast path: cached derived keys + token, so reads do not redo PBKDF2 (~1s).
+  if (!forceUnlock) {
+    const hit = await tryCachedSession(api);
+    if (hit) return { api, cfg, keys: hit.keys, items: decryptVault(hit.payload, hit.keys), fromCache: true };
+  }
+
+  const clientId = credsGet(C_CLIENT_ID);
+  const clientSecret = credsGet(C_CLIENT_SECRET);
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      `no API key stored, and a master password alone cannot obtain a token\n` +
+      `  web vault -> Settings -> Security -> Keys -> API key:\n` +
+      `  f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
+      `  f creds set ${C_CLIENT_SECRET} '<client secret>'\n` +
+      `  (the API key exists to skip 2FA; it cannot decrypt anything by itself)`,
+    );
+  }
+  const master = credsGet(cfg.masterPasswordCred);
+  if (!master) {
+    throw new Error(
+      `no master password stored — the vault cannot be decrypted without one\n` +
+      `  f vaultwarden config --master-password   (prompts, then stores it)\n` +
+      `  An API key alone is not enough: vault contents are end-to-end encrypted\n` +
+      `  with a key derived from the master password, which the API key cannot replace.`,
+    );
+  }
+
+  await api.loginApiKey({ clientId, clientSecret });
+  const pre = await api.prelogin(cfg.email);
+  const sync = await api.sync();
+  const encKey = sync?.profile?.key;
+  if (!encKey) throw new Error(`sync returned no profile.key — account may not be set up, or the token lacks vault scope`);
+  let keys;
+  try {
+    keys = deriveKeys({ email: cfg.email, password: master, kdfIterations: pre.kdfIterations, encryptedKey: encKey });
+  } catch (e) {
+    if (/MAC verification failed/.test(String(e.message))) {
+      throw new Error(`master password is wrong (key unwrap failed MAC check) — do not retry blindly, retype it: f vaultwarden config --master-password`);
+    }
+    throw e;
+  }
+  await writeKeyCache(cfg, keys, api.accessToken, api.refreshToken);
+  // Re-read via /api/ciphers. If that fails we fall back to the sync we already
+  // hold — but only when it actually carries ciphers; treating a cipher-less
+  // sync as "0 items" would make a transient failure look like an empty vault,
+  // and every lookup would then report "no such item".
+  let payload = null;
+  try {
+    payload = await api.ciphers();
+  } catch (e) {
+    if (Array.isArray(sync?.ciphers)) payload = sync;
+    else throw new Error(`vault read failed: ${e.message} (sync carried no ciphers to fall back on)`);
+  }
+  const items = decryptVault(payload, keys);
+  return { api, cfg, keys, items, fromCache: false, kdf: pre };
+}
+
+/* ------------------------------------------------ key cache (in the box) */
+
+async function readKeyCache() {
+  let blob;
+  try {
+    blob = credsGet(C_KEY_CACHE);
+  } catch {
+    return null;
+  }
+  if (!blob) return null;
+  try {
+    const j = JSON.parse(blob);
+    if (!j?.exp || Date.now() > j.exp) { credsRm(C_KEY_CACHE); return null; }
+    if (!j.accessToken || !j.encKey || !j.macKey) return null;
+    const b64 = (s) => Buffer.from(s, "base64");
+    return {
+      accessToken: j.accessToken,
+      refreshToken: j.refreshToken ?? null,
+      keys: { encKey: b64(j.encKey), macKey: b64(j.macKey), symmetricKey: b64(j.encKey) },
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeKeyCache(cfg, keys, accessToken, refreshToken) {
+  if (!accessToken) return;
+  const blob = JSON.stringify({
+    exp: Date.now() + KEY_CACHE_TTL_SEC * 1000,
+    accessToken,
+    refreshToken: refreshToken ?? null,
+    encKey: keys.encKey.toString("base64"),
+    macKey: keys.macKey.toString("base64"),
+  });
+  await credsSet(C_KEY_CACHE, blob);
+}
+
+function dropKeyCache() {
+  credsRm(C_KEY_CACHE);
+}
+
+/**
+ * Serve a request from cached keys if possible.
+ *
+ * Returns { keys, payload }, or null when a full re-authentication is needed.
+ * A rejected access token is refreshed once (if a refresh token was cached);
+ * any other error propagates — a network failure is not a reason to re-derive
+ * keys and try the same request again.
+ */
+async function tryCachedSession(api) {
+  const cached = await readKeyCache();
+  if (!cached) return null;
+  api.setAccessToken(cached.accessToken);
+  try {
+    return { keys: cached.keys, payload: await api.ciphers() };
+  } catch (e) {
+    if (!/HTTP 401|HTTP 403/.test(String(e?.message))) throw e;
+    if (!cached.refreshToken) return null;
+    if (!(await api.refresh().catch(() => false))) return null;
+    try {
+      const payload = await api.ciphers();
+      // Keep the rotated token alongside the still-valid key material.
+      await credsSet(
+        C_KEY_CACHE,
+        JSON.stringify({
+          exp: Date.now() + KEY_CACHE_TTL_SEC * 1000,
+          accessToken: api.accessToken,
+          refreshToken: api.refreshToken,
+          encKey: cached.keys.encKey.toString("base64"),
+          macKey: cached.keys.macKey.toString("base64"),
+        }),
+      );
+      return { keys: cached.keys, payload };
+    } catch {
+      return null;
+    }
+  }
+}
+
+/* ------------------------------------------------------- item resolution */
+
+/**
+ * Find the vault item (+field) that answers cred `name`.
+ *
+ * Priority: explicit map → exact item name → unique uri host match. Anything
+ * ambiguous returns { ambiguous: [...] } rather than guessing: silently serving
+ * the wrong secret is worse than an error, and duplicate item names are normal
+ * in real vaults.
+ */
+function findValue(name, items, cfg, { suffix } = {}) {
+  const wanted = String(name).trim();
+  let selector = null;
+  let key = wanted;
+  if (wanted.includes("::")) {
+    const i = wanted.indexOf("::");
+    key = wanted.slice(0, i).trim();
+    suffix = wanted.slice(i + 2).trim() || suffix;
+  }
+  const lc = key.toLowerCase();
+
+  // 1. explicit map. The target may be an item NAME or an item ID; ids are
+  //    unique, so a map entry pointing at an id can never be ambiguous.
+  const mapped = Object.entries(cfg.map ?? {}).find(([k]) => k.toLowerCase() === lc);
+  if (mapped) {
+    const sel = String(mapped[1]);
+    const [itemName, field] = sel.includes("::") ? [sel.slice(0, sel.indexOf("::")), sel.slice(sel.indexOf("::") + 2)] : [sel, undefined];
+    const want = itemName.trim().toLowerCase();
+    const byId = items.filter((i) => i.id.toLowerCase() === want);
+    const hits = byId.length ? byId : items.filter((i) => i.name.trim().toLowerCase() === want);
+    if (!hits.length) return { unknown: `map entry '${mapped[0]}' -> item '${itemName}' does not exist in the vault (f vaultwarden list --search ${itemName})` };
+    if (hits.length > 1) return { ambiguous: hits.map(describe), reason: `map target '${itemName}' matches ${hits.length} items — point it at an item id instead` };
+    const value = hits[0].select(field);
+    if (value == null || value === "") return { unknown: `map entry '${mapped[0]}' -> '${sel}' has no value (item has: ${hits[0].fieldSummary().join(", ") || "nothing"})` };
+    return { value, item: hits[0], field: field ?? "password", via: "map" };
+  }
+
+  // 2. exact item name, then unique item id
+  const byName = items.filter((i) => i.name.trim().toLowerCase() === lc);
+  if (byName.length === 1) {
+    const value = byName[0].select(suffix);
+    if (value == null || value === "") return { unknown: `vault item '${byName[0].name}' has no ${suffix ?? "password"} (has: ${byName[0].fieldSummary().join(", ") || "nothing"})` };
+    return { value, item: byName[0], field: suffix ?? "password", via: "name" };
+  }
+  if (byName.length > 1) {
+    return { ambiguous: byName.map(describe), reason: `${byName.length} vault items are named '${key}' — disambiguate with a map entry pointing at an item id` };
+  }
+  const byId = items.filter((i) => i.id.toLowerCase() === lc);
+  if (byId.length === 1) {
+    const value = byId[0].select(suffix);
+    if (value == null || value === "") return { unknown: `vault item '${byId[0].name}' has no ${suffix ?? "password"} (has: ${byId[0].fieldSummary().join(", ") || "nothing"})` };
+    return { value, item: byId[0], field: suffix ?? "password", via: "id" };
+  }
+
+  // 3. unique uri host match
+  const host = nameHost(key);
+  if (host) {
+    const byUri = [];
+    for (const it of items) {
+      for (const uri of it.uriList()) if (uriMatchesHost(uri, host)) { byUri.push({ item: it, uri }); break; }
+    }
+    if (byUri.length === 1) {
+      const value = byUri[0].item.select(suffix);
+      if (value == null || value === "") return { unknown: `vault item '${byUri[0].item.name}' (uri ${byUri[0].uri}) has no ${suffix ?? "password"} (has: ${byUri[0].item.fieldSummary().join(", ") || "nothing"})` };
+      return { value, item: byUri[0].item, field: suffix ?? "password", via: `uri:${byUri[0].uri}` };
+    }
+    if (byUri.length > 1) {
+      return { ambiguous: byUri.map((h) => describe(h.item)), reason: `${byUri.length} vault items list a uri for '${host}' — disambiguate with a map entry` };
+    }
+  }
+  return { none: true };
+}
+
+const describe = (i) => `${i.name} [${i.id}] ${i.fieldSummary().join(",")}`;
+
+/* ---------------------------------------------------------- provider API */
+
+/**
+ * The provider object `f creds` discovers via `f providers --dump`.
+ *
+ * resolve() throws on availability failures (locked store, wrong master
+ * password, dns) so creds reports them instead of saying "no such cred".
+ */
+export const credentialProvider = {
+  name: "vaultwarden",
+  mirrorTtlSec: MIRROR_TTL_SEC,
+  status: () => providerStatus(vwConfig()),
+  resolve: async (name) => {
+    const cfg = vwConfig();
+    if (!cfg.server || !cfg.email) return null; // unconfigured: not ours
+    const { items } = await openVault({ quiet: true });
+    const res = findValue(name, items, cfg);
+    if (res.value != null) return res.value;
+    if (res.ambiguous) throw new Error(`${res.reason}: ${res.ambiguous.join(" | ")}`);
+    if (res.unknown) throw new Error(res.unknown);
+    return null; // genuinely unknown to the vault
+  },
+  // No `has()`: knowing whether a vault answers for `github.com` requires the
+  // item list (whose uris supply host names) or the password grant (2FA). A
+  // pre-filter that could only consult the map would veto resolve() for every
+  // name outside it — a confidently wrong "not mine". Cheaper instead to let
+  // resolve() answer, with the creds uck's mirror + negative cache absorbing
+  // the repeat cost.
+  list: async () => {
+    const cfg = vwConfig();
+    if (!cfg.server || !cfg.email) return [];
+    const { items } = await openVault({ quiet: true });
+    return items.flatMap((i) => namesForItem(i, cfg));
+  },
+};
+
+function providerStatus(cfg) {
+  if (!cfg.server) return { ready: false, note: "no server configured", hint: "f vaultwarden config --server https://vault.example.com --email you@example.com" };
+  if (!cfg.email) return { ready: false, note: `no email configured for ${cfg.server}`, hint: "f vaultwarden config --email you@example.com" };
+  const st = credsStatus();
+  if (!st.unlocked) return { ready: false, note: "creds locked", hint: "f creds unlock" };
+  let master = null, clientId = null;
+  try { master = credsGet(cfg.masterPasswordCred); clientId = credsGet(C_CLIENT_ID); } catch { return { ready: false, note: "creds locked", hint: "f creds unlock" }; }
+  if (!master) return { ready: false, note: `no master password (${cfg.masterPasswordCred})`, hint: "f vaultwarden config --master-password" };
+  if (!clientId) return { ready: false, note: `no API key (${C_CLIENT_ID})`, hint: "f creds set " + C_CLIENT_ID + " 'user.<uuid>' && f creds set " + C_CLIENT_SECRET + " '<secret>'" };
+  const cached = !!safeHasCache();
+  return { ready: true, note: `${cfg.server} as ${cfg.email}${cached ? " (keys cached)" : ""}` };
+}
+
+function safeHasCache() {
+  try {
+    const blob = credsGet(C_KEY_CACHE);
+    if (!blob) return false;
+    return Date.now() < JSON.parse(blob).exp;
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ cli */
+
+const USAGE =
+  "usage: f vaultwarden <cmd>\n" +
+  "  config [--server <url>] [--email <addr>] [--master-password] [--print]\n" +
+  "                                    set non-secret config; prompts for the\n" +
+  "                                    master password without echoing it\n" +
+  "  apikey <client-id> <client-secret> store the vault API key (skips 2FA)\n" +
+  "  status                            config + readiness + what it can answer\n" +
+  "  test                              login, decrypt, report (changes nothing)\n" +
+  "  list [--search <s>]               items + the cred names each can answer\n" +
+  "  get <name> [--secrets]            resolve one cred (item name, host, or map key)\n" +
+  "  map <cred-name> '<Item::field>'   pin a cred name to an item/field\n" +
+  "  unmap <cred-name>                 remove a map entry\n" +
+  "  set-totp <name> <secret>          WRITE: store a TOTP secret on an item\n" +
+  "  cache [--clear]                   vault key cache (skips PBKDF2 per read)\n" +
+  "  forget                            clear the key cache and cached tokens\n" +
+  "\n" +
+  "name forms: 'github.com'  'Item Name'  'Item Name::username'  '<cred>::totp'\n" +
+  "fields:     password (default) | username | totp | note | uri | field:<name>\n" +
+  "\n" +
+  "as a credential provider: `f creds get <name>` falls through to this uck on a\n" +
+  "local miss and mirrors the answer as mirror:<name> for " + MIRROR_TTL_SEC / 60 + "m.\n" +
+  "A master password is unavoidable — an API key authenticates but cannot decrypt.\n";
+
+export function register(ctx) {
+  return {
+    name: "vaultwarden",
+    desc: "read secrets from a Vaultwarden vault; credential provider for f creds",
+    skills: [{ name: "f-vaultwarden", path: path.join(here, "SKILL.md") }],
+    credentialProvider,
+    run: (_argv, args) => main(args._ ?? []),
+  };
+}
+
+/* Flags that take a value. Kept explicit so parsing is unambiguous. */
+const VALUE_FLAGS = new Set([
+  "--server", "--email", "--search", "--ttl", "--iterations", "--field", "--map",
+]);
+
+async function main(argv) {
+  const flags = [];
+  const pos = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      // Consume a value attached to a known value-taking flag, so a value that
+      // happens to start with `--` (an odd password, a negative number) is still
+      // read as the value, and a bare `--verbose` is still a boolean flag.
+      if (VALUE_FLAGS.has(a) && i + 1 < argv.length) {
+        flags.push(`${a}=${argv[++i]}`);
+      } else {
+        flags.push(a);
+      }
+    } else {
+      pos.push(a);
+    }
+  }
+  const has = (f) => flags.some((x) => x === `--${f}` || x === `--${f}=1` || x.startsWith(`--${f}=`));
+  const flagVal = (f) => {
+    const hit = flags.find((x) => x === `--${f}` || x.startsWith(`--${f}=`));
+    if (!hit) return null;
+    // A recognised flag always carries its own value, so nothing here can reach
+    // past it and swallow a following positional (which would silently shift the
+    // command's own arguments).
+    return hit.includes("=") ? hit.slice(hit.indexOf("=") + 1) : usage(`--${f} needs a value`);
+  };
+  const [cmd, ...rest] = pos;
+
+  switch (cmd) {
+    case "config": {
+      const patch = {};
+      const server = flagVal("server") ?? (has("server") ? usage("config --server needs a value") : null);
+      const email = flagVal("email") ?? (has("email") ? usage("config --email needs a value") : null);
+      if (server) patch.server = server.replace(/\/+$/, "");
+      if (email) patch.email = email;
+      if (Object.keys(patch).length) {
+        saveVwConfig(patch);
+        for (const [k, v] of Object.entries(patch)) process.stdout.write(`config\t${k}\t${v}\n`);
+      }
+      if (has("master-password")) {
+        const pw = await promptSecret("f: vault master password (not echoed, not stored elsewhere): ");
+        if (!pw) return usage("empty master password — nothing stored");
+        await credsSet(vwConfig().masterPasswordCred || C_MASTER, pw);
+        dropKeyCache(); // any cached keys came from the old password
+        process.stdout.write("stored\tvault master password\n");
+      }
+      if (has("print") || (!Object.keys(patch).length && !has("master-password"))) {
+        const cfg = vwConfig();
+        process.stdout.write(`server\t${cfg.server ?? "(unset)"}\n`);
+        process.stdout.write(`email\t${cfg.email ?? "(unset)"}\n`);
+        process.stdout.write(`map\t${Object.keys(cfg.map ?? {}).length} entr(ies)\n`);
+        for (const [k, v] of Object.entries(cfg.map ?? {})) process.stdout.write(`  ${k} -> ${v}\n`);
+      }
+      break;
+    }
+    case "apikey": {
+      const [id, secret] = rest;
+      if (!id || !secret) return usage("apikey needs <client-id> <client-secret>");
+      if (!id.startsWith("user.") && !id.startsWith("organization.")) {
+        process.stderr.write(`f: note: client_id usually looks like 'user.<uuid>' — got '${id}'\n`);
+      }
+      await credsSet(C_CLIENT_ID, id);
+      await credsSet(C_CLIENT_SECRET, secret);
+      dropKeyCache();
+      process.stdout.write("stored\tvaultwarden api key\n");
+      break;
+    }
+    case "status": {
+      const cfg = vwConfig();
+      const st = await providerStatus(cfg);
+      process.stdout.write(`provider\tvaultwarden\t${st.ready ? "ready" : "not ready"}\n`);
+      if (st.note) process.stdout.write(`note\t${st.note}\n`);
+      if (st.hint) process.stdout.write(`hint\t${st.hint}\n`);
+      process.stdout.write(`server\t${cfg.server ?? "(unset)"}\n`);
+      process.stdout.write(`email\t${cfg.email ?? "(unset)"}\n`);
+      process.stdout.write(`mirror ttl\t${MIRROR_TTL_SEC}s\n`);
+      process.stdout.write(`key cache\t${safeHasCache() ? `on (<=${KEY_CACHE_TTL_SEC / 3600}h)` : "off"}\n`);
+      if (st.ready) {
+        try {
+          const { items } = await openVault({ quiet: true });
+          const names = new Set(items.flatMap((i) => namesForItem(i, cfg)));
+          process.stdout.write(`items\t${items.length}\n`);
+          process.stdout.write(`names\t${names.size}\n`);
+          for (const n of [...names].sort().slice(0, 40)) process.stdout.write(`  ${n}\n`);
+          if (names.size > 40) process.stdout.write(`  … +${names.size - 40} more (f vaultwarden list)\n`);
+        } catch (e) {
+          process.stdout.write(`vault\tsession failed: ${e.message}\n`);
+        }
+      }
+      break;
+    }
+    case "test": {
+      const { items, kdf, fromCache } = await openVault({ quiet: false, allowInsecureHttp: has("allow-insecure-http") });
+      const cfg = vwConfig();
+      process.stdout.write(`ok\tlogged in and decrypted ${items.length} item(s)${fromCache ? " (cached keys)" : ` (kdf ${kdf?.kdfIterations ?? "?"} iters)`}\n`);
+      const login = items.filter((i) => i.type === CIPHER_TYPE.LOGIN);
+      process.stdout.write(`logins\t${login.length}\n`);
+      const withTotp = login.filter((i) => i.login?.totp);
+      process.stdout.write(`totp fields\t${withTotp.length}${withTotp.length ? ` (e.g. ${withTotp.slice(0, 5).map((i) => JSON.stringify(i.name)).join(", ")})` : ""}\n`);
+      const dupes = new Map();
+      for (const i of items) dupes.set(i.name.trim().toLowerCase(), (dupes.get(i.name.trim().toLowerCase()) ?? 0) + 1);
+      const dup = [...dupes.entries()].filter(([, n]) => n > 1);
+      if (dup.length) {
+        process.stdout.write(`duplicate item names\t${dup.length} (these need a map entry)\n`);
+        for (const [n, c] of dup.slice(0, 10)) process.stdout.write(`  ${JSON.stringify(n)}\t${c}\n`);
+        if (dup.length > 10) process.stdout.write(`  … +${dup.length - 10} more\n`);
+      } else {
+        process.stdout.write("duplicate item names\t0\n");
+      }
+      const hosts = new Map();
+      for (const i of login) for (const u of i.uriList()) { const h = uriHost(u); if (h) hosts.set(h, (hosts.get(h) ?? 0) + 1); }
+      const dupHosts = [...hosts.entries()].filter(([, n]) => n > 1);
+      process.stdout.write(`ambiguous hosts\t${dupHosts.length}${dupHosts.length ? `: ${dupHosts.slice(0, 8).map(([h, n]) => `${h}(${n})`).join(" ")}` : ""}\n`);
+      process.stdout.write(`map entries\t${Object.keys(cfg.map ?? {}).length}\n`);
+      break;
+    }
+    case "list": {
+      const cfg = vwConfig();
+      const { items } = await openVault({ allowInsecureHttp: has("allow-insecure-http") });
+      const search = (flagVal("search") ?? "").toLowerCase();
+      for (const i of items) {
+        const names = namesForItem(i, cfg);
+        const hay = `${i.name} ${names.join(" ")}`.toLowerCase();
+        if (search && !hay.includes(search)) continue;
+        process.stdout.write(`${i.name}\ttype=${i.type}\tfields=${i.fieldSummary().join(",") || "-"}\tnames=${names.join(",")}\n`);
+      }
+      break;
+    }
+    case "get": {
+      const name = rest[0];
+      if (!name) return usage("get requires <name>");
+      const cfg = vwConfig();
+      const { items } = await openVault({ allowInsecureHttp: has("allow-insecure-http") });
+      const res = findValue(name, items, cfg);
+      if (res.value != null) {
+        if (has("secrets")) process.stdout.write(res.value + "\n");
+        else process.stdout.write(`[redacted — pass --secrets to reveal] via ${res.via} (${res.item.name}::${res.field})\n`);
+        break;
+      }
+      if (res.ambiguous) {
+        process.stderr.write(`f: '${name}' is ambiguous — ${res.reason}\n`);
+        for (const d of res.ambiguous) process.stderr.write(`  ${d}\n`);
+        process.stderr.write(`fix: f vaultwarden map ${name} '<exact item name>::password'\n`);
+        process.exit(1);
+      }
+      if (res.unknown) { process.stderr.write(`f: ${res.unknown}\n`); process.exit(1); }
+      process.stderr.write(`f: no vault item answers '${name}'\n  f vaultwarden list --search <term>  |  f vaultwarden map ${name} '<item>::<field>'\n`);
+      process.exit(1);
+    }
+    case "map": {
+      const [credName, selector] = rest;
+      if (!credName || !selector) return usage("map needs <cred-name> '<Item::field>'");
+      const cfg = vwConfig();
+      const map = { ...(cfg.map ?? {}) };
+      map[credName] = selector;
+      saveVwConfig({ map });
+      // Drop any mirror under the old value so the new mapping takes effect now.
+      try { execFileSync("f", ["creds", "forget", credName], { stdio: "ignore", timeout: 15000 }); } catch {}
+      process.stdout.write(`mapped\t${credName}\t->\t${selector}\n`);
+      break;
+    }
+    case "unmap": {
+      const [credName] = rest;
+      if (!credName) return usage("unmap needs <cred-name>");
+      const map = { ...(vwConfig().map ?? {}) };
+      if (!(credName in map)) { process.stdout.write(`not mapped\t${credName}\n`); break; }
+      delete map[credName];
+      saveVwConfig({ map });
+      process.stdout.write(`unmapped\t${credName}\n`);
+      break;
+    }
+    case "set-totp": {
+      const [name, secret] = rest;
+      if (!name || !secret) return usage("set-totp needs <name> <secret>");
+      process.stderr.write(`f: this WRITES to the vault item and replaces any existing totp field.\n`);
+      if (!has("yes")) {
+        const ok = await promptSecret("f: type 'yes' then Enter to continue: ");
+        if (ok.trim() !== "yes") { process.stderr.write("f: cancelled\n"); break; }
+      }
+      const cfg = vwConfig();
+      const { api, keys, items } = await openVault({ allowInsecureHttp: has("allow-insecure-http") });
+      const res = findValue(name, items, cfg, { suffix: "totp" });
+      const item = res.item ?? (() => {
+        const lc = name.toLowerCase();
+        const hits = items.filter((i) => i.name.trim().toLowerCase() === lc);
+        if (hits.length !== 1) return null;
+        return hits[0];
+      })();
+      if (!item) { process.stderr.write(`f: cannot resolve '${name}' to exactly one item\n`); process.exit(1); }
+      const raw = item.raw;
+      const login = { ...(raw.login ?? {}) };
+      if (login.totp) {
+        let current = null;
+        try { current = decryptString(login.totp, keys); } catch {}
+        if (current && !has("force")) {
+          process.stderr.write(`f: item '${item.name}' already has a totp field — pass --force to replace it\n`);
+          process.exit(1);
+        }
+      }
+      login.totp = encryptString(secret, keys);
+      await api.putCipher(item.id, toWire(raw, { login }));
+      dropKeyCache(); // server bumped revisionDates; force a clean resync
+      process.stdout.write(`set-totp\t${item.name}\n`);
+      process.stdout.write("note\tmirrors of this item may still hold the old value: f creds forget <name>\n");
+      break;
+    }
+    case "cache": {
+      if (has("clear")) { dropKeyCache(); process.stdout.write("cleared\tkey cache\n"); break; }
+      const cached = safeHasCache();
+      process.stdout.write(`key cache\t${cached ? "on" : "off"}\n`);
+      process.stdout.write(`purpose\tskip PBKDF2 (${KEY_CACHE_TTL_SEC / 3600}h window)\n`);
+      break;
+    }
+    case "forget": {
+      dropKeyCache();
+      credsRm(C_TOKEN);
+      credsRm(C_REFRESH);
+      process.stdout.write("cleared\tkey cache + cached tokens (master password and api key kept)\n");
+      break;
+    }
+    default:
+      usage();
+  }
+}
+
+/**
+ * Build a PUT /api/ciphers body from a decrypted item plus field overrides.
+ * Bitwarden requires the whole object; unset/unsupported sub-objects are
+ * omitted rather than guessed so a partial write cannot blank a field the uck
+ * does not model.
+ */
+function toWire(raw, patch) {
+  const body = {
+    type: raw.type,
+    organizationId: raw.organizationId ?? null,
+    folderId: raw.folderId ?? null,
+    favorite: !!raw.favorite,
+    name: raw.name,
+  };
+  if (raw.notes !== undefined) body.notes = raw.notes;
+  if (raw.fields !== undefined) body.fields = raw.fields;
+  if (raw.login !== undefined) body.login = {uris: raw.login?.uris ?? [], ...patch.login};
+  if (raw.passwordHistory !== undefined) body.login.passwordHistory = raw.passwordHistory;
+  if (raw.identity !== undefined) body.identity = raw.identity;
+  if (raw.card !== undefined) body.card = raw.card;
+  return body;
+}
+
+function usage(msg) {
+  if (msg) process.stderr.write(`f: ${msg}\n`);
+  process.stderr.write(USAGE);
+  process.exit(1);
+}
+
+/* --------------------------------------------------- probe protocol */
+
+/**
+ * `f creds` probes providers by executing this file:
+ *   node index.js resolve <name>   -> value on stdout, exit 1 with reason on stderr
+ *   node index.js has <name>       -> 'yes'|'no'
+ *   node index.js status           -> {ready,note,hint} JSON
+ * Keep stdout free of anything but the answer.
+ */
+async function probe(argv) {
+  const [sub, arg] = argv;
+  if (sub === "--dump") {
+    process.stdout.write(JSON.stringify([{ name: credentialProvider.name, entry: path.join(here, "index.js"), hasExternalApi: true, mirrorTtlSec: MIRROR_TTL_SEC }]));
+    return;
+  }
+  if (sub === "status") {
+    process.stdout.write(JSON.stringify(await providerStatus(vwConfig())));
+    return;
+  }
+  if (sub === "list") {
+    const cfg = vwConfig();
+    if (!cfg.server || !cfg.email) { process.stdout.write("[]"); return; }
+    const { items } = await openVault({ quiet: true });
+    process.stdout.write(JSON.stringify([...new Set(items.flatMap((i) => namesForItem(i, cfg)))]));
+    return;
+  }
+  if (!sub || !arg) { process.stderr.write("probe needs resolve|has|status|list <name>"); process.exitCode = 2; return; }
+  const cfg = vwConfig();
+  if (!cfg.server || !cfg.email) {
+    // Unconfigured is "not mine", not an error.
+    if (sub === "resolve") { process.exitCode = 3; return; }
+    process.stdout.write(sub === "has" ? "no" : "");
+    return;
+  }
+  const { items } = await openVault({ quiet: true });
+  const res = findValue(arg, items, cfg);
+  if (sub === "has") { process.stdout.write(res.value != null ? "yes" : "no"); return; }
+  if (res.value != null) { process.stdout.write(res.value); return; }
+  if (res.ambiguous) { process.stderr.write(`${res.reason}: ${res.ambiguous.join(" | ")}`); process.exitCode = 1; return; }
+  if (res.unknown) { process.stderr.write(res.unknown); process.exitCode = 1; return; }
+  process.exitCode = 3; // genuinely absent from the vault
+}
+
+// Dispatch: `f vaultwarden …` goes through run(); direct execution is a probe.
+uckMain(import.meta.url, async (argv) => {
+  const probeSubs = new Set(["resolve", "has", "status", "list", "--dump"]);
+  if (probeSubs.has(argv[0])) return probe(argv);
+  return main(argv);
+});
+
+export default { register, credentialProvider };

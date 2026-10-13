@@ -1,0 +1,506 @@
+// Bitwarden/Vaultwarden client — zero deps, node:crypto + fetch only.
+//
+// Implements the subset of the Bitwarden identity + vault protocol that
+// Vaultwarden serves: /prelogin, /connect/token, /api/sync, and the client-side
+// crypto needed to read a personal vault.
+//
+// ## Why this is not just a call to the Bitwarden SDK
+//
+// @bitwarden/sdk-napi covers Secrets Manager (organisation machine accounts),
+// not personal vaults — which is what Vaultwarden is. `bw`/`rbw` are external
+// binaries. So this file speaks the wire protocol directly.
+//
+// ## Key hierarchy (this is the part worth understanding before editing)
+//
+//   masterPassword + email
+//     └─ PBKDF2-HMAC-SHA256(password, email, kdfIterations) -> masterKey (32B)
+//          ├─ HKDF-Expand(masterKey, "enc") -> stretched enc key
+//          ├─ HKDF-Expand(masterKey, "mac") -> stretched mac key
+//          └─ HMAC-SHA256(masterKey, password) -> password hash sent as the
+//             "password" field of the password grant (the server never sees the
+//             master password itself)
+//
+//   stretched keys decrypt profile.key -> 64B = symmetricKey(32) ‖ macKey(32)
+//   each cipher field is then decrypted with that symmetric key pair.
+//
+// Note the consequence: **the master password is unavoidable.** An API key
+// (client_credentials) only buys you an access token that skips the 2FA round
+// trip; it cannot decrypt anything. Vault contents always require the master
+// password, by design.
+//
+// ## Envelope format
+//
+//   "2.<b64(iv)>|<b64(ciphertext)>|<b64(hmac)>"     type 2 = AES-256-CBC + HMAC
+//   "1.<b64(iv)>|<b64(ciphertext)>"                  type 1 = legacy, no MAC
+//   "0.<b64>"                                        type 0 = plaintext (some uris)
+//
+// HMAC is HMAC-SHA256(macKey, iv ‖ ciphertext) and must be verified before the
+// plaintext is handed to the caller (decrypt-then-verify would be the bug).
+// Type 1 is refused by default: it has no integrity tag.
+
+import crypto from "node:crypto";
+
+const DEVICE_TYPE_CLI = 14;
+// Verified against the live server: this Vaultwarden reads snake_case device
+// fields (`device_identifier`, `device_name`) and *only* accepts `scope=api` for
+// the client_credentials grant — `api offline_access` and `api.device` are both
+// refused with "Scope not supported", so the original form could never log in.
+// Field names are sent in both cases: cheap insurance against a server that
+// validates one spelling or the other, and unknown fields are ignored.
+const DEVICE_IDENTIFIER = "f-vaultwarden-uck";
+const DEVICE_NAME = "f creds (vaultwarden provider)";
+const API_SCOPE = "api";
+const UA = "f-cli/vaultwarden-provider";
+
+/** Cipher type codes (Bitwarden `EncryptionType`). */
+export const ENC = { AES_256_CBC_PLAIN: 0, AES_128_CBC: 1, AES_256_CBC_HMAC: 2, RSA_2048_OAEP: 3 };
+
+/** Cipher `type` values we surface. */
+export const CIPHER_TYPE = { LOGIN: 1, SECURE_NOTE: 2, CARD: 3, IDENTITY: 4 };
+
+/* ------------------------------------------------------------------ crypto */
+
+/** PBKDF2-HMAC-SHA256(masterPassword, email, iterations) -> 32B masterKey. */
+export function makeMasterKey(password, email, iterations) {
+  if (!Number.isInteger(iterations) || iterations <= 0) {
+    throw new Error(`invalid kdfIterations from server: ${iterations}`);
+  }
+  return crypto.pbkdf2Sync(Buffer.from(String(password), "utf8"), Buffer.from(String(email), "utf8"), iterations, 32, "sha256");
+}
+
+/**
+ * HKDF-Expand (RFC 5869 §2.3) using `prk` directly as the pseudorandom key —
+ * i.e. Extract is skipped, which is legitimate here because the masterKey is
+ * already a uniform 32-byte PBKDF2 output (RFC 5869 §3.3). Exported so the test
+ * suite can check it against the RFC's own vectors.
+ */
+export function hkdfExpand(prk, info, length) {
+  if (!Buffer.isBuffer(prk) || prk.length < 32) throw new Error("hkdfExpand: prk must be at least 32 bytes");
+  if (!Number.isInteger(length) || length <= 0 || length > 255 * 32) throw new Error(`hkdfExpand: bad length ${length}`);
+  const hashLen = 32;
+  const n = Math.ceil(length / hashLen);
+  const out = Buffer.allocUnsafe(n * hashLen);
+  let prev = Buffer.alloc(0);
+  const infoBuf = Buffer.isBuffer(info) ? info : Buffer.from(String(info), "utf8");
+  for (let i = 1; i <= n; i++) {
+    prev = crypto.createHmac("sha256", prk).update(prev).update(infoBuf).update(Buffer.from([i])).digest();
+    prev.copy(out, (i - 1) * hashLen);
+  }
+  return out.subarray(0, length);
+}
+
+/** masterKey -> { encKey, macKey } used to unwrap the account symmetric key. */
+export function stretchMasterKey(masterKey) {
+  return { encKey: hkdfExpand(masterKey, Buffer.from("enc", "utf8"), 32), macKey: hkdfExpand(masterKey, Buffer.from("mac", "utf8"), 32) };
+}
+
+/** The value sent as `password` in the password grant. */
+export function masterPasswordHash(masterKey, password) {
+  return crypto.createHmac("sha256", masterKey).update(Buffer.from(String(password), "utf8")).digest();
+}
+
+/** Parse "2.iv|ct|mac" (also type 0/1) into its parts. */
+export function parseEnvelope(s) {
+  if (typeof s !== "string") return null;
+  const dot = s.indexOf(".");
+  if (dot < 0) return null;
+  const type = Number(s.slice(0, dot));
+  const rest = s.slice(dot + 1);
+  if (!Number.isInteger(type)) return null;
+  if (type === ENC.AES_256_CBC_PLAIN) return { type, data: Buffer.from(rest, "base64") };
+  const parts = rest.split("|");
+  if (parts.length < 2) return null;
+  return { type, iv: Buffer.from(parts[0], "base64"), ct: Buffer.from(parts[1], "base64"), mac: parts[2] ? Buffer.from(parts[2], "base64") : null };
+}
+
+/** Constant-time buffer compare. */
+function tagEqual(a, b) {
+  if (a === null || b === null || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Decrypt a Bitwarden envelope with an { encKey, macKey } pair.
+ * Returns undefined for null/empty input (many optional fields are absent).
+ * Throws on a MAC mismatch — that is a wrong key, not corrupted data.
+ */
+export function decryptString(value, keys, { allowUnauthenticated = false } = {}) {
+  if (value == null || value === "") return undefined;
+  const env = parseEnvelope(value);
+  if (!env) throw new Error(`unrecognised ciphertext envelope: ${String(value).slice(0, 24)}…`);
+  if (env.type === ENC.AES_256_CBC_PLAIN) return env.data.toString("utf8");
+
+  if (env.type === ENC.AES_256_CBC_HMAC) {
+    if (!env.mac) throw new Error("type 2 ciphertext without a MAC tag");
+    const expect = crypto.createHmac("sha256", keys.macKey).update(env.iv).update(env.ct).digest();
+    if (!tagEqual(expect, env.mac)) throw new Error("MAC verification failed (wrong key, or tampered ciphertext)");
+  } else if (env.type === ENC.AES_128_CBC) {
+    // Legacy AES-256-CBC with no integrity tag. Never on by default.
+    if (!allowUnauthenticated) {
+      throw new Error("type 1 ciphertext has no integrity tag — refusing (pass --allow-insecure-crypto if you really must)");
+    }
+  } else {
+    throw new Error(`unsupported encryption type ${env.type}`);
+  }
+
+  const d = crypto.createDecipheriv("aes-256-cbc", keys.encKey, env.iv);
+  return Buffer.concat([d.update(env.ct), d.final()]).toString("utf8");
+}
+
+/** Inverse of decryptString — needed to push values back (TOTP writes). */
+export function encryptString(plaintext, keys) {
+  const iv = crypto.randomBytes(16);
+  const c = crypto.createCipheriv("aes-256-cbc", keys.encKey, iv);
+  const ct = Buffer.concat([c.update(Buffer.from(String(plaintext), "utf8")), c.final()]);
+  const mac = crypto.createHmac("sha256", keys.macKey).update(iv).update(ct).digest();
+  return `2.${iv.toString("base64")}|${ct.toString("base64")}|${mac.toString("base64")}`;
+}
+
+/** Unwrap profile.key with the stretched keys -> { symmetricKey, macKey }. */
+/**
+ * Unwrap profile.key with the stretched keys.
+ *
+ * Returns the account key pair under BOTH names Bitwarden uses for it:
+ * `encKey`/`macKey` (what decryptString consumes) and `symmetricKey` (Bitwarden's
+ * term for the same 32 bytes). Getting these two names confused is the classic
+ * failure here — it produces a key set that silently decrypts nothing.
+ */
+export function unwrapSymmetricKey(encryptedKey, stretched) {
+  const raw = decryptString(encryptedKey, stretched);
+  const buf = Buffer.from(raw, "base64");
+  if (buf.length !== 64) throw new Error(`unexpected symmetric key length ${buf.length} (want 64)`);
+  const encKey = buf.subarray(0, 32);
+  return { encKey, macKey: buf.subarray(32, 64), symmetricKey: encKey };
+}
+
+/* -------------------------------------------------------------- api client */
+
+/** Minimal JSON/form HTTP layer over fetch, with Vaultwarden's error shape. */
+export class VaultwardenApi {
+  constructor({ server, timeoutMs = 20000, fetchFn = null, allowInsecureHttp = false } = {}) {
+    if (!server) throw new Error("no vaultwarden server configured (f vaultwarden config --server https://…)");
+    this.server = server.replace(/\/+$/, "");
+    if (!/^https?:\/\//.test(this.server)) throw new Error(`server must be an http(s) URL, got '${server}'`);
+    if (!allowInsecureHttp && this.server.startsWith("http://")) {
+      // A self-hosted Vaultwarden is very often plain http over tailscale/lan, so
+      // this is a real decision and not a formality: the master-password hash and
+      // the API key both travel in the request body. Loopback is called out
+      // because it is the one case that is genuinely safe (and what tests use).
+      const host = (() => { try { return new URL(this.server).hostname; } catch { return ""; } })();
+      const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+      throw new Error(
+        `refusing to send credentials over plaintext http: ${this.server}` +
+          (loopback ? " (loopback; pass --allow-insecure-http or set vaultwarden.allowInsecureHttp to allow it)"
+                    : " — put TLS in front of it, or pass --allow-insecure-http if this is a LAN/tailscale address"),
+      );
+    }
+    this.timeoutMs = timeoutMs;
+    this.fetch = fetchFn ?? ((...a) => fetch(...a));
+    this.accessToken = null;
+    this.refreshToken = null;
+  }
+
+  async #request(path, { method = "GET", form = null, json = null, auth = true, headers = {} } = {}) {
+    const url = `${this.server}${path}`;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), this.timeoutMs);
+    const h = { Accept: "application/json", "User-Agent": UA, ...headers };
+    if (auth && this.accessToken) h.Authorization = `Bearer ${this.accessToken}`;
+    let body;
+    if (form) { h["Content-Type"] = "application/x-www-form-urlencoded"; body = new URLSearchParams(form).toString(); }
+    else if (json != null) { h["Content-Type"] = "application/json"; body = JSON.stringify(json); }
+    let res;
+    try {
+      res = await this.fetch(url, { method, headers: h, body, signal: ac.signal });
+    } catch (e) {
+      if (e?.name === "AbortError") throw new Error(`timed out after ${this.timeoutMs}ms: ${url} (is the server reachable?)`);
+      throw new Error(`cannot reach ${url}: ${e?.cause?.message ?? e?.message ?? e} — check VPN/tailwind/dns (getaddrinfo errors usually mean the name does not resolve)`);
+    } finally {
+      clearTimeout(timer);
+    }
+    const text = await res.text();
+    if (!res.ok) {
+      // Vaultwarden answers with camelCase bodies (`message`, `validationErrors`)
+      // while Identity uses `error_description`; the original extractor checked
+      // `j.message` but not `j.message`, so every real Vaultwarden error
+      // degraded to a bare status code. Empty `error_description` must also not
+      // win over the populated `message` beside it.
+      let detail = "";
+      try {
+        const j = JSON.parse(text);
+        const ve = j?.validationErrors && typeof j.validationErrors === "object"
+          ? Object.values(j.validationErrors).flat().filter(Boolean).join("; ")
+          : "";
+        detail = [j?.error_description, j?.message, j?.Message, j?.errorModel?.message, ve]
+          .map((s) => (typeof s === "string" ? s.trim() : ""))
+          .filter(Boolean)
+          .find((s, i, all) => all.indexOf(s) === i)
+          ?.slice(0, 300) ?? "";
+      } catch { detail = text.replace(/\s+/g, " ").trim().slice(0, 200); }
+
+      // Status-specific guidance: without these, the operator sees "HTTP 429" and
+      // has no way to know whether to wait, re-authenticate, or fix their config.
+      const hint =
+        res.status === 429 ? " — the server is rate-limiting logins; wait a few minutes before retrying (repeated attempts extend the lockout)"
+          : res.status === 404 && path.includes("prelogin") ? " — the server has no prelogin endpoint for this account (is the email correct?)"
+          : res.status === 401 && auth ? " — the access token expired or was revoked; run: f vaultwarden forget"
+          : res.status >= 500 ? " — the server failed (this is not a problem with your credentials)"
+          : "";
+      const err = new Error(`${method} ${path} -> HTTP ${res.status}${detail ? `: ${detail}` : ""}${hint}`);
+      err.status = res.status;
+      err.body = detail;
+      throw err;
+    }
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`${method} ${path} returned non-JSON (${text.slice(0, 80)}) — is ${this.server} really a Vaultwarden server?`);
+    }
+  }
+
+  /** KDF parameters for an account. kdf===0 means Bitwarden's default 600000. */
+  async prelogin(email) {
+    // Sent as JSON, not a form body: verified against a live Vaultwarden, which
+    // answers `{"email":…}` as JSON with 200 and rejects the same field sent as
+    // application/x-www-form-urlencoded with 400. The two spellings are sent
+    // together because the official clients differ on which they use.
+    let j = await this.#request("/identity/accounts/prelogin", { method: "POST", json: { email }, auth: false }).catch((e) => {
+      if (e.status !== 400 && e.status !== 415) throw e;
+      return this.#request("/identity/accounts/prelogin", { method: "POST", form: { email }, auth: false });
+    });
+    const kdfIterations = Number(j?.kdfIterations ?? 600000);
+    return { kdf: Number(j?.kdf ?? 0), kdfIterations: Number.isFinite(kdfIterations) && kdfIterations > 0 ? kdfIterations : 600000 };
+  }
+
+  /** API-key grant. Skips 2FA; yields a token but CANNOT decrypt anything. */
+  async loginApiKey({ clientId, clientSecret }) {
+    const j = await this.#request("/identity/connect/token", {
+      method: "POST",
+      auth: false,
+      form: {
+        grant_type: "client_credentials", scope: API_SCOPE,
+        client_id: clientId, client_secret: clientSecret,
+        deviceType: String(DEVICE_TYPE_CLI),
+        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
+        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
+      },
+    });
+    if (!j?.access_token) throw new Error("token response had no access_token");
+    this.accessToken = j.access_token;
+    this.refreshToken = j.refresh_token ?? null;
+    return j;
+  }
+
+  /** Password grant. `passwordHash` is masterPasswordHash(), not the raw password. */
+  async loginPassword({ email, passwordHash }) {
+    const j = await this.#request("/identity/connect/token", {
+      method: "POST",
+      auth: false,
+      form: {
+        grant_type: "password", username: email, password: passwordHash.toString("base64"),
+        scope: API_SCOPE, client_id: "device",
+        deviceType: String(DEVICE_TYPE_CLI),
+        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
+        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
+      },
+    });
+    if (!j?.access_token) {
+      const twoFactor = j?.twoFactorProviders ?? j?.twoFactorProviders2;
+      const err = new Error("login returned no access_token" + (twoFactor ? ` — 2FA is required (${Object.keys(twoFactor).join(", ")})` : ""));
+      err.twoFactor = twoFactor ?? null;
+      throw err;
+    }
+    this.accessToken = j.access_token;
+    this.refreshToken = j.refresh_token ?? null;
+    return j;
+  }
+
+  async refresh() {
+    if (!this.refreshToken) return false;
+    const j = await this.#request("/identity/connect/token", {
+      method: "POST", auth: false,
+      form: { grant_type: "refresh_token", refresh_token: this.refreshToken, client_id: "device" },
+    });
+    if (!j?.access_token) return false;
+    this.accessToken = j.access_token;
+    this.refreshToken = j.refresh_token ?? this.refreshToken;
+    return true;
+  }
+
+  setAccessToken(token) { this.accessToken = token; }
+
+  /** Full vault: profile.key + every cipher. */
+  sync() { return this.#request("/api/sync"); }
+
+  /** Ciphers only — cheaper than sync when you already hold the keys. */
+  ciphers() { return this.#request("/api/ciphers"); }
+
+  putCipher(id, payload) { return this.#request(`/api/ciphers/${encodeURIComponent(id)}`, { method: "PUT", json: payload }); }
+
+  alive() { return this.#request("/alive", { auth: false }); }
+}
+
+/* ---------------------------------------------------------------- vault */
+
+/**
+ * A decrypted view of one vault item, plus enough of the original ciphertext to
+ * write fields back without a round trip.
+ */
+export class VaultItem {
+  constructor(raw, keys, opts = {}) {
+    this.id = raw.id;
+    this.raw = raw;
+    this.type = raw.type;
+    this.folderId = raw.folderId ?? null;
+    this.errors = {};
+    // A field that will not decrypt is recorded in `errors` and left undefined
+    // rather than thrown: one legacy (unauthenticated) or otherwise odd item must
+    // not stop the rest of the vault from yielding credentials.
+    const dec = (what, value) => {
+      try {
+        return decryptString(value, keys, opts);
+      } catch (e) {
+        // Record it, and keep the message: a vault where every field "fails"
+        // usually means a wrong master password, and that has to be legible.
+        this.errors[what] = e.message;
+        return undefined;
+      }
+    };
+
+    this.name = dec("name", raw.name) ?? "(undecryptable)";
+    this.notes = dec("notes", raw.notes);
+    this.login = null;
+    this.fields = [];
+    this.hidden = { name: raw.name, notes: raw.notes, login: raw.login ? { ...raw.login } : null };
+    if (raw.type === CIPHER_TYPE.LOGIN && raw.login) {
+      const l = raw.login;
+      this.login = {
+        username: dec("login.username", l.username),
+        password: dec("login.password", l.password),
+        totp: dec("login.totp", l.totp),
+        uris: Array.isArray(l.uris)
+          ? l.uris.map((u) => {
+              let uri;
+              try { uri = decryptString(u.uri, keys, opts); } catch { uri = undefined; }
+              return { match: u.match, uri: uri ?? u.uri };
+            })
+          : [],
+      };
+    }
+    if (raw.type === CIPHER_TYPE.SECURE_NOTE) {
+      // Secure notes keep the text in `login.username`; some clients use `note`.
+      this.note = dec("note", raw.login?.username) ?? dec("note2", raw.note);
+    }
+    for (const [i, f] of (raw.fields ?? []).entries()) {
+      this.fields.push({
+        name: dec(`fields[${i}].name`, f.name),
+        value: dec(`fields[${i}].value`, f.value),
+        type: f.type,
+        linkedId: f.linkedId ?? null,
+      });
+    }
+  }
+
+  /** All uris of a login item (lowercased, for host matching). */
+  uriList() {
+    return (this.login?.uris ?? []).map((u) => u.uri).filter(Boolean).map((u) => u.toLowerCase().trim());
+  }
+
+  /** Decrypt a hidden field, or null if it holds no secret. */
+  hiddenField(which) {
+    if (!this.hidden?.login?.[which]) return null;
+    return this.hidden.login[which]; // ciphertext; caller decrypts with keys
+  }
+
+  /** True when nothing in this item decrypted — almost always a wrong key. */
+  fullyFailed() {
+    return Object.keys(this.errors).length > 0 && this.name === "(undecryptable)";
+  }
+
+  /** Resolve a `name::suffix` selector to a value, or undefined. */
+  select(suffix) {
+    if (suffix == null || suffix === "password") return this.login?.password;
+    if (suffix === "username") return this.login?.username;
+    if (suffix === "totp") return this.login?.totp ?? this.login?.totpSource;
+    if (suffix === "note") return this.note ?? this.notes;
+    if (suffix === "uri") return this.uriList()[0];
+    if (suffix.startsWith("field:")) {
+      const want = suffix.slice(6).toLowerCase();
+      return this.fields.find((f) => (f.name ?? "").toLowerCase() === want)?.value;
+    }
+    return undefined;
+  }
+
+  /** Fields the operator can ask for by suffix, and which of them hold values. */
+  fieldSummary() {
+    const out = [];
+    if (this.login?.username) out.push("username");
+    if (this.login?.password) out.push("password");
+    if (this.login?.totp) out.push("totp");
+    if (this.note) out.push("note");
+    for (const f of this.fields) if (f.value) out.push(`field:${f.name}`);
+    return out;
+  }
+}
+
+/** Derive the working key set from an email + master password + a sync payload. */
+export function deriveKeys({ email, password, kdfIterations, encryptedKey }) {
+  const masterKey = makeMasterKey(password, email, kdfIterations);
+  const stretched = stretchMasterKey(masterKey);
+  const keys = unwrapSymmetricKey(encryptedKey, stretched);
+  keys.masterKey = masterKey;
+  keys.stretched = stretched;
+  keys.passwordHash = masterPasswordHash(masterKey, password);
+  return keys;
+}
+
+/**
+ * Pull the cipher array out of either response shape.
+ *
+ *   GET /api/sync    -> { profile: {...}, ciphers: [ ... ] }
+ *   GET /api/ciphers -> { object: "list", data: [ ... ], continuationToken: null }
+ *
+ * The list shape is confirmed against Vaultwarden's own source
+ * (src/api/core/ciphers.rs builds `json!({"data": ..., "object": "list",
+ * "continuationToken": null})`): `data` IS the array, never `{"data":{"data":...}}`.
+ * Upstream Bitwarden capitalises those keys (`"Data"`, `"Object"`) in older
+ * releases, so both spellings are accepted.
+ *
+ * Shapes are matched on their distinguishing key rather than by trying candidates
+ * in order: `data` means different things in the two responses, and a permissive
+ * fallback returns *zero* items when the wrong one matches — which reads as "your
+ * vault is empty" instead of "I misread the response". Unrecognised shapes throw.
+ */
+export function ciphersFrom(payload, { source = "vault payload" } = {}) {
+  if (!payload || typeof payload !== "object") throw new Error(`${source}: empty response`);
+  const pick = (o, keys) => { for (const k of keys) if (o?.[k] !== undefined) return o[k]; return undefined; };
+  const object = pick(payload, ["object", "Object"]);
+  const data = pick(payload, ["data", "Data"]);
+  const cont = pick(payload, ["continuationToken", "ContinuationToken"]);
+  const ciphers = pick(payload, ["ciphers", "Ciphers"]);
+
+  if (typeof object === "string" && /list/i.test(object) && Array.isArray(data)) {
+    // Vaultwarden always returns null here; non-null means more pages exist, and
+    // reading only the first would silently hide most of the vault.
+    if (cont != null) throw new Error(`${source}: response is paginated — unhandled, use /api/sync`);
+    return data;
+  }
+  if (Array.isArray(ciphers)) return ciphers; // /api/sync
+  if (payload.profile || payload.Profile) {
+    // A sync carrying no ciphers key at all is a genuinely empty vault.
+    if (ciphers == null) return [];
+    throw new Error(`${source}: ciphers is ${typeof ciphers}, not an array`);
+  }
+  throw new Error(
+    `${source}: unrecognised response shape (keys: ${Object.keys(payload).join(", ")})` +
+      " — refusing to treat it as an empty vault",
+  );
+}
+
+/** Decrypt every cipher in a sync/ciphers payload. */
+export function decryptVault(payload, keys, opts = {}) {
+  return ciphersFrom(payload).map((c) => new VaultItem(c, keys, opts));
+}
+
+export default { VaultwardenApi, VaultItem, deriveKeys, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };
