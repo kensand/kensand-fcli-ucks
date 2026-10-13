@@ -99,26 +99,36 @@ browser-binding cookie at `GET /identity/connect/authorize` (`VW_SSO_BINDING`, p
 the callback it requires that cookie back (`identity.rs`, `oidcsignin_redirect`) and
 otherwise fails with `SSO session binding mismatch`.
 
+
+### Credentials: an SSO session is enough
+
+After `sso login`, `f vaultwarden list` and `f creds get <host>` work with **no API key**.
+The stored `vaultwarden.access-token` + `.refresh-token` are a bearer session and reads renew
+themselves for ~30 days. The API key is only needed if you want to authenticate without a
+browser; it cannot decrypt anything by itself either way. Precedence in `openVault()`:
+
+1. cached derived keys (`vaultwarden.key-cache`)
+2. a stored SSO session (refreshes on 401/403, derives and caches keys)
+3. API key + master password
+4. an error naming which of the above is missing
+
+The master password is required by *every* decrypting path — SSO replaces authentication,
+never the key derivation. `f vaultwarden config --master-password` stores it.
+
 That check has produced a lot of confusion, and the honest statement is narrower than
 "it's probably the server":
 
-- **`SSO session binding mismatch` on the web vault** is the #7163/#7187 cookie-path bug.
-  #7163 (shipped in 1.36.0, 2026-05-03) set the cookie at `<DOMAIN_PATH>/identity/connect/`
-  and removed it at `/identity/connect/`; a non-empty `DOMAIN_PATH` means every SSO login
-  fails. #7187 merged 2026-05-15, after 1.36.0 was cut. Reports: release discussion #7177
-  (EntraID), and DEX/YunoHost deployments.
-- **The web vault works but the CLI does not** — that is *not* the cookie-path bug, and
-  you should stop looking for it. The web vault and `client_id=cli` are different code
-  paths: web redirects to `<domain>/sso-connector.html` and its cookie arrives through the
-  web origin; cli redirects to `http://localhost:PORT`, an http origin reached from an
-  https page. Treat it as a cookie/redirect-origin question, or as something this client
-  gets wrong.
-- Version tells you which world you are in: **1.35.x has no binding check at all**,
-  **1.36.0** has the broken path, **≥1.37.0** is fixed. There is no unauthenticated version
-  endpoint; `/sso-connector.html` returning 200 means ≥1.36.0 (`connector.html` is the
-  pre-1.36 name) but cannot separate 1.36.0 from 1.37.x. `vaultwarden -V`, or
-  `docker inspect`, is the only reliable read.
-- Do not "fix" this by editing `SSO_*` settings; neither cause is configured there.
+- Read the failing request's **`Sec-Fetch-Site`** header before believing anything.
+  `none` means the URL was opened by paste rather than reached by redirect, so that tab had
+  no binding cookie and the error proves nothing. `--manual` makes this easy to do by
+  accident, and it cost several rounds of wrong diagnosis here.
+- **`ssoHandOffMessage` is not Vaultwarden's cookie.** It is the Bitwarden browser
+  connector's (or a portal's) hand-off text. Vaultwarden's is `VW_SSO_BINDING`. Seeing the
+  former says nothing about whether SSO is working.
+- Version theories need version evidence. `vaultwarden -V` does not exist. `/version` and
+  `/config` 404 on older builds (that 404 is itself a signal), and
+  `<server>/identity/sso/prevalidate` returning `200 {"token":…}` is what proves
+  `SSO_ENABLED=true`. Do not assert "you're on broken 1.36.0" without one of these.
 
 ### Why the CLI used to always fail with `SSO session binding mismatch` (fixed; do not reintroduce)
 
