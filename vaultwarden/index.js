@@ -30,7 +30,7 @@ import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 import { uckMain } from "../../fcli-ucks/lib/uckmain.js";
 import {
@@ -39,8 +39,10 @@ import {
   decryptVault,
   decryptString,
   encryptString,
+  ssoRequiresMasterPassword,
   CIPHER_TYPE,
 } from "./lib/vwclient.js";
+import { captureSsoCode } from "./lib/sso-callback.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const F = path.join(process.env.HOME ?? "", ".f");
@@ -190,6 +192,40 @@ function credsRm(name) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Best-effort browser launch for the SSO hop. Deliberately loud about failing:
+ * on a headless box or a remote shell this cannot work, and silently doing nothing
+ * would leave the operator staring at a listener that no browser will ever reach.
+ * The URL is always printed regardless, so the flow is never blocked by this.
+ */
+function tryOpenBrowser(url) {
+  const cands = process.platform === "darwin"
+    ? [["open", [url]]]
+    : process.platform === "win32"
+      ? [["cmd", ["/c", "start", "", url]]]
+      : [["xdg-open", [url]]];
+  for (const [cmd, args] of cands) {
+    try {
+      // stdio fully detached: a browser helper that writes to stderr or blocks on
+      // stdin must not be able to wedge or delay this command.
+      const child = spawnDetached(cmd, args);
+      if (child) return true;
+    } catch { /* fall through to the message below */ }
+  }
+  process.stderr.write("  (no browser opened — copy the URL above into one that can reach your identity provider)\n");
+  return false;
+}
+
+function spawnDetached(cmd, args) {
+  const c = spawn(cmd, args, { stdio: "ignore", detached: true });
+  // A missing xdg-open surfaces here, not as a throw: spawn() reports ENOENT
+  // asynchronously, so the return value alone cannot tell success from failure.
+  let ok = true;
+  c.on("error", () => { ok = false; });
+  c.unref();
+  return ok ? c : null;
 }
 
 function credsStatus() {
@@ -648,13 +684,24 @@ const USAGE =
   "  set-totp <name> <secret>          WRITE: store a TOTP secret on an item\n" +
   "  cache [--clear]                   vault key cache (skips PBKDF2 per read)\n" +
   "  forget                            clear the key cache and cached tokens\n" +
+  "  sso status                        does the server have OIDC SSO enabled\n" +
+  "                                    (unauthenticated probe)\n" +
+  "  sso login [--port <8065-8070>]    sign in through the identity provider in a\n" +
+  "      [--timeout <sec>] [--force]   browser, then exchange the PKCE code.\n" +
+  "                                    --force skips the 'is SSO enabled' probe\n" +
   "\n" +
   "name forms: 'github.com'  'Item Name'  'Item Name::username'  '<cred>::totp'\n" +
   "fields:     password (default) | username | totp | note | uri | field:<name>\n" +
   "\n" +
   "as a credential provider: `f creds get <name>` falls through to this uck on a\n" +
-  "local miss and mirrors the answer as mirror:<name> for " + MIRROR_TTL_SEC / 60 + "m.\n" +
-  "A master password is unavoidable — an API key authenticates but cannot decrypt.\n";
+  "local miss and mirrors the answer as mirror:<name> for " + (MIRROR_TTL_SEC / 60) + "m.\n" +
+  "\n" +
+  "on sso: it replaces the *login*, never the *decryption*. The vault key stays\n" +
+  "wrapped in a key derived from the master password, which no SSO token carries, so\n" +
+  "the master password is still needed unless the account genuinely has none. What\n" +
+  "SSO does buy: it works when the server sets SSO_ONLY and refuses password logins,\n" +
+  "and it yields a refresh_token, so the session renews for ~30 days without a browser\n" +
+  "— an API key gives you neither.\n";
 
 export function register(ctx) {
   return {
@@ -669,6 +716,7 @@ export function register(ctx) {
 /* Flags that take a value. Kept explicit so parsing is unambiguous. */
 const VALUE_FLAGS = new Set([
   "--server", "--email", "--search", "--ttl", "--iterations", "--field", "--map",
+  "--port", "--timeout",
 ]);
 
 async function main(argv) {
@@ -896,6 +944,92 @@ async function main(argv) {
       credsRm(C_TOKEN);
       credsRm(C_REFRESH);
       process.stdout.write("cleared\tkey cache + cached tokens (master password and api key kept)\n");
+      break;
+    }
+    case "sso": {
+      const sub = rest[0];
+      if (sub === "status") {
+        const cfg = vwConfig();
+        if (!cfg.server) return usage("sso needs a server first: f vaultwarden config --server https://vault.example.com");
+        const api = new VaultwardenApi({ server: cfg.server, timeoutMs: cfg.timeoutMs, allowInsecureHttp: !!cfg.allowInsecureHttp });
+        const st = await api.ssoEnabled();
+        if (!st.reachable) {
+          process.stdout.write("sso\tunknown (could not reach the server)\n");
+          process.stdout.write(`error\t${st.error}\n`);
+          break;
+        }
+        process.stdout.write(`sso\t${st.enabled ? "enabled" : "not enabled on this server"}\n`);
+        if (st.orgIdentifier) process.stdout.write(`org\t${st.orgIdentifier}\n`);
+        if (!st.enabled) {
+          process.stdout.write("note\tthe server refused /identity/sso/prevalidate, which is what a server with SSO_ENABLED=false does\n");
+          process.stdout.write("hint\tuse it anyway with: f vaultwarden sso login --force\n");
+        }
+        break;
+      }
+      if (sub === "login" || sub === undefined) {
+        const cfg = vwConfig();
+        if (!cfg.server) return usage("sso needs a server first: f vaultwarden config --server https://vault.example.com");
+        const api = new VaultwardenApi({ server: cfg.server, email: cfg.email, timeoutMs: cfg.timeoutMs, allowInsecureHttp: !!cfg.allowInsecureHttp });
+
+        // Confirm SSO unless told to skip the check. prevalidate is unauthenticated
+        // and cheap, and failing here beats sending a human to a browser for nothing.
+        if (!has("force")) {
+          const st = await api.ssoEnabled();
+          if (!st.enabled) {
+            return usage(`this server does not report SSO as enabled (${cfg.server})\n  re-run with --force if you know it is configured, or check SSO_ENABLED on the server`);
+          }
+        }
+
+        const port = Number(has("port") ? flagVal("port") : 8065);
+        const { authorizeUrl, codeVerifier } = await api.ssoAuthorizeUrl({ redirectPort: port });
+
+        process.stderr.write("\nOpen this URL to sign in with your identity provider:\n\n");
+        process.stderr.write(`  ${authorizeUrl}\n\n`);
+        process.stderr.write(`Waiting for the redirect on http://localhost:${port} …\n`);
+        // Only useful when a browser can reach this host. Stated, not assumed: on a
+        // headless box the URL must be pasted elsewhere and the callback still lands
+        // here only if localhost means this machine.
+        tryOpenBrowser(authorizeUrl);
+
+        const code = await captureSsoCode({
+          expectedState: null,
+          timeoutMs: has("timeout") ? Number(flagVal("timeout")) * 1000 : 180_000,
+          log: (bound) => process.stderr.write(`  listening on ${bound}\n`),
+        });
+
+        const tok = await api.loginSso({ code, codeVerifier });
+        const hasMaster = ssoRequiresMasterPassword(tok);
+        process.stdout.write(`authenticated\tyes${hasMaster ? " (master password still needed to decrypt)" : " (no master password on this account)"}\n`);
+        process.stdout.write(`refresh token\t${api.refreshToken ? "yes — sessions renew without a browser for ~30 days" : "no"}\n`);
+        if (tok?.KdfIterations) process.stdout.write(`kdf\tpbkdf2-sha256 ${tok.KdfIterations} iterations\n`);
+
+        // Persist the session, but never the master password: that stays in `f creds`
+        // where it belongs, entered through its own prompt.
+        credsSet(C_TOKEN, api.accessToken);
+        if (api.refreshToken) credsSet(C_REFRESH, api.refreshToken);
+
+        if (hasMaster) {
+          try {
+            const keys = VaultwardenApi.keysFromSsoToken(tok, { email: cfg.email, masterPassword: credsGet(cfg.masterPasswordCred) });
+            await writeKeyCache(cfg, keys, api);
+            process.stdout.write("key cache\tprimed — later reads skip PBKDF2\n");
+          } catch (e) {
+            const m = String(e.message ?? e);
+            if (/no master password stored|still uses a master password/.test(m)) {
+              process.stdout.write(`next\t${m.split("\n")[0]}\n`);
+              process.stdout.write("run\tf vaultwarden config --master-password\n");
+            } else if (/no master password: it is SSO-only/.test(m)) {
+              process.stdout.write(`blocked\t${m.split("\n")[0]}\n`);
+            } else {
+              throw e;
+            }
+          }
+        } else {
+          process.stdout.write("note\tthis account has no master password; opening it needs an enrolled device key pair, which this uck does not do\n");
+        }
+        break;
+      }
+      usage(`unknown sso subcommand: ${sub}`);
       break;
     }
     default:

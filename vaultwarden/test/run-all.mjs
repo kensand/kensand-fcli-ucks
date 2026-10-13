@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const suites = ["crypto.test.mjs", "e2e.test.mjs"];
+const suites = ["crypto.test.mjs", "sso.test.mjs", "e2e.test.mjs"];
 let bad = 0;
 for (const f of suites) {
   process.stdout.write(`\n── ${f} ${"─".repeat(Math.max(0, 58 - f.length))}\n`);
