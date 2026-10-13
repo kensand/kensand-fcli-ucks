@@ -231,9 +231,9 @@ async function ssoManualPrompt(authorizeUrl, port) {
     + "  terminal, forward the port and open it on your own machine — cookie and redirect\n"
     + "  then share a browser, and the default (non-manual) flow works:\n"
     + `     ssh -L ${port}:localhost:${port} <host>\n`
-    + "  If a browser on THIS machine still reports `SSO session binding mismatch`, that is\n"
-    + "  not you: Vaultwarden 1.36.x has a broken cookie path and rejects every SSO login.\n"
-    + "  Check `vaultwarden -V`; the fix shipped in 1.37.0.\n"
+    + "  If a browser on THIS machine reports `SSO session binding mismatch`, check the web\n"
+    + "  vault's SSO first: if that also fails, it is the Vaultwarden 1.36.0 cookie-path bug\n"
+    + "  (fix in >=1.37.0). If the web vault works, it is this redirect path, not your server.\n"
     + "\n"
     + "Paste the redirect URL (or just the code), then press Enter:\n\n> ",
   );
@@ -288,10 +288,11 @@ export function extractSsoServerError(input) {
     "  Cause A — you opened the URL on a different device than the one finishing the",
     "            flow. Open it on the machine that will receive the redirect, or forward",
     "            the port: ssh -L 8065:localhost:8065 <host>, then use the default flow.",
-    "  Cause B — your Vaultwarden is 1.36.x, which has a broken cookie path and rejects",
-    "            *every* SSO login, web vault included (#7163 introduced it, #7187 fixed",
-    "            it, first shipped in 1.37.0). Run `vaultwarden -V`; if it says 1.36,",
-    "            upgrade rather than changing your configuration.",
+    "  Cause B — Vaultwarden 1.36.0 has a broken cookie path (#7163) and rejects every",
+    "            SSO login, the web vault included. Run `vaultwarden -V`: 1.35.x has no",
+    "            such check, >=1.37.0 is fixed (#7187). If the WEB VAULT SUCCEEDS while",
+    "            this fails, it is not Cause B -- web and client_id=cli take different",
+    "            redirect paths, so treat it as a cookie/origin question or a bug here.",
   ].join("\n");
 }
 

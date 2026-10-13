@@ -509,7 +509,11 @@ await t("a pasted 'binding mismatch' body is explained, not called a missing cod
   const body = String.raw`{"message":"SSO session binding mismatch for HLRQ7RfKM0r6okaCr2fUpA","validationErrors":{"":["x"]},"object":"error"}`;
   const out = detect(body);
   assert.match(out, /binding mismatch/i);
-  assert.match(out, /1\.36/, "must name the broken release: it is a server bug, not operator error");
+  // Name the broken release, but also name the discriminator: if the web vault works,
+  // it is NOT that release bug. Asserting the server bug alone sent an operator off to
+  // upgrade a healthy server.
+  assert.match(out, /1\.36/);
+  assert.match(out, /WEB VAULT SUCCEEDS/i, "must give the test that rules the server bug out");
   assert.match(out, /ssh -L/, "and must offer the port-forward for the same-device cause");
   // A successful redirect must not be mistaken for an error.
   assert.equal(detect("http://localhost:8065/?code=abc123&state=xy"), null);
