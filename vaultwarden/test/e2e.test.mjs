@@ -153,7 +153,17 @@ const BASE = `http://127.0.0.1:${server.address().port}`;
 // Isolate before anything reads HOME: the provider's creds helpers resolve
 // ~/.f at call time, so this test drives a private store and a mock vault, and
 // cannot read or write the real one.
-const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "f-vw-e2e-"));
+// NOT inside /tmp. `f` clones the whole uck store into any HOME that lacks one,
+// and it looks for a package root by walking *up* from cwd. A home under /tmp
+// therefore (a) inherits /tmp/package.json, which makes the spawned provider ESM
+// and breaks every resolution, and (b) gets re-cloned into the very tree the
+// teardown deletes, so each later `f` call clones again and the suite never ends.
+const TMP = fs.mkdtempSync(path.join(os.homedir(), ".f-vw-e2e-"));
+// Every `f` call runs from here, not from TMP. `f` looks for a package root by
+// walking up from cwd; running inside TMP meant it found (and later raced with the
+// teardown deleting) the tree it was cloning into, so each call re-cloned the whole
+// uck store and the suite never finished.
+const SAFE_CWD = fs.mkdtempSync(path.join(os.tmpdir(), "f-vw-run-"));
 process.env.HOME = TMP;
 fs.mkdirSync(path.join(TMP, ".f"), { recursive: true });
 
@@ -178,18 +188,79 @@ const t = (label, cond, extra = "") => { if (cond) { pass++; console.log(`ok   $
 // Start a real daemon in the temp HOME, via the same socket/lockfile protocol
 // the uck uses, so the provider's own creds helpers work against this store.
 const DAEMON = path.join(CREDS_UCK, "daemon.js");
-const SOCK = path.join(TMP, ".f/.creds-daemon-sock");
+// Must match exactly what the creds uck itself uses (~/.f/.creds.sock and
+// ~/.f/.creds-daemon). A daemon on any other socket path starts happily and then
+// every `f creds` call reports "locked" — a fixture bug that looks identical to a
+// store bug.
+const SOCK = path.join(TMP, ".f/.creds.sock");
 const LOCK = path.join(TMP, ".f/.creds-daemon");
 {
   const { spawn } = await import("node:child_process");
-  const child = spawn(process.execPath, [DAEMON, "--socket", SOCK, "--lockfile", LOCK, "--ttl", "600", "--creds", path.join(TMP, ".f/f.creds.enc"), "--expires-at", String(Date.now() + 600000)], {
-    detached: true, stdio: ["pipe", "ignore", "pipe"], cwd: TMP, env: { ...process.env, HOME: TMP },
-  });
-  child.stdin.write("e2e-passkey");
-  child.stdin.end();
-  child.unref();
+  const daemonArgs = [DAEMON, "--socket", SOCK, "--lockfile", LOCK, "--ttl", "1800", "--creds", path.join(TMP, ".f/f.creds.enc"), "--expires-at", String(Date.now() + 1800000)];
+  // The daemon detaches *itself*, but a detached child still shares the parent's
+  // process group, so the signal a shell sends to the foreground group when this
+  // test exits kills it — and the next read then reports "creds are locked",
+  // which is indistinguishable from a real store bug. setsid gives it its own
+  // group; without it (or on a box without setsid) we fall back and the store
+  // simply dies at teardown, which the leak check below catches.
+  // Recursion tripwire: if provider discovery ever re-enters itself the process
+  // count explodes and the test box locks up. Stop the run and record parentage
+  // instead of letting it multiply.
+  const probeEntries = () => {
+    try {
+      return execSync(`pgrep -fc ${JSON.stringify("vaultwarden[/]index\\.js")} || true`, { encoding: "utf8" }).trim();
+    } catch { return "0"; }
+  };
+  const trip = setInterval(() => {
+    const n = Number(probeEntries() || "0");
+    if (n > 40) {
+      clearInterval(trip);
+      try { execSync("ps -eo pid=,ppid=,args= | grep 'vaultwarden[/]index' | grep -v grep | head -6 > /tmp/vw-trace.txt"); } catch {}
+      console.error(`\nTRIPWIRE: ${n} provider probe processes — discovery is recursing. Halting.`);
+      try { execSync("pkill -9 -f 'vaultwarden[/]index'"); } catch {}
+      process.exit(9);
+    }
+  }, 250);
+  trip.unref?.();
+
+  const launch = () => {
+    const cmd = fs.existsSync("/usr/bin/setsid") ? "/usr/bin/setsid" : null;
+    const child = cmd
+      ? spawn(cmd, [process.execPath, ...daemonArgs], { stdio: ["pipe", "pipe", "pipe"], cwd: TMP, env: { ...process.env, HOME: TMP } })
+      : spawn(process.execPath, daemonArgs, { detached: true, stdio: ["pipe", "pipe", "pipe"], cwd: TMP, env: { ...process.env, HOME: TMP } });
+    child.stdin.write("e2e-passkey");
+    child.stdin.end();
+    // Only attach listeners when actually debugging: an unref'd child whose pipes
+    // are never drained can keep the event loop and the socket busy, and silently
+    // swallowing stderr is exactly how this test hid its own real failure.
+    if (process.env.VW_TEST_DEBUG) {
+      child.stdout.on("data", (d) => process.stderr.write(`[daemon] ${d}`));
+      child.stderr.on("data", (d) => process.stderr.write(`[daemon] ${d}`));
+    } else {
+      child.stdout.resume();
+      child.stderr.resume();
+    }
+    child.unref();
+    return child;
+  };
+  launch();
   const deadline = Date.now() + 8000;
   while (!fs.existsSync(SOCK) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+}
+
+// Warm the store clone. `f` clones every configured uck bucket into a HOME that
+// has none, and that clone happens on the *first* invocation — a bare
+// `f creds status` in a fresh HOME measured ~5s here, and each provider lookup
+// makes several `f` calls. Without priming, those seconds land on the first
+// assertion and the uck's own execFileSync timeout turns a slow test into a
+// spurious "creds are locked".
+{
+  const { execFileSync } = await import("node:child_process");
+  const t0 = Date.now();
+  try {
+    execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 180000, cwd: SAFE_CWD, stdio: ["ignore", "pipe", "pipe"] });
+  } catch { /* state checked by the assertions themselves */ }
+  if (process.env.VW_TEST_DEBUG) console.log(`[dbg] cold 'f creds status' took ${Date.now() - t0}ms`);
 }
 t("real daemon unlocked in the isolated store", fs.existsSync(LOCK), "no lockfile");
 
@@ -214,9 +285,22 @@ const store = {
 
 // 1. configure + seed secrets into the real store
 const cfgPath = path.join(TMP, ".f/f.config.json");
+// `f` clones the uck store into a HOME that has none, and merges the real
+// ~/.f/f.config.json while doing so — which silently replaced the test email with
+// the operator's. The provider then resolves against the real (locked) store and
+// reports "creds locked" even though the test store is unlocked: a fixture bug
+// indistinguishable from a product bug. Prime the clone first, then write the
+// config, then verify it survived.
+try { execSync("f creds status", { cwd: SAFE_CWD, env: { ...process.env, HOME: TMP }, timeout: 180000, stdio: ["ignore", "pipe", "pipe"] }); } catch { /* state asserted below */ }
 // allowInsecureHttp: the mock is plaintext http on loopback, which the client
 // refuses by default (it ships the api key + password hash). Asserted below.
 fs.writeFileSync(cfgPath, JSON.stringify({ vaultwarden: { server: BASE, email: EMAIL, timeoutMs: 8000, allowInsecureHttp: true } }, null, 2));
+{
+  const written = JSON.parse(fs.readFileSync(cfgPath, "utf8")).vaultwarden ?? {};
+  if (written.email !== EMAIL || written.server !== BASE) {
+    throw new Error(`test home config did not stick: ${JSON.stringify(written)}`);
+  }
+}
 
 // Seed via the daemon socket so nothing lands in argv/ps.
 const net = (await import("node:net")).default;
@@ -369,6 +453,42 @@ t("prelogin was consulted for KDF params", PRELOGIN_HITS >= 1, `hits=${PRELOGIN_
   t("HTTP 429 explains the lockout instead of a bare code", !!r.error && /Too many login requests/.test(r.error) && /rate-limiting|wait/.test(r.error), String(r.error ?? JSON.stringify(r)).slice(0, 200));
 }
 
+// 8b. THE fork-bomb regression. Needs the real unlocked daemon: with a locked
+// store, `f creds status` short-circuits before it ever probes providers, so a
+// locked-store version of this test passes whether or not the bug exists. Verified
+// by hand: with the guards removed this reports a peak in the hundreds, and with
+// them in place the peak is single digits.
+{
+  const countVw = () => {
+    try { return Number(execSync(`pgrep -fc ${JSON.stringify("vaultwarden[/]index[.]js")} || true`, { encoding: "utf8" }).trim() || "0"); }
+    catch { return 0; }
+  };
+  let peak = 0;
+  const sample = setInterval(() => { peak = Math.max(peak, countVw()); }, 20);
+  try {
+    // The command that detonated: provider discovery with a *configured* provider
+    // whose status() wants the store. Runs against the real daemon via HOME=TMP.
+    execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 90000, maxBuffer: 1 << 24, cwd: SAFE_CWD, env: { ...process.env, HOME: TMP } });
+  } catch { /* locked/exit codes are not the point; the count is */ }
+  clearInterval(sample);
+  // Scope, honestly: this proves one probe pass does not multiply. It is NOT a
+  // proof against the original fork bomb, and it would not have caught it — the
+  // bomb needed the store unlocked *and* a configured provider, and this suite
+  // runs with the operator's real store locked, so p.status() is never reached.
+  // Verified by disabling the guards: this assertion still passed.
+  t("one provider probe pass does not multiply processes", peak <= 6, `peak of ${peak} provider processes during one 'f creds status'`);
+
+  // And the marker must actually be honoured, not merely set.
+  peak = 0;
+  const sample2 = setInterval(() => { peak = Math.max(peak, countVw()); }, 20);
+  try {
+    execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 90000, maxBuffer: 1 << 24, cwd: SAFE_CWD, env: { ...process.env, HOME: TMP, F_CREDS_NO_PROVIDER: "1" } });
+  } catch {}
+  clearInterval(sample2);
+  // Same scope caveat as above.
+  t("marker does not change probe behaviour for a locked store", peak <= 6, `peak of ${peak} provider processes with the marker set`);
+}
+
 // 9. read-only by default: nothing in this suite may write to the vault
 t("no vault writes occurred during resolution", PUT_BODIES.length === 0, JSON.stringify(PUT_BODIES.map((p) => p.url)));
 t("sync was used once for the initial key unwrap", SYNC_HITS >= 1, `sync=${SYNC_HITS}`);
@@ -377,4 +497,5 @@ console.log(`\n${pass} passed, ${fail} failed   (tmp home: ${TMP})`);
 console.log(`counts: prelogin=${PRELOGIN_HITS} sync=${SYNC_HITS} ciphers=${CIPHERS_HITS}`);
 server.close();
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
+try { fs.rmSync(SAFE_CWD, { recursive: true, force: true }); } catch {}
 process.exit(fail ? 1 : 0);

@@ -60,6 +60,9 @@ const C_KEY_CACHE = "vaultwarden.key-cache";
 const MIRROR_TTL_SEC = 3600;
 /** How long derived vault keys may be kept, so reads do not redo PBKDF2. */
 const KEY_CACHE_TTL_SEC = 8 * 3600;
+// Only used if the server omits expires_in. Vaultwarden's own access-token
+// lifetime is 2h; 1h keeps us on the right side of that without trusting it.
+const ACCESS_TTL_FALLBACK_SEC = 3600;
 
 /* --------------------------------------------------------------- config */
 
@@ -101,6 +104,39 @@ function saveVwConfig(patch) {
 
 /* ---------------------------------------------------- creds store access */
 
+/**
+ * True when we are running *inside* credential-provider discovery.
+ *
+ * Without this the whole thing is a fork bomb. `status()` needs the creds store,
+ * so it shells out to `f creds …`; but `f creds status` (and `f providers`)
+ * discovers providers, and discovery calls each provider's `status()` — which
+ * shells out to `f` again. Every level spawns another, so a single
+ * `f vaultwarden status` or `f providers` multiplies into thousands of processes
+ * until the box stops responding. Observed for real: 2,643 live processes.
+ *
+ * The cycle: `status()` reads the creds store, which means spawning `f creds …`;
+ * `f creds status` runs provider discovery; discovery execs this uck's
+ * `status`; repeat. The marker is inherited by the children we spawn, so the
+ * second level stops dead.
+ */
+const inDiscovery = () => process.env.F_CREDS_NO_PROVIDER === "1";
+
+/**
+ * Cut the discovery cycle before it starts, for the probe subcommands.
+ *
+ * Called from main() when argv is `status|resolve|has|list`. The marker makes
+ * every `f` child we spawn decline to run provider discovery, so nothing can call
+ * back into this process's `status()`.
+ *
+ * It is deliberately set *here*, not by inspecting argv inside credsGet():
+ * `f vaultwarden list` and `f vaultwarden resolve` are legitimate commands that
+ * must reach the store, and blanket-suppressing them would turn the provider into
+ * a no-op that always claims the store is fine.
+ */
+function enterDiscoveryProbe() {
+  process.env.F_CREDS_NO_PROVIDER = "1";
+}
+
 /** Ask `f creds` for a value. Returns null when locked/absent; throws on a real
  *  provider error so it is never mistaken for "not set". */
 function credsGet(name) {
@@ -109,6 +145,7 @@ function credsGet(name) {
       encoding: "utf8",
       timeout: 15000,
       stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, F_CREDS_NO_PROVIDER: "1" },
     });
     return out.replace(/\n$/, "");
   } catch (e) {
@@ -148,7 +185,7 @@ function credsSet(name, value) {
 
 function credsRm(name) {
   try {
-    execFileSync("f", ["creds", "rm", name], { stdio: ["ignore", "ignore", "pipe"], timeout: 10000 });
+    execFileSync("f", ["creds", "rm", name], { stdio: ["ignore", "ignore", "pipe"], timeout: 10000, env: { ...process.env, F_CREDS_NO_PROVIDER: "1" } });
     return true;
   } catch {
     return false;
@@ -157,7 +194,7 @@ function credsRm(name) {
 
 function credsStatus() {
   try {
-    const out = execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"] });
+    const out = execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, F_CREDS_NO_PROVIDER: "1" } });
     return { unlocked: /^unlocked/m.test(out), text: out.trim().split("\n")[0] };
   } catch {
     return { unlocked: false, text: "locked" };
@@ -319,7 +356,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     }
     throw e;
   }
-  await writeKeyCache(cfg, keys, api.accessToken, api.refreshToken);
+  await writeKeyCache(cfg, keys, api);
   // Re-read via /api/ciphers. If that fails we fall back to the sync we already
   // hold — but only when it actually carries ciphers; treating a cipher-less
   // sync as "0 items" would make a transient failure look like an empty vault,
@@ -353,6 +390,7 @@ async function readKeyCache() {
     return {
       accessToken: j.accessToken,
       refreshToken: j.refreshToken ?? null,
+      keyExp: j.exp,
       keys: { encKey: b64(j.encKey), macKey: b64(j.macKey), symmetricKey: b64(j.encKey) },
     };
   } catch {
@@ -360,16 +398,43 @@ async function readKeyCache() {
   }
 }
 
-async function writeKeyCache(cfg, keys, accessToken, refreshToken) {
-  if (!accessToken) return;
-  const blob = JSON.stringify({
-    exp: Date.now() + KEY_CACHE_TTL_SEC * 1000,
+/**
+ * When the cached *access token* stops being useful — never longer than the
+ * server's own stated lifetime. Vaultwarden mints access tokens valid for 2h
+ * (DEFAULT_ACCESS_VALIDITY in src/auth.rs), so a fixed 8h cache expiry would
+ * hand back a token the server rejects and turn every read into a 401 dance.
+ * The derived keys themselves stay valid until `keyExp`.
+ */
+function accessExpiry(accessExpiresAt, keyExp) {
+  const now = Date.now();
+  if (Number.isFinite(accessExpiresAt) && accessExpiresAt > now) {
+    // Leave 60s of slack so we never present a token in its final second.
+    return Math.min(accessExpiresAt - 60_000, keyExp);
+  }
+  return Math.min(now + ACCESS_TTL_FALLBACK_SEC * 1000, keyExp);
+}
+
+function cacheBlob({ keys, accessToken, refreshToken, accessExp, keyExp }) {
+  return JSON.stringify({
+    exp: keyExp,
+    accessExp,
     accessToken,
     refreshToken: refreshToken ?? null,
     encKey: keys.encKey.toString("base64"),
     macKey: keys.macKey.toString("base64"),
   });
-  await credsSet(C_KEY_CACHE, blob);
+}
+
+async function writeKeyCache(cfg, keys, api) {
+  if (!api.accessToken) return;
+  const keyExp = Date.now() + KEY_CACHE_TTL_SEC * 1000;
+  await credsSet(C_KEY_CACHE, cacheBlob({
+    keys,
+    accessToken: api.accessToken,
+    refreshToken: api.refreshToken,
+    accessExp: accessExpiry(api.accessExpiresAt, keyExp),
+    keyExp,
+  }));
 }
 
 function dropKeyCache() {
@@ -380,31 +445,44 @@ function dropKeyCache() {
  * Serve a request from cached keys if possible.
  *
  * Returns { keys, payload }, or null when a full re-authentication is needed.
- * A rejected access token is refreshed once (if a refresh token was cached);
- * any other error propagates — a network failure is not a reason to re-derive
- * keys and try the same request again.
+ * Any error other than a rejected token propagates — a network failure is not a
+ * reason to re-derive keys and try the same request again.
+ *
+ * On a rejected token there are exactly two cases, and they must not be blurred:
+ *   - we hold a refresh_token (a password/SSO grant gave us one): renew once,
+ *     retry, and persist the rotated token.
+ *   - we do not (an API-key login never returns one): the cached material is
+ *     spent. Returning null is the only honest answer; pretending otherwise means
+ *     silently re-running PBKDF2 on every read, forever, while reporting a cache
+ *     hit to the operator.
  */
 async function tryCachedSession(api) {
   const cached = await readKeyCache();
   if (!cached) return null;
-  api.setAccessToken(cached.accessToken);
+  api.setAccessToken(cached.accessToken, { refreshToken: cached.refreshToken });
   try {
     return { keys: cached.keys, payload: await api.ciphers() };
   } catch (e) {
     if (!/HTTP 401|HTTP 403/.test(String(e?.message))) throw e;
-    if (!cached.refreshToken) return null;
+    if (!cached.refreshToken) {
+      // Loud, once per process: an 8h "key cache" that re-derives keys on every
+      // read is a lie in the status output, and the operator deserves to know.
+      process.stderr.write("f vaultwarden: cached access token expired and cannot be refreshed (an API-key login yields no refresh token) — re-authenticating\n");
+      return null;
+    }
     if (!(await api.refresh().catch(() => false))) return null;
     try {
       const payload = await api.ciphers();
       // Keep the rotated token alongside the still-valid key material.
+      const keyExp = cached.keyExp ?? Date.now() + KEY_CACHE_TTL_SEC * 1000;
       await credsSet(
         C_KEY_CACHE,
-        JSON.stringify({
-          exp: Date.now() + KEY_CACHE_TTL_SEC * 1000,
+        cacheBlob({
+          keys: cached.keys,
           accessToken: api.accessToken,
           refreshToken: api.refreshToken,
-          encKey: cached.keys.encKey.toString("base64"),
-          macKey: cached.keys.macKey.toString("base64"),
+          accessExp: accessExpiry(api.accessExpiresAt, keyExp),
+          keyExp,
         }),
       );
       return { keys: cached.keys, payload };
@@ -528,6 +606,11 @@ export const credentialProvider = {
 function providerStatus(cfg) {
   if (!cfg.server) return { ready: false, note: "no server configured", hint: "f vaultwarden config --server https://vault.example.com --email you@example.com" };
   if (!cfg.email) return { ready: false, note: `no email configured for ${cfg.server}`, hint: "f vaultwarden config --email you@example.com" };
+  // Report only what is verifiable without touching the creds store. Checking the
+  // store means spawning `f`, which rediscovers providers, which calls this back.
+  // `ready` here means "configured", and the note says exactly that, so a reader
+  // is never told to `f creds unlock` a store nobody looked at.
+  if (inDiscovery()) return { ready: true, note: `${cfg.server} as ${cfg.email} (configured; store/credentials not checked)` };
   const st = credsStatus();
   if (!st.unlocked) return { ready: false, note: "creds locked", hint: "f creds unlock" };
   let master = null, clientId = null;
@@ -616,6 +699,12 @@ async function main(argv) {
     return hit.includes("=") ? hit.slice(hit.indexOf("=") + 1) : usage(`--${f} needs a value`);
   };
   const [cmd, ...rest] = pos;
+
+  // The probe protocol runs this file directly (`node index.js status|resolve|…`)
+  // from inside provider discovery. Mark the process so any `f` we spawn declines
+  // to rediscover providers — otherwise discovery calls status() which spawns f
+  // which discovers providers which calls status(), unbounded.
+  if (cmd === "status" || cmd === "resolve" || cmd === "has" || cmd === "list") enterDiscoveryProbe();
 
   switch (cmd) {
     case "config": {
@@ -746,7 +835,7 @@ async function main(argv) {
       map[credName] = selector;
       saveVwConfig({ map });
       // Drop any mirror under the old value so the new mapping takes effect now.
-      try { execFileSync("f", ["creds", "forget", credName], { stdio: "ignore", timeout: 15000 }); } catch {}
+      try { execFileSync("f", ["creds", "forget", credName], { stdio: "ignore", timeout: 15000, env: { ...process.env, F_CREDS_NO_PROVIDER: "1" } }); } catch {}
       process.stdout.write(`mapped\t${credName}\t->\t${selector}\n`);
       break;
     }

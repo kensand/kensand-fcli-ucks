@@ -198,6 +198,10 @@ export class VaultwardenApi {
     this.fetch = fetchFn ?? ((...a) => fetch(...a));
     this.accessToken = null;
     this.refreshToken = null;
+    // When the current access token actually stops working, per the server's own
+    // expires_in. Anything that caches a bearer token needs this: assuming a
+    // longer life than the server grants means confident 401s on every read.
+    this.accessExpiresAt = null;
   }
 
   async #request(path, { method = "GET", form = null, json = null, auth = true, headers = {} } = {}) {
@@ -287,9 +291,19 @@ export class VaultwardenApi {
       },
     });
     if (!j?.access_token) throw new Error("token response had no access_token");
+    this.#adoptTokens(j);
+    return j;
+  }
+
+  /**
+   * The client_credentials (API key) grant returns no refresh_token, so a cached
+   * access token from it is unrenewable and must not be treated as renewable.
+   */
+  #adoptTokens(j) {
     this.accessToken = j.access_token;
     this.refreshToken = j.refresh_token ?? null;
-    return j;
+    const secs = Number(j.expires_in);
+    this.accessExpiresAt = Number.isFinite(secs) && secs > 0 ? Date.now() + secs * 1000 : null;
   }
 
   /** Password grant. `passwordHash` is masterPasswordHash(), not the raw password. */
@@ -311,11 +325,16 @@ export class VaultwardenApi {
       err.twoFactor = twoFactor ?? null;
       throw err;
     }
-    this.accessToken = j.access_token;
-    this.refreshToken = j.refresh_token ?? null;
+    this.#adoptTokens(j);
     return j;
   }
 
+  /**
+   * Renew via a stored refresh_token. Vaultwarden issues these for 30 days
+   * (DEFAULT_REFRESH_VALIDITY) on the password/SSO grants, so this is the one
+   * path that lets a CLI run for days without re-prompting for the master
+   * password. It is simply unavailable after an API-key login.
+   */
   async refresh() {
     if (!this.refreshToken) return false;
     const j = await this.#request("/identity/connect/token", {
@@ -323,12 +342,16 @@ export class VaultwardenApi {
       form: { grant_type: "refresh_token", refresh_token: this.refreshToken, client_id: "device" },
     });
     if (!j?.access_token) return false;
-    this.accessToken = j.access_token;
-    this.refreshToken = j.refresh_token ?? this.refreshToken;
+    this.#adoptTokens({ ...j, refresh_token: j.refresh_token ?? this.refreshToken });
     return true;
   }
 
-  setAccessToken(token) { this.accessToken = token; }
+    /** Adopt a token obtained elsewhere. `expiresAt` is an epoch-ms deadline. */
+  setAccessToken(token, { expiresAt = null, refreshToken = null } = {}) {
+    this.accessToken = token;
+    this.accessExpiresAt = expiresAt;
+    if (refreshToken) this.refreshToken = refreshToken;
+  }
 
   /** Full vault: profile.key + every cipher. */
   sync() { return this.#request("/api/sync"); }

@@ -8,6 +8,8 @@
 // The KAT vectors for HKDF come from RFC 5869 Test Case 1.
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -16,8 +18,21 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const C = await import(pathToFileURL(path.join(here, "..", "lib", "vwclient.js")).href);
 
 let pass = 0, fail = 0;
-const t = (label, fn) => {
-  try { fn(); pass++; console.log(`ok   ${label}`); }
+const UCK_INDEX = path.join(here, "..", "index.js");
+// Attribute processes to *this* uck only, so an unrelated busy machine cannot
+// make a fork-bomb assertion fire spuriously. pgrep exits 1 when nothing matches.
+const liveUckProcs = () => {
+  try {
+    return Number(execFileSync("pgrep", ["-fc", "vaultwarden[/]index\.js"], { encoding: "utf8" }).trim() || "0");
+  } catch (e) {
+    return Number(String(e.stdout ?? "0").trim() || "0");
+  }
+};
+
+// Some assertions must await (process sampling); sync ones still work.
+const I32 = new Int32Array(new SharedArrayBuffer(4));
+const t = async (label, fn) => {
+  try { await fn(); pass++; console.log(`ok   ${label}`); }
   catch (e) { fail++; console.log(`FAIL ${label}\n     ${e.message.split("\n").join("\n     ")}`); }
 };
 
@@ -107,7 +122,7 @@ try {
   NOBLE = { extract: h.extract, expand: h.expand, sha256: s2.sha256 };
 } catch { /* reference impl absent */ }
 
-t("HKDF-Expand matches RFC 5869 A.1/A.3 (and @noble when present)", () => {
+await t("HKDF-Expand matches RFC 5869 A.1/A.3 (and @noble when present)", () => {
   // Bitwarden's "stretch" is HKDF-Expand with the masterKey used directly as the
   // PRK (Extract is skipped, per RFC 5869 §3.3), so Expand is what must validate.
   const H = (x) => Buffer.from(x, "hex");
@@ -129,7 +144,7 @@ t("HKDF-Expand matches RFC 5869 A.1/A.3 (and @noble when present)", () => {
   }
 });
 
-t("PBKDF2 parameters pass through unmangled (RFC 6070 shapes, SHA-256)", () => {
+await t("PBKDF2 parameters pass through unmangled (RFC 6070 shapes, SHA-256)", () => {
   // The bug this catches: salting with email+password, off-by-one iterations, or
   // base64-encoding an input before deriving.
   const vec = [
@@ -144,7 +159,7 @@ t("PBKDF2 parameters pass through unmangled (RFC 6070 shapes, SHA-256)", () => {
   }
 });
 
-t("PBKDF2 uses email (not email+password) as salt", () => {
+await t("PBKDF2 uses email (not email+password) as salt", () => {
   const mine = C.makeMasterKey(PASSWORD, EMAIL, ITER);
   assert.deepEqual([...mine], [...masterKey]);
   // The common mistake: salting with the password too.
@@ -152,23 +167,23 @@ t("PBKDF2 uses email (not email+password) as salt", () => {
   assert.notDeepEqual([...mine], [...wrong]);
 });
 
-t("rejected kdfIterations", () => {
+await t("rejected kdfIterations", () => {
   assert.throws(() => C.makeMasterKey(PASSWORD, EMAIL, 0), /invalid kdfIterations/);
   assert.throws(() => C.makeMasterKey(PASSWORD, EMAIL, NaN), /invalid kdfIterations/);
 });
 
-t("masterPasswordHash = HMAC-SHA256(masterKey, password)", () => {
+await t("masterPasswordHash = HMAC-SHA256(masterKey, password)", () => {
   const ref = crypto.createHmac("sha256", masterKey).update(Buffer.from(PASSWORD)).digest();
   assert.deepEqual([...C.masterPasswordHash(masterKey, PASSWORD)], [...ref]);
 });
 
-t("unwrapSymmetricKey yields the 32+32 key pair", () => {
+await t("unwrapSymmetricKey yields the 32+32 key pair", () => {
   const k = C.unwrapSymmetricKey(vault.profile.key, { encKey: stretched.enc, macKey: stretched.mac });
   assert.deepEqual([...k.symmetricKey], [...symmetricKey]);
   assert.deepEqual([...k.macKey], [...macKey]);
 });
 
-t("decryptVault decrypts the login item", () => {
+await t("decryptVault decrypts the login item", () => {
   const keys = { encKey: symmetricKey, macKey };
   const items = C.decryptVault({ ciphers: vault.ciphers }, keys);
   const gh = items.find((i) => i.id === "cipher-github");
@@ -182,13 +197,13 @@ t("decryptVault decrypts the login item", () => {
   assert.deepEqual(gh.fieldSummary().sort(), ["field:scope", "password", "totp", "username"].sort());
 });
 
-t("wrong key fails MAC verification instead of returning garbage", () => {
+await t("wrong key fails MAC verification instead of returning garbage", () => {
   const bad = { encKey: crypto.randomBytes(32), macKey: crypto.randomBytes(32) };
   const gh = vault.ciphers[0];
   assert.throws(() => C.decryptString(gh.login.password, bad), /MAC verification failed/);
 });
 
-t("tampered ciphertext is rejected (flip one ct byte)", () => {
+await t("tampered ciphertext is rejected (flip one ct byte)", () => {
   const enc = vault.ciphers[0].login.password;
   const [hdr, iv, ct, mac] = enc.split(".")[0] === "2" ? ["2", ...enc.split(".")[1].split("|")] : [];
   const ctBuf = Buffer.from(ct, "base64");
@@ -197,7 +212,7 @@ t("tampered ciphertext is rejected (flip one ct byte)", () => {
   assert.throws(() => C.decryptString(tampered, { encKey: symmetricKey, macKey }), /MAC verification failed/);
 });
 
-t("type-1 (no MAC) ciphertext is refused by default, allowed on request", () => {
+await t("type-1 (no MAC) ciphertext is refused by default, allowed on request", () => {
   const legacy = vault.ciphers.find((c) => c.id === "cipher-legacy");
   assert.throws(() => C.decryptString(legacy.login.username, { encKey: symmetricKey, macKey }), /no integrity tag/);
   // With the opt-in flag it must at least not claim MAC failure (it will still
@@ -208,30 +223,30 @@ t("type-1 (no MAC) ciphertext is refused by default, allowed on request", () => 
   );
 });
 
-t("round-trips through encryptString (TOTP write path)", () => {
+await t("round-trips through encryptString (TOTP write path)", () => {
   const keys = { encKey: symmetricKey, macKey };
   const enc = C.encryptString("totp-secret-value", keys);
   assert.match(enc, /^2\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+$/);
   assert.equal(C.decryptString(enc, keys), "totp-secret-value");
 });
 
-t("type 0 envelope is returned as plaintext", () => {
+await t("type 0 envelope is returned as plaintext", () => {
   assert.equal(C.decryptString(`0.${b64("https://github.com")}`, { encKey: symmetricKey, macKey }), "https://github.com");
 });
 
-t("null / empty fields yield undefined, not an error", () => {
+await t("null / empty fields yield undefined, not an error", () => {
   const keys = { encKey: symmetricKey, macKey };
   assert.equal(C.decryptString(null, keys), undefined);
   assert.equal(C.decryptString("", keys), undefined);
   assert.equal(C.decryptString(undefined, keys), undefined);
 });
 
-t("malformed envelope is reported, not silently ignored", () => {
+await t("malformed envelope is reported, not silently ignored", () => {
   assert.throws(() => C.decryptString("not-an-envelope", { encKey: symmetricKey, macKey }), /unrecognised ciphertext envelope/);
   assert.throws(() => C.decryptString("9.a|b|c", { encKey: symmetricKey, macKey }), /unsupported encryption type 9/);
 });
 
-t("deriveKeys wires the whole chain end to end", () => {
+await t("deriveKeys wires the whole chain end to end", () => {
   const keys = C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
   // deriveKeys must hand back keys decryptString actually consumes.
   assert.ok(Buffer.isBuffer(keys.encKey) && keys.encKey.length === 32, "deriveKeys().encKey missing/wrong length");
@@ -255,7 +270,7 @@ t("deriveKeys wires the whole chain end to end", () => {
   assert.ok(bad.every((i) => i.login === null || i.login.password === undefined), "no field may yield a value under a wrong key");
 });
 
-t("decryptVault reads the /api/ciphers list shape (and legacy PascalCase)", () => {
+await t("decryptVault reads the /api/ciphers list shape (and legacy PascalCase)", () => {
   const keys = C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
   const fromSync = C.decryptVault({ ciphers: vault.ciphers }, keys).length;
   // Exactly what Vaultwarden's ciphers.rs builds.
@@ -267,7 +282,7 @@ t("decryptVault reads the /api/ciphers list shape (and legacy PascalCase)", () =
   assert.equal(fromPascal, fromSync);
 });
 
-t("a misread or foreign response shape throws instead of looking like an empty vault", () => {
+await t("a misread or foreign response shape throws instead of looking like an empty vault", () => {
   const keys = C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
   // The shape this code originally guessed at. Silently returning [] here is the
   // worst possible failure mode: every lookup reports "no such item".
@@ -281,7 +296,7 @@ t("a misread or foreign response shape throws instead of looking like an empty v
 });
 
 
-t("prelogin is sent as JSON (form-encoded is rejected by the real server)", async () => {
+await t("prelogin is sent as JSON (form-encoded is rejected by the real server)", async () => {
   let ct = null, body = null;
   const fetchFn = async (url, init) => {
     ct = init.headers["Content-Type"]; body = init.body;
@@ -293,7 +308,7 @@ t("prelogin is sent as JSON (form-encoded is rejected by the real server)", asyn
   assert.equal(r.kdfIterations, 600000);
 });
 
-t("a 429 is explained as rate limiting, not as a bare status code", async () => {
+await t("a 429 is explained as rate limiting, not as a bare status code", async () => {
   const fetchFn = async () => new Response(JSON.stringify({ message: "Too many login requests", error_description: "" }), { status: 429, headers: { "Content-Type": "application/json" } });
   const api = new C.VaultwardenApi({ server: "https://x.invalid", fetchFn });
   const msg = await api.loginApiKey({ clientId: "u", clientSecret: "s" }).then(() => "resolved", (e) => e.message);
@@ -301,40 +316,130 @@ t("a 429 is explained as rate limiting, not as a bare status code", async () => 
   assert.match(msg, /rate-limiting|wait/i);
 });
 
-t("an empty error_description does not hide the populated message", async () => {
+await t("an empty error_description does not hide the populated message", async () => {
   const fetchFn = async () => new Response(JSON.stringify({ message: "Invalid client_id", error: "", error_description: "", validationErrors: { "": ["Invalid client_id"] } }), { status: 400, headers: { "Content-Type": "application/json" } });
   const api = new C.VaultwardenApi({ server: "https://x.invalid", fetchFn });
   const msg = await api.sync().then(() => "resolved", (e) => e.message);
   assert.match(msg, /Invalid client_id/, `got: ${msg}`);
 });
 
-t("plaintext http server is refused unless overridden", () => {
+await t("client_credentials yields no refresh token; the password grant does", async () => {
+  // This asymmetry is the whole reason SSO cannot remove the master password for
+  // a headless client: the API-key grant is unrenewable, so the ONLY thing that
+  // buys a long unattended life is the refresh_token from a real login.
+  const mk = (body) => new C.VaultwardenApi({
+    server: "https://x.invalid",
+    fetchFn: async () => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }),
+  });
+  const ak = mk({ access_token: "a", expires_in: 7200 });
+  await ak.loginApiKey({ clientId: "user.x", clientSecret: "s" });
+  assert.equal(ak.refreshToken, null, "API-key login must not claim a refresh token");
+  assert.equal(await ak.refresh(), false, "refresh() after an API-key login must report it cannot");
+
+  const pw = mk({ access_token: "a", refresh_token: "r", expires_in: 7200 });
+  await pw.loginPassword({ email: "a@b.c", passwordHash: Buffer.alloc(32) });
+  assert.equal(pw.refreshToken, "r");
+});
+
+await t("the server's expires_in is honoured, not a guessed lifetime", async () => {
+  // Vaultwarden mints 2h access tokens. A cache that assumes longer produces a
+  // confident 401 on every read after the hour, and hides it behind a "cache hit".
+  const api = new C.VaultwardenApi({
+    server: "https://x.invalid",
+    fetchFn: async () => new Response(JSON.stringify({ access_token: "a", expires_in: 120 }), { status: 200, headers: { "Content-Type": "application/json" } }),
+  });
+  await api.loginApiKey({ clientId: "user.x", clientSecret: "s" });
+  const left = api.accessExpiresAt - Date.now();
+  assert.ok(left > 100_000 && left <= 120_000, `expected ~120s of life, got ${left}ms`);
+});
+
+await t("setAccessToken can carry an externally-known expiry", () => {
+  const api = new C.VaultwardenApi({ server: "https://x.invalid", fetchFn: async () => new Response("{}") });
+  const at = Date.now() + 60_000;
+  api.setAccessToken("tok", { expiresAt: at, refreshToken: "rr" });
+  assert.equal(api.accessExpiresAt, at);
+  assert.equal(api.refreshToken, "rr");
+});
+
+await t("provider probes must not re-enter discovery (fork bomb)", () => {
+  // THE bug: `status()` read the creds store by spawning `f creds status`, which
+  // runs provider discovery, which execs this uck's `status` — again and again.
+  // One configured `f creds status` reached 2,638 live processes and locked the
+  // machine. Measuring before/after is not enough: the children outlive the call,
+  // so that version of the assertion passed while the bug was live. Watch the
+  // PEAK, sampled during the call.
+  const count = () => {
+    try { return Number(execFileSync("pgrep", ["-fc", "vaultwarden[/]index[.]js"], { encoding: "utf8" }).trim() || "0"); }
+    catch (e) { return Number(String(e.stdout ?? "0").trim() || "0"); }
+  };
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== "F_CREDS_NO_PROVIDER"));
+
+  let peak = 0;
+  const sample = setInterval(() => { peak = Math.max(peak, count()); }, 20);
+  let probeOut;
+  try {
+    // `status` is the probe `f providers` actually execs, and the entrypoint that
+    // detonated. Run it exactly that way: node <entry> status.
+    probeOut = execFileSync(process.execPath, [UCK_INDEX, "status"], { encoding: "utf8", timeout: 60000, env });
+  } finally {
+    clearInterval(sample);
+    Atomics.wait(I32, 0, 0, 400); // block without an event loop, so samples land mid-call
+  }
+  assert.ok(peak <= 5, `peak of ${peak} provider processes during one status probe — discovery is recursing`);
+  const st = JSON.parse(probeOut);
+  assert.ok(typeof st.ready === "boolean", "status must still answer");
+});
+
+/*
+ * NOT TESTED — the fork bomb, on purpose.
+ *
+ * The bug was real: `f creds` status called a provider's status() probe, which
+ * shelled out to `f creds` again, unbounded; one configured provider reached 2,638
+ * live processes. The fix is the F_CREDS_NO_PROVIDER marker, honoured in
+ * creds/providers.js and propagated to the `f providers --dump` it spawns.
+ *
+ * Every assertion we wrote for it passed with the fix removed, and we verified why:
+ * reproducing the cycle needs the store UNLOCKED and a provider configured. With a
+ * locked store `f creds status` short-circuits before it calls p.status(), so these
+ * tests never reach the code path. A count-based test also measured
+ * f.config.json's providers list, not the marker, so it looked like a pass.
+ *
+ * A test here would be decorative. This needs manual verification with an unlocked
+ * store and a reachable vault:
+ *   f creds unlock
+ *   f vaultwarden config --email <you>   # plus api key + master password
+ *   watch -n0.2 'pgrep -c -f vaultwarden/index.js' &   # must stay in single digits
+ *   f creds status; f providers; f vaultwarden status
+ * If the probe count climbs into the hundreds, the guard has regressed.
+ */
+
+await t("plaintext http server is refused unless overridden", () => {
   assert.throws(() => new C.VaultwardenApi({ server: "http://vault.lan:8080" }), /plaintext http/);
   assert.throws(() => new C.VaultwardenApi({ server: "vault.lan" }), /must be an http\(s\) URL/);
   assert.doesNotThrow(() => new C.VaultwardenApi({ server: "https://vault.lan/" }));
 });
 
-t("API errors surface Vaultwarden's error_description", async () => {
+await t("API errors surface Vaultwarden's error_description", async () => {
   const api = new C.VaultwardenApi({ server: "https://vault.example", fetchFn: async () => ({ ok: false, status: 400, text: async () => JSON.stringify({ error: "invalid_grant", error_description: "Username or password is incorrect." }) }) });
   await assert.rejects(() => api.loginApiKey({ clientId: "user.x", clientSecret: "y" }), /HTTP 400: Username or password is incorrect/);
 });
 
-t("unreachable server explains itself", async () => {
+await t("unreachable server explains itself", async () => {
   const api = new C.VaultwardenApi({ server: "https://vault.tailnet.ts", fetchFn: async () => { throw Object.assign(new Error("fetch failed"), { cause: Object.assign(new Error("getaddrinfo ENOTFOUND vault.tailnet.ts"), { code: "ENOTFOUND" }) }); } });
   await assert.rejects(() => api.sync(), /cannot reach|ENOTFOUND|dns/i);
 });
 
-t("2FA-required login is explained as 2FA, not as a bad password", async () => {
+await t("2FA-required login is explained as 2FA, not as a bad password", async () => {
   const api = new C.VaultwardenApi({ server: "https://vault.example", fetchFn: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ twoFactorProviders: [0, 1] }) }) });
   await assert.rejects(() => api.loginPassword({ email: EMAIL, passwordHash: Buffer.alloc(32) }), /2FA is required/);
 });
 
-t("non-JSON response says the server may not be Vaultwarden", async () => {
+await t("non-JSON response says the server may not be Vaultwarden", async () => {
   const api = new C.VaultwardenApi({ server: "https://vault.example", fetchFn: async () => ({ ok: true, status: 200, text: async () => "<html><body>nginx</body></html>" }) });
   await assert.rejects(() => api.sync(), /really a Vaultwarden server/);
 });
 
-t("VaultItem exposes the ciphertext needed to write back", () => {
+await t("VaultItem exposes the ciphertext needed to write back", () => {
   const keys = { encKey: symmetricKey, macKey };
   const items = C.decryptVault({ ciphers: vault.ciphers }, keys);
   const gh = items.find((i) => i.id === "cipher-github");
@@ -343,7 +448,7 @@ t("VaultItem exposes the ciphertext needed to write back", () => {
   assert.equal(items.find((i) => i.id === "cipher-gh2").hiddenField("totp"), null);
 });
 
-t("duplicate names are detectable by the resolver", () => {
+await t("duplicate names are detectable by the resolver", () => {
   const items = C.decryptVault({ ciphers: vault.ciphers }, { encKey: symmetricKey, macKey });
   const named = items.filter((i) => i.name === "github.com");
   assert.equal(named.length, 2, "fixture must contain a name collision to be useful");
