@@ -120,6 +120,36 @@ That check has produced a lot of confusion, and the honest statement is narrower
   `docker inspect`, is the only reliable read.
 - Do not "fix" this by editing `SSO_*` settings; neither cause is configured there.
 
+How to tell whose flow failed — **read the `state`, not the error text.** The state is
+client-chosen, and the two clients pick it differently:
+
+* **this uck**: `crypto.randomBytes(16).toString("base64url")` → a **22-character** string
+  (`fMibIbZS6TGJSJMjScXhdQ`). The server echoes it base64-encoded, so the URL carries a
+  ~32-char `state=` that decodes back to 22 chars.
+* **the web vault**: much longer, and its server-side state ends in `_identifier=<uuid>`.
+
+`SSO session binding mismatch` naming a 22-char state means **the CLI's flow failed**, and
+says nothing about the web vault. Do not read it as "SSO is broken server-wide", and do not
+let a working web vault convince you the CLI did something right — they are separate
+`SsoAuth` rows with separate binding cookies. Check the state first; it has already told you
+which one broke.
+
+Binding applies to `web` and `cli` identically (`binding_hash` is passed for every client in
+`sso::authorize_url`), so if web passes and cli fails the difference is the **browser leg**,
+not server policy. The decisive observation:
+
+> DevTools → Network → click the failing `oidc-signin` request → Request Headers →
+> `Cookie:`. `VW_SSO_BINDING` **absent** → the browser would not send it (a Secure/loopback
+> or third-party-cookie question; note Safari does *not* exempt `http://localhost` from
+> `Secure`). **Present** → server-side. `HttpOnly` stops page JS reading it; it does not hide
+> it from the Network panel, which is why this works as an experiment at all.
+
+Server-side checks worth ruling out: `DOMAIN_PATH` must be empty unless the vault really is
+served from a sub-path (on 1.36.0 the cookie is set at `/identity/connect/` and removed at
+the same path, so a non-empty `DOMAIN_PATH` breaks the web vault too), and an authenticating
+reverse proxy in front of the vault can consume the browser session and leave the binding
+cookie set in a session that no longer exists by callback time.
+
 The device that opens the URL must be the one whose cookie jar receives the redirect — so open the URL **on the same machine** that runs the command,
 and use `--manual` only when that machine has a browser you can see but the terminal cannot
 drive (a remote terminal session, a container with a mounted display, a browser that

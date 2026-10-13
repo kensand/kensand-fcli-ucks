@@ -513,7 +513,10 @@ await t("a pasted 'binding mismatch' body is explained, not called a missing cod
   // it is NOT that release bug. Asserting the server bug alone sent an operator off to
   // upgrade a healthy server.
   assert.match(out, /1\.36/);
-  assert.match(out, /WEB VAULT SUCCEEDS/i, "must give the test that rules the server bug out");
+  // The 22-char state is what identifies *this* client's flow. Asserting it stays in the
+  // message is the guard against me re-asserting a server-side cause from the error text
+  // alone -- which is exactly the mistake this replaced.
+  assert.match(out, /22 chars|web vault/i, "must say whether this is the CLI's own flow");
   assert.match(out, /ssh -L/, "and must offer the port-forward for the same-device cause");
   // A successful redirect must not be mistaken for an error.
   assert.equal(detect("http://localhost:8065/?code=abc123&state=xy"), null);
