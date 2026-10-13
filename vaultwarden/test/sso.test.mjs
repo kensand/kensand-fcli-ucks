@@ -17,6 +17,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const C = await import(pathToFileURL(path.join(here, "..", "lib", "vwclient.js")).href);
 const { captureSsoCode } = await import(pathToFileURL(path.join(here, "..", "lib", "sso-callback.js")).href);
 
+let refreshCount = 0;
 let pass = 0, fail = 0;
 const t = async (label, fn) => {
   try { await fn(); pass++; console.log(`ok   ${label}`); }
@@ -25,7 +26,7 @@ const t = async (label, fn) => {
 
 /* ------------------------------------------------------------ mock server */
 
-const seen = { token: null, ssoToken: null, prevalidateHits: 0 };
+const seen = { token: null, authorize: null, prevalidateHits: 0 };
 // Set these to steer the mock per-test.
 let mock = {};
 
@@ -39,28 +40,46 @@ const srv = http.createServer((req, res) => {
 
     if (u.pathname === "/identity/sso/prevalidate") {
       seen.prevalidateHits++;
-      if (mock.ssoOff) return json(400, { message: "SSO is not enabled" });
-      return json(200, { "2faRequired": false, ssoEnabled: true, ssoOrgIdentifier: null });
+      // Real shapes, copied from identity.rs `prevalidate`: enabled answers with a
+      // signed token claim and nothing else; disabled answers with an error. There is no
+      // boolean `ssoEnabled` field -- an earlier client checked for one and always
+      // reported "not enabled".
+      if (mock.ssoOff) return json(400, { message: "SSO sign-in is not available" });
+      return json(200, { token: "eyJhbGciOiJIUzI1NiJ9.stub.signature" });
     }
 
-    if (u.pathname === "/identity/sso/token") {
-      seen.ssoToken = form;
-      // Mirrors authorize_url(): client_id must be cli/web/browser/desktop/mobile,
-      // and for cli the redirect must be http://localhost:8065..8070.
-      if (form.client_id !== "cli") return json(400, { message: `Unsupported client ${form.client_id}` });
-      const portOk = /^http:\/\/localhost:(806[5-9]|8070)$/.test(form.redirect_uri ?? "");
-      if (!portOk) return json(400, { message: `Unsupported redirect uri ${form.redirect_uri}` });
-      if (!form.code_challenge) return json(400, { message: "code challenge cannot be blank" });
-      if (form.code_challenge_method && form.code_challenge_method !== "S256") {
-        return json(400, { message: "only S256 is supported" });
+    // The real entry point: GET /identity/connect/authorize answers 307 to the IdP.
+    // There is no JSON endpoint that returns an authorize URL. Field rules copied from
+    // AuthorizeData + sso.rs::authorize_url.
+    if (u.pathname === "/identity/connect/authorize") {
+      seen.authorize = Object.fromEntries(u.searchParams);
+      const { client_id, redirect_uri, code_challenge, code_challenge_method } = seen.authorize;
+      if (code_challenge_method !== "S256") return json(400, { message: "Unsupported code challenge method" });
+      if (!code_challenge) return json(400, { message: "code challenge cannot be blank" });
+      const ports = [];
+      for (let pt = 8065; pt <= 8070; pt++) ports.push(`http://localhost:${pt}`);
+      if (client_id === "cli") {
+        if (!ports.includes(redirect_uri)) return json(400, { message: `Unsupported redirect uri ${redirect_uri}` });
+      } else if (!["web", "browser", "desktop", "mobile"].includes(client_id)) {
+        return json(400, { message: `Unsupported client ${client_id}` });
       }
-      // Remember the challenge so the exchange can verify it, like the server does.
-      mock.expectedChallenge = form.code_challenge;
-      return json(200, { AuthorizeUrl: `${BASE}/sso-connector.html?state=${form.state}`, State: form.state });
+      mock.expectedChallenge = code_challenge;
+      // Vaultwarden sets a browser-binding cookie here and 307s to the IdP. The issuer
+      // is a DIFFERENT origin in reality (Keycloak/Authentik/etc. on its own host), so
+      // the mock uses a separate listening socket rather than a path on this one --
+      // otherwise "did we leave the server?" cannot be tested at all.
+      res.writeHead(307, { location: `${IDP}/authorize?state=${seen.authorize.state}&client_id=vaultwarden` });
+      return res.end();
     }
 
     if (u.pathname === "/identity/connect/token") {
       seen.token = form;
+      if (form.grant_type === "refresh_token") {
+        // identity.rs accepts this with client_id + refresh_token and no device fields.
+        for (const f of ["client_id", "refresh_token"]) if (!form[f]) return json(400, { error: "invalid_request", error_description: `${f} cannot be blank` });
+        refreshCount++;
+        return json(200, { ...defaultToken(), access_token: `AT-${refreshCount}` });
+      }
       if (form.grant_type !== "authorization_code") return json(400, { error: `unsupported grant ${form.grant_type}` });
       // Required-field checks copied from identity.rs sso_login.
       for (const f of ["client_id", "code", "code_verifier", "device_identifier", "device_name", "device_type"]) {
@@ -87,6 +106,19 @@ const defaultToken = () => ({
 });
 
 const api = () => new C.VaultwardenApi({ server: BASE, email: "user@example.com", timeoutMs: 8000, allowInsecureHttp: true });
+
+// A second, genuinely separate origin stands in for the identity provider. Its job is
+// only to prove the client stops at the IdP instead of trying to complete the flow
+// without a browser (it cannot, and should not pretend to).
+const idpHits = [];
+const idpSrv = http.createServer((req, res) => {
+  idpHits.push(req.url);
+  res.writeHead(200, { "content-type": "text/html" });
+  res.end("<html>pretend login screen</html>");
+});
+await new Promise((r) => idpSrv.listen(0, "127.0.0.1", r));
+const IDP = `http://127.0.0.1:${idpSrv.address().port}`;
+assert.notEqual(new URL(IDP).port, new URL(BASE).port, "the mock IdP must be a different origin");
 
 /**
  * Drive a capture to completion, returning its message whether it resolved or threw.
@@ -145,24 +177,45 @@ function getVia(host, port, pathName) {
 
 /* ------------------------------------------------------------------ tests */
 
-await t("ssoEnabled() reads the unauthenticated prevalidate probe", async () => {
+await t("ssoEnabled() reports enabled from the real {token} response", async () => {
   mock = {};
   const st = await api().ssoEnabled();
-  assert.equal(st.enabled, true, "must report enabled when prevalidate says so");
+  assert.equal(st.enabled, true, "a {token} response means SSO is on; checking a boolean ssoEnabled field would say false");
+  assert.equal(st.reachable, true);
   assert.ok(seen.prevalidateHits >= 1);
 });
 
-await t("ssoEnabled() reports false, not a throw, when the server has no SSO", async () => {
+await t("ssoEnabled() does not mistake a bare-200-with-no-token for enabled", async () => {
+  mock = {};
+  const stub = new C.VaultwardenApi({ server: BASE, timeoutMs: 8000, allowInsecureHttp: true });
+  const real = stub.fetch;
+  stub.fetch = async (u, o) => ({ status: 200, ok: true, headers: new Headers({ "content-type": "application/json" }), text: async () => "{}" });
+  const st = await stub.ssoEnabled();
+  stub.fetch = real;
+  assert.equal(st.enabled, false, "an empty 200 is not evidence of SSO");
+});
+
+await t("ssoEnabled() reports disabled when the server refuses prevalidate", async () => {
   mock = { ssoOff: true };
   const st = await api().ssoEnabled();
   assert.equal(st.enabled, false);
+  assert.equal(st.reachable, true, "an HTTP refusal is a real answer about the setting");
+});
+
+await t("ssoEnabled() says 'unreachable', not 'disabled', when the server cannot be reached", async () => {
+  // Conflating these sends the operator to flip SSO_ENABLED on a server that is fine.
+  const dead = new C.VaultwardenApi({ server: "http://127.0.0.1:1", timeoutMs: 1500, allowInsecureHttp: true });
+  const st = await dead.ssoEnabled();
+  assert.equal(st.enabled, false);
+  assert.equal(st.reachable, false, "must not claim knowledge of the server's config");
+  assert.ok(st.error, "must carry the reason");
 });
 
 await t("authorize request uses client_id=cli + a port the server accepts", async () => {
   mock = {};
   const r = await api().ssoAuthorizeUrl({ redirectPort: 8065 });
-  assert.equal(seen.ssoToken.client_id, "cli", "server rejects every other client for a CLI");
-  assert.equal(seen.ssoToken.redirect_uri, "http://localhost:8065");
+  assert.equal(seen.authorize.client_id, "cli", "server rejects every other client for a CLI");
+  assert.equal(seen.authorize.redirect_uri, "http://localhost:8065");
   assert.ok(r.authorizeUrl, "must hand back a URL to open");
   assert.ok(/[A-Za-z0-9_-]{40,}/.test(r.codeVerifier), "PKCE verifier must be high-entropy");
 });
@@ -171,7 +224,8 @@ await t("authorize sends an S256 challenge that hashes from the verifier", async
   mock = {};
   const r = await api().ssoAuthorizeUrl({ redirectPort: 8066 });
   const expect = crypto.createHash("sha256").update(r.codeVerifier).digest("base64url");
-  assert.equal(seen.ssoToken.code_challenge, expect, "plain challenge would leak the verifier");
+  assert.equal(seen.authorize.code_challenge, expect, "plain challenge would leak the verifier");
+  assert.equal(seen.authorize.code_challenge_method, "S256", "the server hard-requires the literal S256");
 });
 
 await t("a redirect port outside 8065-8070 is refused before any request", async () => {
@@ -379,6 +433,10 @@ await t("full flow: authorize, capture the redirect, exchange, derive nothing wi
   const a = api();
   const { authorizeUrl, codeVerifier } = await a.ssoAuthorizeUrl({ redirectPort: 8067 });
   assert.match(authorizeUrl, /^http:/, "must give a URL a browser can open");
+  assert.notEqual(new URL(authorizeUrl).host, new URL(BASE).host, "must hand back the IdP URL, not a URL on the vault server");
+  // Stopping is the point: completing the flow needs a human. Fetching the IdP login
+  // page would mean we think we can drive it ourselves, which we cannot.
+  assert.equal(idpHits.length, 0, `the client must not fetch the IdP itself (got ${idpHits.length} request(s))`);
 
   let port = null;
   // The code arrives out of band, exactly as a browser redirect would.
@@ -397,6 +455,25 @@ await t("full flow: authorize, capture the redirect, exchange, derive nothing wi
   assert.equal(a.refreshToken, "RT-SSO");
   // And the master password question is answered from the response, not assumed.
   assert.equal(C.ssoRequiresMasterPassword(tok), true);
+});
+
+await t("after one browser login, later reads renew with no browser at all", async () => {
+  // This is the property that makes the browser acceptable: it should be a one-time
+  // event. If renewal silently fails, every read would need the operator to sign in
+  // again, which for a credential provider is worse than no SSO at all.
+  mock = {};
+  const a = api();
+  const { codeVerifier } = await a.ssoAuthorizeUrl({ redirectPort: 8065 });
+  await a.loginSso({ code: "C1", codeVerifier });
+  assert.ok(a.refreshToken, "the whole renewal story depends on the refresh token");
+  const first = a.accessToken;
+
+  const ok = await a.refresh();
+  assert.equal(ok, true, "refresh must succeed against a server that issues refresh tokens");
+  assert.notEqual(a.accessToken, first, "must actually trade the refresh token for a new access token");
+  assert.equal(seen.token.grant_type, "refresh_token", "renewal must use the refresh grant, not a fresh login");
+  assert.equal(seen.token.refresh_token, "RT-SSO", "and must send the stored refresh token");
+  assert.ok(seen.token.client_id, "the refresh grant still has to identify the client");
 });
 
 await t("a named port that is taken fails loudly instead of binding another", async () => {

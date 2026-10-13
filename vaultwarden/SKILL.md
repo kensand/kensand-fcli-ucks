@@ -60,6 +60,26 @@ that case — Bitwarden's passwordless unlock (TDE / Key Connector) is Bitwarden
 and not implemented in Vaultwarden, and `--code` bypasses the SSO claim entirely. See "Why a
 master password is unavoidable" below.
 
+The wire contract, re-read from Vaultwarden's `identity.rs`/`sso.rs` after the first
+guess produced a 404. Implement it from this, not from intuition:
+
+- `GET /identity/sso/prevalidate` — unauthenticated. Enabled answers **`{"token": "<jwt>"}`**
+  and nothing else; disabled answers an error body. There is **no** boolean `ssoEnabled`
+  field, so `!!j.ssoEnabled` is permanently false and `sso status` will tell you SSO is off
+  on a server where it works.
+- `GET /identity/connect/authorize?client_id&redirect_uri&state&code_challenge&code_challenge_method`
+  — **a GET that answers 307 to the identity provider.** There is **no** `POST
+  /identity/sso/token`; that endpoint does not exist and 404s. `code_challenge_method` must
+  be exactly `S256`. For `client_id=cli` the `redirect_uri` must be `http://localhost:8065`
+  through `8070` — every other value is rejected with `Unsupported redirect uri`.
+- The client must **stop** at the first off-server `Location`. Fetching the IdP's own login
+  URL is pointless: completing the flow needs a human.
+- `POST /identity/connect/token` with `grant_type=authorization_code`, the `code`, and the
+  `code_verifier` — no client secret, PKCE replaces it. Device fields (`device_identifier`,
+  `device_name`, `device_type`) are required here too.
+- `grant_type=refresh_token` needs only `client_id` + `refresh_token`. This is what makes the
+  browser a one-time event.
+
 Two things that bite during the browser hop:
 
 - The callback binds **both** `127.0.0.1` and `::1`. The `redirect_uri` is literally
@@ -166,7 +186,7 @@ else; nothing in the resolution path can mutate the vault.
 ```
 node test/run-all.mjs            # all three suites
 node test/crypto.test.mjs        # 31: crypto vectors, envelope handling, error shapes
-node test/sso.test.mjs           # 24: OIDC flow + the loopback callback listener
+node test/sso.test.mjs           # 27: OIDC flow + the loopback callback listener
 node test/e2e.test.mjs           # 32: whole provider ladder vs a mock Vaultwarden
 ```
 
@@ -212,6 +232,8 @@ collections, `device-encryption` (key-pair) unlock, attachments, or your actual 
 | `sso login` opens the browser, then times out | the redirect never reached the callback. Check the port: `ss -tlnp \| grep -E ':806[5-9]\|:8070'`. A listener bound to `127.0.0.1` only is the classic cause — `localhost` resolves to `::1` first, so the browser's connection is refused. This uck binds both loopbacks; if you patched it to bind one, restore that. |
 | `port N is in use` / `no free port` with nothing obviously listening | a previous attempt's listener is still shutting down, or a stale process holds it. Kill it — the message names the port. It does not fall back to another port on purpose: the IdP was told to redirect to that exact one. |
 | `sso status` → `unknown (could not reach the server)` | network/TLS/DNS, per the `error` line. Not a server setting — do not go editing `SSO_ENABLED`. |
+| `sso login` → **HTTP 404** | the authorize step is `GET /identity/connect/authorize` (307 to the IdP). A `POST /identity/sso/token` does not exist — an earlier version of this client invented it. If you are reading this after rewriting the flow, check the verb and the path before blaming the server. |
+| `sso status` says `not enabled` but SSO clearly works | prevalidate returns `{"token": ...}`, not a boolean. Checking `j.ssoEnabled` is always false. Fixed in `ssoEnabled()`; do not reintroduce it. |
 | SSO succeeds and it still asks for the master password | expected, not a bug. See the SSO section above. |
 
 If `f providers` does not list `vaultwarden`, the uck failed to load: run

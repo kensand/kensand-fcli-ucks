@@ -381,10 +381,19 @@ export class VaultwardenApi {
    * when SSO is configured, and a 400 when it is not. That makes it a cheap,
    * unauthenticated probe: better than reading the config and being wrong.
    */
+  /**
+   * Does this server offer SSO? `GET /identity/sso/prevalidate` is the unauthenticated
+   * probe. Shape matters and was got wrong once: current Vaultwarden returns
+   * `{"token": "<jwt>"}` when enabled and errors with "SSO sign-in is not available"
+   * when not. There is no boolean `ssoEnabled` field, so testing for one reports "not
+   * enabled" against a server whose SSO works fine. Presence of the token is the signal;
+   * the older spelling is still accepted so a version change is not misread.
+   */
   async ssoEnabled() {
     try {
       const j = await this.#request("/identity/sso/prevalidate", { auth: false });
-      return { enabled: !!j?.ssoEnabled, orgIdentifier: j?.ssoOrgIdentifier ?? null, raw: j, reachable: true };
+      const enabled = Boolean(j?.token ?? j?.Token ?? j?.ssoEnabled);
+      return { enabled, orgIdentifier: j?.ssoOrgIdentifier ?? j?.orgIdentifier ?? null, raw: j, reachable: true };
     } catch (e) {
       // "SSO is off" and "I could not ask" are different answers. Vaultwarden answers
       // this route with a 400 when SSO is disabled, so only an HTTP-level refusal
@@ -392,7 +401,7 @@ export class VaultwardenApi {
       // and reporting that as "not enabled" sends the operator to change a server
       // setting that is probably fine.
       const msg = String(e?.message ?? e);
-      const refused = /\bHTTP 40[0x]|\bHTTP 404|\bHTTP 50[0-9]/i.test(msg);
+      const refused = /\bHTTP [45]\d\d/i.test(msg);
       if (refused) return { enabled: false, orgIdentifier: null, raw: null, reachable: true };
       return { enabled: false, orgIdentifier: null, raw: null, reachable: false, error: msg };
     }
@@ -412,6 +421,22 @@ export class VaultwardenApi {
    * value. We do keep the PKCE `code_verifier`, which is the secret that makes a
    * captured `code` useless to anyone else.
    */
+  /**
+   * Start an SSO authorization: produce the URL to open in a browser.
+   *
+   * The real entry point is `GET /identity/connect/authorize` (identity.rs `authorize`),
+   * which answers **307 Redirect** to the identity provider. There is no JSON endpoint
+   * that hands back an authorize URL — an earlier version of this method POSTed to
+   * `/identity/sso/token`, which does not exist, and the server answered 404.
+   *
+   * So: follow redirects, but *stop* at the IdP. The chain is
+   *   /identity/connect/authorize  ->  <issuer>/authorize  ->  (only once a human is
+   *   involved) back to http://localhost:<port>. We want the first hop off-box, which is
+   *   the URL to show/open; fetching it further would mean driving the IdP without a
+   *   browser, which is exactly what we cannot do.
+   *
+   * @param opts.redirectPort one of 8065-8070; sso.rs accepts nothing else for cli.
+   */
   async ssoAuthorizeUrl({ redirectPort = 8065 } = {}) {
     if (redirectPort < 8065 || redirectPort > 8070) {
       throw new Error(`redirectPort must be 8065-8070 for client_id=cli (got ${redirectPort})`);
@@ -419,30 +444,75 @@ export class VaultwardenApi {
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
     const state = crypto.randomBytes(16).toString("base64url");
-    const j = await this.#request("/identity/sso/token", {
-      method: "POST",
-      auth: false,
-      form: {
-        client_id: SSO_CLIENT_ID,
-        state,
-        code_challenge: codeChallenge,
-        redirect_uri: `http://localhost:${redirectPort}`,
-        // Sent both ways: this server is verified to read the snake_case spellings
-        // for the other grants, and `uncased` field matching makes the duplicate free.
-        deviceType: String(DEVICE_TYPE_CLI), device_type: String(DEVICE_TYPE_CLI),
-        deviceIdentifier: DEVICE_IDENTIFIER,
-        deviceName: DEVICE_NAME,
-        device_identifier: DEVICE_IDENTIFIER,
-        device_name: DEVICE_NAME,
-      },
+    const q = new URLSearchParams({
+      client_id: SSO_CLIENT_ID,
+      response_type: "code",
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256", // the server hard-requires exactly this string
+      redirect_uri: `http://localhost:${redirectPort}`,
     });
-    const url = j?.AuthorizeUrl ?? j?.authorizeUrl ?? j?.url ?? null;
-    if (!url) {
-      throw new Error(`sso/token returned no authorize URL (keys: ${Object.keys(j ?? {}).join(",") || "none"})`);
-    }
-    return { authorizeUrl: url, codeVerifier, state };
+    const url = `${this.server}/identity/connect/authorize?${q}`;
+    const authorizeUrl = await this.#followToIdentityProvider(url, redirectPort);
+    return { authorizeUrl, codeVerifier, state };
   }
 
+  /**
+   * Walk the redirect chain from /identity/connect/authorize until it leaves this
+   * server. The first off-server Location is the IdP URL the operator must open.
+   *
+   * Redirects back to our own loopback callback are followed too — that only happens
+   * if the server short-circuits, and it would mean the code is already in hand.
+   */
+  async #followToIdentityProvider(startUrl, redirectPort) {
+    let current = startUrl;
+    for (let hop = 0; hop < 6; hop++) {
+      const res = await this.#raw(current, { redirect: "manual" });
+      const loc = res.headers.get("location");
+      // A 2xx here means the server answered without redirecting; use it as-is.
+      if (!loc) {
+        if (res.status >= 400) throw new Error(`GET /identity/connect/authorize -> HTTP ${res.status}: ${await this.#textOf(res)}`);
+        return current;
+      }
+      const next = new URL(loc, current).toString();
+      const callback = `http://localhost:${redirectPort}`;
+      if (next.startsWith(callback)) {
+        // Already back at the callback (a server with no interactive step). Hand it
+        // back so the caller can pick the code off it.
+        return next;
+      }
+      const here = next.startsWith(this.server);
+      if (!here) return next;   // off to the IdP: this is the URL to open
+      current = next;
+    }
+    throw new Error("the authorize redirect did not leave this server within 6 hops; refusing to guess the identity provider URL");
+  }
+
+  /**
+   * Raw fetch with the shared timeout, for the authorize hop where we need to see the
+   * redirect itself rather than the eventual body. Uses this.fetch so an injected
+   * implementation (the tests) still applies.
+   */
+  async #raw(url, { redirect = "manual" } = {}) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), this.timeoutMs);
+    try {
+      return await this.fetch(url, { redirect, signal: ac.signal, headers: { "User-Agent": UA } });
+    } catch (e) {
+      if (e?.name === "AbortError") throw new Error(`timed out after ${this.timeoutMs}ms: ${url}`);
+      throw new Error(`GET ${url} failed: ${e?.message ?? e} (is the server reachable?)`);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async #textOf(res) {
+    try { return (await res.text()).slice(0, 300); } catch { return "<unreadable body>"; }
+  }
+
+  /**
+   * Exchange the authorization code from the browser callback for tokens.
+   */
   /**
    * Exchange the browser's authorization code for a vault session.
    *
