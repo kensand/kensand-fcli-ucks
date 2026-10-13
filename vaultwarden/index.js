@@ -476,18 +476,56 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     if (hit) return { api, cfg, keys: hit.keys, items: decryptVault(hit.payload, hit.keys), fromCache: true };
   }
 
+  // An SSO login left a refreshable token in the store. Use it before demanding an API
+  // key: `sso login` mints one valid for ~30 days, and refusing to read it made an SSO
+  // user configure credentials they did not need.
+  const ssoAccess = credsGet(C_TOKEN);
+  const ssoRefresh = credsGet(C_REFRESH);
+  const master = credsGet(cfg.masterPasswordCred);
+  if ((ssoAccess || ssoRefresh) && master) {
+    api.setAccessToken(ssoAccess, { refreshToken: ssoRefresh });
+    // Prove the token is still good before spending ~1s on PBKDF2, and refresh once if
+    // the access token has aged out — this is the whole point of SSO having a refresh token.
+    let payload = await api.ciphers().catch(async (e) => {
+      if (!/HTTP 401|HTTP 403/.test(String(e?.message))) throw e;
+      if (!(await api.refresh().catch(() => false))) return null;
+      return await api.ciphers().catch(() => null);
+    });
+    if (payload) {
+      // Keys come from prelogin + sync + master password, exactly as the API-key path
+      // does them: prelogin yields only KDF params, and the wrapped user key is
+      // sync.profile.key. SSO authenticates; it does not replace the master password,
+      // which is why this branch requires `master`.
+      try {
+        const pre = await api.prelogin(cfg.email);
+        const sync = await api.sync();
+        const encKey = sync?.profile?.key;
+        if (!encKey) throw new Error("sync returned no profile.key");
+        const keys = deriveKeys({ email: cfg.email, password: master, kdfIterations: pre.kdfIterations, encryptedKey: encKey });
+        await writeKeyCache(cfg, keys, api);
+        const items = decryptVault(payload, keys);
+        return { api, cfg, keys, items: items.length ? items : decryptVault(sync, keys), fromCache: false };
+      } catch (e) {
+        const m = String(e.message ?? e);
+        // Distinguish "your master password is wrong" from "the token was fine but
+        // something else failed": falling through to an unrelated "no API key stored"
+        // is what sent an operator off to create an API key they did not need.
+        throw new Error(
+          (/MAC verification failed/.test(m)
+            ? `the SSO session works but the stored master password does not unlock the vault — do not retry blindly, retype it:`
+            : `the SSO session works but the vault could not be opened: ${m.split("\n")[0]}\n  `) +
+          `  f vaultwarden config --master-password`,
+        );
+      }
+    }
+    // Nothing usable was said, so fall through to the API key below.
+  }
+
   const clientId = credsGet(C_CLIENT_ID);
   const clientSecret = credsGet(C_CLIENT_SECRET);
-  if (!clientId || !clientSecret) {
-    throw new Error(
-      `no API key stored, and a master password alone cannot obtain a token\n` +
-      `  web vault -> Settings -> Security -> Keys -> API key:\n` +
-      `  f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
-      `  f creds set ${C_CLIENT_SECRET} '<client secret>'\n` +
-      `  (the API key exists to skip 2FA; it cannot decrypt anything by itself)`,
-    );
-  }
-  const master = credsGet(cfg.masterPasswordCred);
+  // Master password first, and before the API-key check: without it nothing decrypts,
+  // whether the token comes from SSO or from an API key. Checking the key first made this
+  // message unreachable for the common "no API key yet" case.
   if (!master) {
     throw new Error(
       `no master password stored — the vault cannot be decrypted without one\n` +
@@ -496,7 +534,23 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
       `  with a key derived from the master password, which the API key cannot replace.`,
     );
   }
-
+  if (!clientId || !clientSecret) {
+    const ssoOnly = !!(ssoAccess || ssoRefresh);
+    throw new Error(
+      ssoOnly
+        // The operator HAS an SSO session; "no API key stored" sent them off to configure
+        // credentials they did not need. Say what actually happened: the token is spent.
+        ? `the stored SSO session could not be used (expired or revoked) and there is no API key to fall back on\n` +
+          `  f vaultwarden sso login        (re-authenticate; the master password is already stored)`
+        : `no API key stored, and a master password alone cannot obtain a token\n` +
+          `  web vault -> Settings -> Security -> Keys -> API key:\n` +
+          `  f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
+          `  f creds set ${C_CLIENT_SECRET} '<client secret>'\n` +
+          `  or, if this account uses single sign-on:\n` +
+          `  f vaultwarden sso login\n` +
+          `  (the API key exists to skip 2FA; it cannot decrypt anything by itself)`,
+    );
+  }
   await api.loginApiKey({ clientId, clientSecret });
   const pre = await api.prelogin(cfg.email);
   const sync = await api.sync();

@@ -93,6 +93,8 @@ let CIPHERS_HITS = 0;
 let PUT_BODIES = [];
 let FAIL_CIPHERS_WITH = null; // e.g. 401
 let RATE_LIMIT_NEXT = false;
+const SSO_REFRESH = "ref-sso-1";
+let REFRESH_HITS = 0;
 
 const server = http.createServer((req, res) => {
   let body = "";
@@ -114,6 +116,13 @@ const server = http.createServer((req, res) => {
     }
     if (req.method === "POST" && req.url === "/identity/connect/token") {
       const p = Object.fromEntries(new URLSearchParams(body));
+      // An SSO access token is renewed with grant_type=refresh_token. Storing C_REFRESH is
+      // only meaningful if reads can renew without a browser, so the mock must honour it.
+      if (p.grant_type === "refresh_token") {
+        if (p.refresh_token !== SSO_REFRESH) return send(400, { message: "invalid_grant", validationErrors: { "": ["invalid_grant"] } });
+        REFRESH_HITS++;
+        return send(200, { access_token: "tok-sso-2", refresh_token: SSO_REFRESH, expires_in: 3600, token_type: "Bearer" });
+      }
       // Enforce the rules probed against the live server, so a regression in the
       // request body fails here rather than at first use in the field.
       if (p.grant_type !== "client_credentials") return send(400, { message: "unsupported grant", validationErrors: { "": ["unsupported grant"] } });
@@ -126,7 +135,7 @@ const server = http.createServer((req, res) => {
       TOKEN_SEEN = { clientId: p.client_id, scope: p.scope, deviceType: p.deviceType };
       return send(200, { access_token: "tok-1", refresh_token: "ref-1", expires_in: 3600, token_type: "Bearer" });
     }
-    const bearerOk = auth === "Bearer tok-1";
+    const bearerOk = auth === "Bearer tok-1" || auth === "Bearer tok-sso" || auth === "Bearer tok-sso-2";
     if (req.method === "GET" && req.url === "/api/sync") {
       SYNC_HITS++;
       if (!bearerOk) return send(401, { error: "invalid_token" });
@@ -252,6 +261,7 @@ t("real daemon unlocked in the isolated store", fs.existsSync(LOCK), "no lockfil
 /* ------------------------- test suite (ordered) ------------------------- */
 
 const box = new Map();
+const MIRROR_NAME = (n) => "mirror:" + n;
 const stamps = new Map();
 let unlockedFlag = true;
 const store = {
@@ -303,6 +313,61 @@ await sockOp({ op: "set", name: "vaultwarden.client-id", value: "user.test-id" }
 await sockOp({ op: "set", name: "vaultwarden.client-secret", value: "test-secret" });
 await sockOp({ op: "set", name: "vaultwarden.master-password", value: PASSWORD });
 t("store seeded", true);
+// An SSO session must be usable on its own. This is the regression that produced
+// "no API key stored, and a master password alone cannot obtain a token" immediately after
+// a SUCCESSFUL `sso login`: `sso login` stores a refreshable token, but openVault read only
+// C_KEY_CACHE and then tried the API-key grant — so the SSO session was invisible and an
+// operator who did not need an API key was sent to configure one.
+//
+// These drive the REAL daemon via sockOp, exactly as `f creds set` does. Mutating the
+// in-process `box` has no effect here: the vaultwarden provider is spawned as a child that
+// talks to the daemon, so a test which only edits `box` "passes" while testing nothing.
+{
+  const rm = async (n) => { try { await sockOp({ op: "rm", name: n }); } catch {} };
+  await rm("vaultwarden.key-cache"); await rm("vaultwarden.client-id"); await rm("vaultwarden.client-secret");
+  await sockOp({ op: "set", name: "vaultwarden.access-token", value: "tok-sso" });
+  await sockOp({ op: "set", name: "vaultwarden.refresh-token", value: SSO_REFRESH });
+  // The child writes a mirror into the real store; drop it or the provider short-circuits.
+  await rm(MIRROR_NAME("forgejo.kensand.net"));
+  box.delete(MIRROR_NAME("forgejo.kensand.net")); stamps.delete(MIRROR_NAME("forgejo.kensand.net"));
+  providers.clearMisses();
+  TOKEN_SEEN = null;
+  injectVw();
+  const r = await providers.resolveViaProvider("forgejo.kensand.net", store);
+  t("SSO session alone opens the vault (no api key stored)", r.value === "fj_token_3" && r.provider === "vaultwarden", JSON.stringify(r).slice(0, 200));
+  // Assert the mechanism, not just the value: an api-key login would also produce fj_token_3.
+  t("it did NOT fall back to an api-key login", TOKEN_SEEN === null, JSON.stringify(TOKEN_SEEN));
+
+  // A second read must reuse the derived keys, so PBKDF2 is paid once per session.
+  const syncBefore = SYNC_HITS;
+  await rm(MIRROR_NAME("forgejo.kensand.net"));
+  box.delete(MIRROR_NAME("forgejo.kensand.net")); stamps.delete(MIRROR_NAME("forgejo.kensand.net"));
+  providers.clearMisses();
+  TOKEN_SEEN = null;
+  const r2 = await providers.resolveViaProvider("forgejo.kensand.net", store);
+  t("a second read reuses cached keys and needs no api key", r2.value === "fj_token_3" && TOKEN_SEEN === null && SYNC_HITS === syncBefore,
+    `sync ${syncBefore}->${SYNC_HITS} TOKEN_SEEN=${JSON.stringify(TOKEN_SEEN)}`);
+  await rm("vaultwarden.access-token"); await rm("vaultwarden.refresh-token"); await rm("vaultwarden.key-cache");
+}
+
+// A SPENT SSO session must fall back to the api key rather than erroring: refreshable
+// tokens do expire, and an api-key setup should keep working underneath one.
+{
+  const rm = async (n) => { try { await sockOp({ op: "rm", name: n }); } catch {} };
+  await rm("vaultwarden.key-cache");
+  await sockOp({ op: "set", name: "vaultwarden.client-id", value: "user.test-id" });
+  await sockOp({ op: "set", name: "vaultwarden.client-secret", value: "test-secret" });
+  await sockOp({ op: "set", name: "vaultwarden.access-token", value: "tok-expired" });  // mock rejects this bearer
+  await sockOp({ op: "set", name: "vaultwarden.refresh-token", value: "ref-dead" });    // cannot be refreshed
+  await rm(MIRROR_NAME("forgejo.kensand.net"));
+  box.delete(MIRROR_NAME("forgejo.kensand.net")); stamps.delete(MIRROR_NAME("forgejo.kensand.net"));
+  providers.clearMisses();
+  TOKEN_SEEN = null;
+  injectVw();
+  const r = await providers.resolveViaProvider("forgejo.kensand.net", store);
+  t("expired SSO session falls back to the api-key grant", r.value === "fj_token_3" && TOKEN_SEEN !== null, JSON.stringify(r).slice(0, 180));
+  await rm("vaultwarden.access-token"); await rm("vaultwarden.refresh-token"); await rm("vaultwarden.key-cache");
+}
 
 // 1b. the plaintext guard must be armed by default and honoured per config
 {
