@@ -196,6 +196,25 @@ export function unwrapSymmetricKey(encryptedKey, stretched) {
 /* -------------------------------------------------------------- api client */
 
 /** Minimal JSON/form HTTP layer over fetch, with Vaultwarden's error shape. */
+
+/**
+ * When the server claims a form field was blank, say which fields we actually sent.
+ *
+ * `device_identifier cannot be blank` can mean "the client never sent it" or "the server
+ * received it under a name it would not bind" — and those need opposite fixes. Without
+ * this the operator and I can only guess, which is how a single SSO session lost several
+ * rounds of wrong theories. This echoes the real request keys, so the next run is
+ * evidence rather than speculation. Only fires on the exact "cannot be blank" shape.
+ */
+function fieldEcho(method, path, form, detail) {
+  if (!form || !/cannot be blank/i.test(String(detail || ""))) return "";
+  const keys = Object.keys(form).filter((k) => form[k] !== undefined && form[k] !== null && form[k] !== "");
+  return `\n  fields actually sent in this request: ${keys.join(", ") || "(none)"}`
+    + `\n  if the field named above appears there, the server received it under a name it`
+    + ` would not bind (Vaultwarden\'s FromForm uncased matching is CASE-insensitive only:`
+    + ` underscores are not folded, so deviceIdentifier does NOT match device_identifier).`;
+}
+
 export class VaultwardenApi {
   constructor({ server, timeoutMs = 20000, fetchFn = null, allowInsecureHttp = false } = {}) {
     if (!server) throw new Error("no vaultwarden server configured (f vaultwarden config --server https://…)");
@@ -270,7 +289,7 @@ export class VaultwardenApi {
           : res.status === 401 && auth ? " — the access token expired or was revoked; run: f vaultwarden forget"
           : res.status >= 500 ? " — the server failed (this is not a problem with your credentials)"
           : "";
-      const err = new Error(`${method} ${path} -> HTTP ${res.status}${detail ? `: ${detail}` : ""}${hint}`);
+      const err = new Error(`${method} ${path} -> HTTP ${res.status}${detail ? `: ${detail}` : ""}${hint}${fieldEcho(method, path, form, detail)}`);
       err.status = res.status;
       err.body = detail;
       throw err;

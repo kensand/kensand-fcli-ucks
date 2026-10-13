@@ -231,9 +231,10 @@ async function ssoManualPrompt(authorizeUrl, port) {
     + "  terminal, forward the port and open it on your own machine — cookie and redirect\n"
     + "  then share a browser, and the default (non-manual) flow works:\n"
     + `     ssh -L ${port}:localhost:${port} <host>\n`
-    + "  If a browser on THIS machine reports `SSO session binding mismatch`, check the web\n"
-    + "  vault's SSO first: if that also fails, it is the Vaultwarden 1.36.0 cookie-path bug\n"
-    + "  (fix in >=1.37.0). If the web vault works, it is this redirect path, not your server.\n"
+    + "  Keep the browser and this terminal on the SAME machine: the authorize URL and\n"
+    + "  the redirect must share one cookie jar. If it fails, the server log\n"
+    + "  (docker logs <vault> around /identity/connect/oidc-signin) is the ground truth —\n"
+    + "  do not guess from the browser.\n"
     + "\n"
     + "Paste the redirect URL (or just the code), then press Enter:\n\n> ",
   );
@@ -283,20 +284,24 @@ export function extractSsoServerError(input) {
   // VW_SSO_BINDING cookie is absent or does not hash to the stored value. Two distinct
   // causes reach it, and they need different fixes, so both are offered.
   return [
-    "the identity provider rejected the callback: SSO session binding mismatch",
-    "  The flow is bound to a cookie set in the browser that opened the authorize URL.",
-    "  This is THIS CLI's flow: the state decodes to 22 chars, which is what this client",
-    "  generates (the web vault's state is much longer and ends in '_identifier='). A",
-    "  working web vault therefore says nothing about this failure -- separate sessions,",
-    "  separate binding cookies. The server checked VW_SSO_BINDING on its own oidc-signin",
-    "  route and did not find it, so --manual/--port/ssh -L cannot help: they act on the",
-    "  hop after this check. DevTools -> Network -> the failing oidc-signin -> Request",
-    "  Headers -> Cookie: tells you whether the browser sent VW_SSO_BINDING at all.",
-    "  Cause B — Vaultwarden 1.36.0 has a broken cookie path (#7163) and rejects every",
-    "            SSO login, the web vault included. Run `vaultwarden -V`: 1.35.x has no",
-    "            such check, >=1.37.0 is fixed (#7187). If the WEB VAULT SUCCEEDS while",
-    "            this fails, it is not Cause B -- web and client_id=cli take different",
-    "            redirect paths, so treat it as a cookie/origin question or a bug here.",
+    "the vault rejected the callback: SSO session binding mismatch",
+    "  Vaultwarden sets VW_SSO_BINDING on the /identity/connect/authorize response and",
+    "  requires the same token back at /identity/connect/oidc-signin. It only matches if",
+    "  the BROWSER that opened the authorize URL is the one that completes it — a cookie",
+    "  follows the browser, not the program. This CLI used to fetch that hop itself, which",
+    "  put the cookie in the wrong process; that is fixed, so if you still see this, the",
+    "  most likely cause is that the URL was opened somewhere other than where the redirect",
+    "  lands (a different browser, a remote machine, or a tab where it was pasted rather",
+    "  than followed — Sec-Fetch-Site: none in DevTools proves the paste case). From a",
+    "  remote terminal, forward the port and open the URL on your OWN machine so the cookie",
+    "  and the redirect share one browser: ssh -L 8065:localhost:8065 <host>, then run",
+    "  without --manual. Decode the state in the error if you need to know whose flow it",
+    "  is: 22 base64url chars is this CLI; the web vault's is longer and ends in",
+    "  '_identifier=' — they are separate sessions with separate binding cookies.",
+    "  Ground truth is the server log, not the browser: ask for the lines around the",
+    "  failing oidc-signin, and compare the request SEQUENCE of a WORKING web-vault login",
+    "  (it shows prevalidate then '=> 307') against the failing one. That diff settles what",
+    "  no browser header can.",
   ].join("\n");
 }
 

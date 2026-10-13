@@ -547,10 +547,12 @@ await t("a pasted 'binding mismatch' body is explained, not called a missing cod
   const body = String.raw`{"message":"SSO session binding mismatch for HLRQ7RfKM0r6okaCr2fUpA","validationErrors":{"":["x"]},"object":"error"}`;
   const out = detect(body);
   assert.match(out, /binding mismatch/i);
-  // Name the broken release, but also name the discriminator: if the web vault works,
-  // it is NOT that release bug. Asserting the server bug alone sent an operator off to
-  // upgrade a healthy server.
-  assert.match(out, /1\.36/);
+  // Must NOT push a version theory. This text used to name "1.36.0 cookie-path bug" and
+  // tell the operator to run `vaultwarden -V` — a flag that does not exist — sending them
+  // to upgrade a healthy server. The one true instruction is: read the server log and diff
+  // a working run's request sequence against the failing one.
+  assert.doesNotMatch(out, /1\.36|vaultwarden -V|cookie-path bug/, "no fabricated version/flag advice");
+  assert.match(out, /docker logs|server log/i, "points at the server log as ground truth");
   // The 22-char state is what identifies *this* client's flow. Asserting it stays in the
   // message is the guard against me re-asserting a server-side cause from the error text
   // alone -- which is exactly the mistake this replaced.
