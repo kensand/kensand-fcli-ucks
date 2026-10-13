@@ -1104,7 +1104,7 @@ async function main(argv) {
         // decides it. Default keeps the listener; --manual never binds a port.
         const manual = has("manual");
         const port = Number(has("port") ? flagVal("port") : 8065);
-        const { authorizeUrl, codeVerifier } = await api.ssoAuthorizeUrl({ redirectPort: port });
+        const { authorizeUrl, codeVerifier } = api.ssoAuthorizeUrl({ redirectPort: port });
 
         process.stderr.write("\nOpen this URL to sign in with your identity provider:\n\n");
         process.stderr.write(`  ${authorizeUrl}\n\n`);

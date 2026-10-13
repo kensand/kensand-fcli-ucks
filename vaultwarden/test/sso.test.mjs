@@ -105,7 +105,17 @@ const defaultToken = () => ({
   UserDecryptionOptions: { HasMasterPassword: true, MasterPasswordUnlock: { MasterKeyEncryptedUserKey: "2.Iv|ct|mac", Salt: "user@example.com" }, Object: "userDecryptionOptions" },
 });
 
-const api = () => new C.VaultwardenApi({ server: BASE, email: "user@example.com", timeoutMs: 8000, allowInsecureHttp: true });
+// Seam for tests only. A real IdP learns the PKCE challenge when the human's browser
+// arrives at the authorize URL. The CLI must NOT fetch that URL itself (that is the
+// binding-cookie bug: VW_SSO_BINDING's Set-Cookie would be consumed here instead of
+// reaching the browser), so the mock is TOLD the challenge instead of observing a request.
+// It is a parameter of ssoAuthorizeUrl, not a constructor option.
+const api = () => {
+  const a = new C.VaultwardenApi({ server: BASE, clientId: "cli", timeoutMs: 8000, allowInsecureHttp: true });
+  const build = a.ssoAuthorizeUrl.bind(a);
+  a.ssoAuthorizeUrl = (o = {}) => build({ ...o, _onAuthorizeUrl: (u) => { mock.expectedChallenge = new URL(u).searchParams.get("code_challenge"); } });
+  return a;
+};
 
 // A second, genuinely separate origin stands in for the identity provider. Its job is
 // only to prove the client stops at the IdP instead of trying to complete the flow
@@ -211,26 +221,50 @@ await t("ssoEnabled() says 'unreachable', not 'disabled', when the server cannot
   assert.ok(st.error, "must carry the reason");
 });
 
-await t("authorize request uses client_id=cli + a port the server accepts", async () => {
+await t("the printed URL is Vaultwarden's /identity/connect/authorize, NOT the IdP's", async () => {
+  // The bug that cost the most time here. Vaultwarden sets the browser-binding cookie
+  // VW_SSO_BINDING on the /identity/connect/authorize response and requires it back at
+  // oidcsignin. Cookies follow the browser, not the program: resolving that redirect with
+  // fetch and printing the IdP URL sent the operator to the IdP with no cookie ever set,
+  // so every attempt failed 'SSO session binding mismatch' WITH A VALID CODE, because the
+  // IdP half genuinely worked. The web vault succeeds precisely because the browser itself
+  // performs this navigation.
   mock = {};
-  const r = await api().ssoAuthorizeUrl({ redirectPort: 8065 });
-  assert.equal(seen.authorize.client_id, "cli", "server rejects every other client for a CLI");
-  assert.equal(seen.authorize.redirect_uri, "http://localhost:8065");
-  assert.ok(r.authorizeUrl, "must hand back a URL to open");
-  assert.ok(/[A-Za-z0-9_-]{40,}/.test(r.codeVerifier), "PKCE verifier must be high-entropy");
+  const r = api().ssoAuthorizeUrl({ redirectPort: 8065 });
+  const u = new URL(r.authorizeUrl);
+  assert.equal(u.pathname, "/identity/connect/authorize", `got: ${r.authorizeUrl}`);
+  assert.equal(u.host, new URL(BASE).host, "must point at the vault, not the identity provider");
+  assert.ok(!r.authorizeUrl.includes(new URL(IDP).host), "the IdP host must never appear in the URL we print");
+  assert.equal(seen.authorize, null, "constructing the URL must not hit the authorize endpoint");
 });
 
-await t("authorize sends an S256 challenge that hashes from the verifier", async () => {
-  mock = {};
-  const r = await api().ssoAuthorizeUrl({ redirectPort: 8066 });
-  const expect = crypto.createHash("sha256").update(r.codeVerifier).digest("base64url");
-  assert.equal(seen.authorize.code_challenge, expect, "plain challenge would leak the verifier");
-  assert.equal(seen.authorize.code_challenge_method, "S256", "the server hard-requires the literal S256");
+await t("building the authorize URL makes NO request at all", async () => {
+  // No request means no Set-Cookie consumed by the wrong agent, and no server-side SsoAuth
+  // row minted ahead of the browser. Both are required for the cookie the browser eventually
+  // carries to match the row the callback looks up.
+  const hits = [];
+  const spy = new C.VaultwardenApi({ server: BASE, timeoutMs: 4000, allowInsecureHttp: true });
+  spy.fetch = async (u) => { hits.push(String(u)); throw new Error("must not fetch while constructing the authorize URL"); };
+  const r = spy.ssoAuthorizeUrl({ redirectPort: 8065 });
+  assert.equal(hits.length, 0, `expected zero requests, made ${hits.length}`);
+  assert.ok(r.authorizeUrl.includes("code_challenge="));
 });
 
-await t("a redirect port outside 8065-8070 is refused before any request", async () => {
+await t("the authorize URL carries the PKCE challenge, state and callback port", async () => {
   mock = {};
-  await assert.rejects(api().ssoAuthorizeUrl({ redirectPort: 9000 }), /8065-8070/);
+  const r = api().ssoAuthorizeUrl({ redirectPort: 8066 });
+  const q = new URL(r.authorizeUrl).searchParams;
+  assert.equal(q.get("client_id"), "cli", "the server rejects every other client for a localhost callback");
+  assert.equal(q.get("redirect_uri"), "http://localhost:8066");
+  assert.equal(q.get("code_challenge_method"), "S256", "the server requires this literal string");
+  assert.equal(q.get("code_challenge"), crypto.createHash("sha256").update(r.codeVerifier).digest("base64url"), "a plain challenge would leak the verifier");
+  assert.equal(q.get("state"), r.state, "state must come back too: it is how the callback is matched");
+});
+
+await t("a redirect port outside 8065-8070 is refused before a browser is opened", async () => {
+  mock = {};
+  assert.throws(() => api().ssoAuthorizeUrl({ redirectPort: 9000 }), /8065-8070/);
+  assert.throws(() => api().ssoAuthorizeUrl({ redirectPort: "8065" }), /8065-8070/, "a string port would slip past a numeric compare");
 });
 
 await t("token exchange sends every field the server marks required", async () => {
@@ -433,7 +467,11 @@ await t("full flow: authorize, capture the redirect, exchange, derive nothing wi
   const a = api();
   const { authorizeUrl, codeVerifier } = await a.ssoAuthorizeUrl({ redirectPort: 8067 });
   assert.match(authorizeUrl, /^http:/, "must give a URL a browser can open");
-  assert.notEqual(new URL(authorizeUrl).host, new URL(BASE).host, "must hand back the IdP URL, not a URL on the vault server");
+  // The OPPOSITE of what this test originally asserted, deliberately: handing back the
+  // IdP URL *was* the bug. The browser must start at the vault so it receives
+  // VW_SSO_BINDING; resolving the redirect ourselves put that cookie in this process.
+  assert.equal(new URL(authorizeUrl).pathname, "/identity/connect/authorize", "must stay on the vault");
+  assert.ok(!authorizeUrl.includes(new URL(IDP).host), "must NOT be the identity provider's URL");
   // Stopping is the point: completing the flow needs a human. Fetching the IdP login
   // page would mean we think we can drive it ourselves, which we cannot.
   assert.equal(idpHits.length, 0, `the client must not fetch the IdP itself (got ${idpHits.length} request(s))`);

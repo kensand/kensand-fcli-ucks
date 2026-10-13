@@ -437,9 +437,28 @@ export class VaultwardenApi {
    *
    * @param opts.redirectPort one of 8065-8070; sso.rs accepts nothing else for cli.
    */
-  async ssoAuthorizeUrl({ redirectPort = 8065 } = {}) {
-    if (redirectPort < 8065 || redirectPort > 8070) {
-      throw new Error(`redirectPort must be 8065-8070 for client_id=cli (got ${redirectPort})`);
+  /**
+   * Build the SSO authorize URL to hand to a browser.
+   *
+   * It must be the VAULTWARDEN url — `/identity/connect/authorize?...` — and NOT the
+   * IdP url that endpoint redirects to. Vaultwarden sets the browser-binding cookie
+   * `VW_SSO_BINDING` on that first response, and `oidcsignin` requires it back (it
+   * stores only the SHA-256 of the token). A cookie follows the browser, not the
+   * program: if this method resolved the redirect with fetch and returned the IdP url,
+   * the Set-Cookie would land in this process's nothing, the browser would complete the
+   * IdP round trip carrying no binding cookie, and every attempt would fail
+   * `SSO session binding mismatch` — with a valid code, because the IdP half works.
+   * That is exactly what happened, and it is why the web vault succeeded: the web vault
+   * navigates to `/identity/connect/authorize` *in the browser*.
+   *
+   * So: no request is made here at all. The browser does the whole chain.
+   *
+   * @param opts.redirectPort one of 8065-8070; sso.rs `authorize_url` accepts nothing
+   *                          else for client_id=cli.
+   */
+  ssoAuthorizeUrl({ redirectPort = 8065, _onAuthorizeUrl = null } = {}) {
+    if (!Number.isInteger(redirectPort) || redirectPort < 8065 || redirectPort > 8070) {
+      throw new Error(`redirectPort must be an integer 8065-8070 for client_id=cli (got ${redirectPort})`);
     }
     const codeVerifier = crypto.randomBytes(32).toString("base64url");
     const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
@@ -449,69 +468,20 @@ export class VaultwardenApi {
       response_type: "code",
       state,
       code_challenge: codeChallenge,
-      code_challenge_method: "S256", // the server hard-requires exactly this string
+      code_challenge_method: "S256", // the server requires this literal string
       redirect_uri: `http://localhost:${redirectPort}`,
     });
-    const url = `${this.server}/identity/connect/authorize?${q}`;
-    const authorizeUrl = await this.#followToIdentityProvider(url, redirectPort);
-    return { authorizeUrl, codeVerifier, state };
+    const authorizeUrl = `${this.server}/identity/connect/authorize?${q}`;
+    // Seam for the tests only: a real IdP learns the challenge when the human's browser
+    // arrives at this URL; our mock cannot observe the browser, so it is told here.
+    if (_onAuthorizeUrl) _onAuthorizeUrl(authorizeUrl);
+    return { authorizeUrl, codeVerifier, state, redirectPort };
   }
 
   /**
-   * Walk the redirect chain from /identity/connect/authorize until it leaves this
-   * server. The first off-server Location is the IdP URL the operator must open.
-   *
-   * Redirects back to our own loopback callback are followed too — that only happens
-   * if the server short-circuits, and it would mean the code is already in hand.
-   */
-  async #followToIdentityProvider(startUrl, redirectPort) {
-    let current = startUrl;
-    for (let hop = 0; hop < 6; hop++) {
-      const res = await this.#raw(current, { redirect: "manual" });
-      const loc = res.headers.get("location");
-      // A 2xx here means the server answered without redirecting; use it as-is.
-      if (!loc) {
-        if (res.status >= 400) throw new Error(`GET /identity/connect/authorize -> HTTP ${res.status}: ${await this.#textOf(res)}`);
-        return current;
-      }
-      const next = new URL(loc, current).toString();
-      const callback = `http://localhost:${redirectPort}`;
-      if (next.startsWith(callback)) {
-        // Already back at the callback (a server with no interactive step). Hand it
-        // back so the caller can pick the code off it.
-        return next;
-      }
-      const here = next.startsWith(this.server);
-      if (!here) return next;   // off to the IdP: this is the URL to open
-      current = next;
-    }
-    throw new Error("the authorize redirect did not leave this server within 6 hops; refusing to guess the identity provider URL");
-  }
-
-  /**
-   * Raw fetch with the shared timeout, for the authorize hop where we need to see the
-   * redirect itself rather than the eventual body. Uses this.fetch so an injected
-   * implementation (the tests) still applies.
-   */
-  async #raw(url, { redirect = "manual" } = {}) {
-    const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(), this.timeoutMs);
-    try {
-      return await this.fetch(url, { redirect, signal: ac.signal, headers: { "User-Agent": UA } });
-    } catch (e) {
-      if (e?.name === "AbortError") throw new Error(`timed out after ${this.timeoutMs}ms: ${url}`);
-      throw new Error(`GET ${url} failed: ${e?.message ?? e} (is the server reachable?)`);
-    } finally {
-      clearTimeout(t);
-    }
-  }
-
-  async #textOf(res) {
-    try { return (await res.text()).slice(0, 300); } catch { return "<unreadable body>"; }
-  }
-
-  /**
-   * Exchange the authorization code from the browser callback for tokens.
+   * Does the server support SSO, without the operator having to try a browser? This is
+   * a separate, harmless probe; it is *not* part of the authorize chain and must not be
+   * used to prefetch or replace it.
    */
   /**
    * Exchange the browser's authorization code for a vault session.

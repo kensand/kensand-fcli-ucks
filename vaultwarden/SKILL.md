@@ -120,37 +120,49 @@ That check has produced a lot of confusion, and the honest statement is narrower
   `docker inspect`, is the only reliable read.
 - Do not "fix" this by editing `SSO_*` settings; neither cause is configured there.
 
-### When the web vault's SSO works and the CLI's does not
+### Why the CLI used to always fail with `SSO session binding mismatch` (fixed; do not reintroduce)
 
-Established by reading request headers, not by theorising. Two facts decide it:
+**This was a client bug, not a server, browser, portal, or version problem.** The log line
+that proves it:
 
-1. **`Sec-Fetch-Site: none` on the failing request means the browser did not navigate
-   there — the URL was opened directly.** A page the operator pasted or bookmarked, with a
-   fresh tab and an empty cookie jar, cannot present a cookie that was set in a different
-   tab several navigations earlier. Any conclusion drawn from such a request is invalid,
-   including "SSO is broken". Reproduce by starting from the sign-in page and following
-   every redirect inside one tab.
-2. **`Cookie: ssoHandOffMessage=You may now close this tab and continue in the extension`
-   is not Vaultwarden's.** Vaultwarden's binding cookie is `VW_SSO_BINDING` and its own
-   hand-off page has different wording; `ssoHandOffMessage` is set by the Bitwarden
-   client's `clientId === 'browser'` SSO connector. If you front the vault with a portal
-   (Authentik, Cloudflare Access, oauth2-proxy), that portal may be terminating the browser
-   SSO entirely, and "the web vault works with SSO" may mean *the portal logged in*, never
-   the vault. **Check which system actually authenticated you before reasoning about
-   `VW_SSO_BINDING` at all** — if it was the portal, you have no working vault SSO to
-   compare against, and the CLI's failure is unexplained rather than contradicted.
-
-A live example of how badly this can go: with Authentik in front, portal-SSO succeeding and
-CLI-SSO failing at `VW_SSO_BINDING` looks like a client bug, but it can equally mean
-Vaultwarden's own `[sso]` provider settings are wrong or unreachable (the server must fetch
-the OIDC discovery document), and the two failures are then unrelated. Nothing in a browser
-header can tell those apart; Vaultwarden's log can, and it is the only place to look.
-
-Useful, since it is unauthenticated and cheap:
-```sh
-curl -s <server>/identity/sso/prevalidate     # 200 + {"token": …} = SSO_ENABLED=true
 ```
-`/version` and `/config` are newer additions; their absence is itself a version signal.
+[ERROR] SSO session binding mismatch for <state>
+(oidcsignin) GET /identity/connect/oidc-signin?<code>&<state> => 400 Bad Request
+```
+
+Route rank 1 (`<code>&<state>`) fires only when a `code` **is present**. So the IdP round
+trip *succeeded* — Authentik authenticated, issued a code, redirected correctly. What
+failed is the very next check, `VW_SSO_BINDING`. It was never broken; it was never *set*.
+
+Mechanism: `VaultwardenApi.ssoAuthorizeUrl()` used to follow `/identity/connect/authorize`
+server-side with `fetch` and print the **identity provider's** URL. Vaultwarden sets
+`VW_SSO_BINDING` on the `/identity/connect/authorize` response and stores only its SHA-256,
+then requires the same token back at `oidcsignin`. **A cookie follows the browser, not the
+program.** `fetch` consumed that `Set-Cookie` into a process that would never send it, the
+human opened the IdP URL with no cookie in the jar, and the callback arrived cookie-less —
+every time, on the first attempt, in both Firefox and Chrome.
+
+The web vault works because it navigates to `/identity/connect/authorize` **in the browser**.
+
+Fix: `ssoAuthorizeUrl()` is synchronous, makes **zero requests**, and returns the vault's
+own `/identity/connect/authorize?...` URL so the browser performs the whole chain. Never
+resolve that hop again.
+
+**The diagnostic that would have found this in one step:** the working run's log contains a
+`prevalidate?domainHint=` line and then `=> 307`; every failing run had **no prevalidate
+near it** and `=> 400`. Comparing the *request sequence* of a working run against a failing
+one beats any theory about browsers, portals, or versions. Ask for the log of a run that
+works, early.
+
+Also true, learned the hard way, and worth keeping:
+- `Sec-Fetch-Site: none` on a captured `oidc-signin` means the URL was **opened directly**,
+  so that tab had no cookie and the capture proves nothing. Pasting the callback (which
+  `--manual` encourages) manufactures this.
+- `Cookie: ssoHandOffMessage=…continue in the extension` is the Bitwarden **browser
+  connector**, not Vaultwarden. It is not the binding cookie and proves nothing about SSO.
+- `vaultwarden -V` does not exist. `/version` and `/config` 404 on older builds (that 404 is
+  itself a version signal); `<server>/identity/sso/prevalidate` returning 200 + `{"token"}`
+  is what proves `SSO_ENABLED=true`.
 
 The device that opens the URL must be the one whose cookie jar receives the redirect — so open the URL **on the same machine** that runs the command,
 and use `--manual` only when that machine has a browser you can see but the terminal cannot
