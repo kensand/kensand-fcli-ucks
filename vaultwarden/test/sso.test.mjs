@@ -476,6 +476,29 @@ await t("after one browser login, later reads renew with no browser at all", asy
   assert.ok(seen.token.client_id, "the refresh grant still has to identify the client");
 });
 
+await t("extractSsoCode survives what a paste actually looks like", async () => {
+  // The input is whatever the operator copied off a browser, so the shapes are not
+  // hypothetical: the redirect URL has extra params, terminals add quotes, selections
+  // pick up trailing commas, and an IdP error page must never be read as a code.
+  const mod = await import(pathToFileURL(path.join(here, "..", "index.js")).href + `?extract=${Date.now()}`);
+  const extract = mod.extractSsoCode ?? globalThis.__extractSsoCode;
+  assert.equal(typeof extract, "function", "extractSsoCode must be exported for testing");
+  const cases = [
+    ["http://localhost:8065/?code=AbC123xyz&state=qq&scope=sso&iss=https%3A%2F%2Fvault.x", "AbC123xyz"],
+    ["AbC123xyz", "AbC123xyz"],
+    ["  http://localhost:8065/?code=AbC123xyz  ", "AbC123xyz"],
+    ['"http://localhost:8065/?code=AbC123xyz"', "AbC123xyz"],
+    ["http://localhost:8065/?state=qq&code=AbC123xyz", "AbC123xyz"],
+    ["AbC123xyz,", "AbC123xyz"],
+    ["", null],
+    ["not a code at all!!", null],
+    ["http://localhost:8065/?error=access_denied", null],
+  ];
+  for (const [inp, want] of cases) {
+    assert.equal(extract(inp), want, `paste ${JSON.stringify(inp)} should yield ${JSON.stringify(want)}`);
+  }
+});
+
 await t("a named port that is taken fails loudly instead of binding another", async () => {
   // Silently moving to a free port would produce a hang the operator cannot diagnose,
   // because the IdP was told to redirect to the first one.

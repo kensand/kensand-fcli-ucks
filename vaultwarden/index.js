@@ -200,6 +200,81 @@ function credsRm(name) {
  * would leave the operator staring at a listener that no browser will ever reach.
  * The URL is always printed regardless, so the flow is never blocked by this.
  */
+/**
+ * Read the redirect URL (or a bare code) from the terminal, for the case where the
+ * browser is on another device.
+ *
+ * Why this exists at all: the default flow listens on 127.0.0.1, so the redirect only
+ * arrives if the browser's localhost *is* this machine. On SSH, in a container, or in
+ * any terminal whose host has no browser, the operator opens the URL on a phone or
+ * laptop and the redirect lands there instead. `--manual` prints the URL, waits for a
+ * paste, and never binds a port.
+ *
+ * The pasted thing is whatever the browser shows after the redirect, which varies: a
+ * URL with a query string, a bare code, or a page the operator paraphrased. So accept a
+ * full URL, extract `code`, and otherwise treat the input as the code itself.
+ *
+ * The read is line-based and tolerant of a missing trailing newline, which is what a
+ * terminal paste actually looks like when the operator hits Enter once.
+ */
+async function ssoManualPrompt(authorizeUrl, port) {
+  const { createInterface } = await import("node:readline");
+  process.stderr.write(
+    "  1. open it in a browser ON THIS MACHINE\n"
+    + "  2. sign in there\n"
+    + "  3. the browser lands on a dead localhost URL — that is expected. Copy the\n"
+    + `     whole address bar (it starts with http://localhost:${port}/?code=…) and\n`
+    + "     paste it below\n"
+    + "\n"
+    + "  Opening it on a DIFFERENT device cannot work: the server binds the flow to a\n"
+    + "  cookie set in the browser that opened the URL (VW_SSO_BINDING) and rejects the\n"
+    + "  callback without it. From a remote terminal, forward the port and open the URL\n"
+    + "  on your own machine — the cookie and the redirect then share a browser, and the\n"
+    + "  default (non-manual) flow works:\n"
+    + `     ssh -L ${port}:localhost:${port} <host>\n`
+    + "\n"
+    + "Paste the redirect URL (or just the code), then press Enter:\n\n> ",
+  );
+
+  const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+  let line;
+  try {
+    line = await new Promise((resolve, reject) => {
+      rl.question("", resolve);
+      rl.once("SIGINT", () => reject(new Error("cancelled — nothing was exchanged")));
+    });
+  } finally {
+    rl.close();
+  }
+
+  const raw = String(line ?? "").trim();
+  if (!raw) throw new Error("nothing pasted — nothing was exchanged");
+  const code = extractSsoCode(raw);
+  if (!code) {
+    throw new Error("could not find an authorization code in what you pasted\n  paste the full address-bar URL (http://localhost:…/?code=…) or the code value alone");
+  }
+  return code;
+}
+
+/**
+ * Pull the code out of whatever the operator pasted. Deliberately forgiving about
+ * shape and strict about content: a copied URL may carry the code first or last, may be
+ * wrapped in quotes or angle brackets by a terminal, and may have the state appended.
+ */
+export function extractSsoCode(input) {
+  let t = input.trim().replace(/^["'<`]+|["'`>]+$/g, "");
+  // A full URL: take the query parameter, which is unambiguous when present.
+  if (/[?&]code=/i.test(t)) {
+    for (const part of t.split(/[?&]/)) {
+      const [k, v] = [part.slice(0, part.indexOf("=")), part.slice(part.indexOf("=") + 1)];
+      if (/^code$/i.test(k) && v) return decodeURIComponent(v);
+    }
+  }
+  // Bare code, possibly with stray whitespace or a trailing comma from a selection.
+  const bare = t.replace(/[,;\s]+$/, "");
+  return /^[A-Za-z0-9._~+/=-]{8,}$/.test(bare) ? bare : null;
+}
+
 function tryOpenBrowser(url) {
   const cands = process.platform === "darwin"
     ? [["open", [url]]]
@@ -689,6 +764,11 @@ const USAGE =
   "  sso login [--port <8065-8070>]    sign in through the identity provider in a\n" +
   "      [--timeout <sec>] [--force]   browser, then exchange the PKCE code.\n" +
   "                                    --force skips the 'is SSO enabled' probe\n" +
+  "  sso login --manual                same, but binds no port: open the URL on any\n" +
+  "                                    device, then paste the redirect URL (or just\n" +
+  "                                    the code) back here. Use over ssh, in a\n" +
+  "                                    container, or wherever the browser's localhost\n" +
+  "                                    is not this machine.\n" +
   "\n" +
   "name forms: 'github.com'  'Item Name'  'Item Name::username'  '<cred>::totp'\n" +
   "fields:     password (default) | username | totp | note | uri | field:<name>\n" +
@@ -980,22 +1060,30 @@ async function main(argv) {
           }
         }
 
+        // Two ways to get the code back, and which one applies depends on where the
+        // browser is relative to this process -- see ssoManual below for the case that
+        // decides it. Default keeps the listener; --manual never binds a port.
+        const manual = has("manual");
         const port = Number(has("port") ? flagVal("port") : 8065);
         const { authorizeUrl, codeVerifier } = await api.ssoAuthorizeUrl({ redirectPort: port });
 
         process.stderr.write("\nOpen this URL to sign in with your identity provider:\n\n");
         process.stderr.write(`  ${authorizeUrl}\n\n`);
-        process.stderr.write(`Waiting for the redirect on http://localhost:${port} …\n`);
-        // Only useful when a browser can reach this host. Stated, not assumed: on a
-        // headless box the URL must be pasted elsewhere and the callback still lands
-        // here only if localhost means this machine.
-        tryOpenBrowser(authorizeUrl);
 
-        const code = await captureSsoCode({
-          expectedState: null,
-          timeoutMs: has("timeout") ? Number(flagVal("timeout")) * 1000 : 180_000,
-          log: (bound) => process.stderr.write(`  listening on ${bound}\n`),
-        });
+        let code;
+        if (manual) {
+          code = await ssoManualPrompt(authorizeUrl, port);
+        } else {
+          process.stderr.write(`Waiting for the redirect on http://localhost:${port} …\n`);
+          process.stderr.write("  (on a machine with no browser, or one whose localhost is not this machine, re-run with --manual)\n");
+          // Only useful when a browser can reach this host. Stated, not assumed.
+          tryOpenBrowser(authorizeUrl);
+          code = await captureSsoCode({
+            expectedState: null,
+            timeoutMs: has("timeout") ? Number(flagVal("timeout")) * 1000 : 180_000,
+            log: (bound) => process.stderr.write(`  listening on ${bound}\n`),
+          });
+        }
 
         const tok = await api.loginSso({ code, codeVerifier });
         const hasMaster = ssoRequiresMasterPassword(tok);
