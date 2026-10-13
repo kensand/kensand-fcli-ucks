@@ -324,9 +324,9 @@ export class VaultwardenApi {
       form: {
         grant_type: "client_credentials", scope: API_SCOPE,
         client_id: clientId, client_secret: clientSecret,
-        deviceType: String(DEVICE_TYPE_CLI), device_type: String(DEVICE_TYPE_CLI),
-        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
-        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
+        device_type: String(DEVICE_TYPE_CLI),
+        device_identifier: DEVICE_IDENTIFIER,
+        device_name: DEVICE_NAME,
       },
     });
     if (!j?.access_token) throw new Error("token response had no access_token");
@@ -353,9 +353,9 @@ export class VaultwardenApi {
       form: {
         grant_type: "password", username: email, password: passwordHash.toString("base64"),
         scope: API_SCOPE, client_id: "device",
-        deviceType: String(DEVICE_TYPE_CLI), device_type: String(DEVICE_TYPE_CLI),
-        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
-        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
+        device_type: String(DEVICE_TYPE_CLI),
+        device_identifier: DEVICE_IDENTIFIER,
+        device_name: DEVICE_NAME,
       },
     });
     if (!j?.access_token) {
@@ -525,9 +525,7 @@ export class VaultwardenApi {
         code,
         code_verifier: codeVerifier,
         scope: SSO_SCOPE,
-        deviceType: String(DEVICE_TYPE_CLI), device_type: String(DEVICE_TYPE_CLI),
-        deviceIdentifier: DEVICE_IDENTIFIER,
-        deviceName: DEVICE_NAME,
+        device_type: String(DEVICE_TYPE_CLI),
         device_identifier: DEVICE_IDENTIFIER,
         device_name: DEVICE_NAME,
       },
