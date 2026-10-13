@@ -320,7 +320,7 @@ await t("callback refuses a state mismatch and never returns the code", async ()
   let port = null;
   // Pinned so overlapping deferred closes from neighbouring tests cannot hand this
   // test a listener belonging to someone else.
-  const EPIN = 8065;
+  const EPIN = 8069;   // dedicated; 8065 is shared with two earlier tests
   // Capture the settlement as a value rather than awaiting the promise: the rejection
   // is created inside an HTTP handler, and anything that observes it later (even
   // `assert.rejects`) leaves it unobserved at Node's next microtask checkpoint, which

@@ -120,35 +120,37 @@ That check has produced a lot of confusion, and the honest statement is narrower
   `docker inspect`, is the only reliable read.
 - Do not "fix" this by editing `SSO_*` settings; neither cause is configured there.
 
-How to tell whose flow failed — **read the `state`, not the error text.** The state is
-client-chosen, and the two clients pick it differently:
+### When the web vault's SSO works and the CLI's does not
 
-* **this uck**: `crypto.randomBytes(16).toString("base64url")` → a **22-character** string
-  (`fMibIbZS6TGJSJMjScXhdQ`). The server echoes it base64-encoded, so the URL carries a
-  ~32-char `state=` that decodes back to 22 chars.
-* **the web vault**: much longer, and its server-side state ends in `_identifier=<uuid>`.
+Established by reading request headers, not by theorising. Two facts decide it:
 
-`SSO session binding mismatch` naming a 22-char state means **the CLI's flow failed**, and
-says nothing about the web vault. Do not read it as "SSO is broken server-wide", and do not
-let a working web vault convince you the CLI did something right — they are separate
-`SsoAuth` rows with separate binding cookies. Check the state first; it has already told you
-which one broke.
+1. **`Sec-Fetch-Site: none` on the failing request means the browser did not navigate
+   there — the URL was opened directly.** A page the operator pasted or bookmarked, with a
+   fresh tab and an empty cookie jar, cannot present a cookie that was set in a different
+   tab several navigations earlier. Any conclusion drawn from such a request is invalid,
+   including "SSO is broken". Reproduce by starting from the sign-in page and following
+   every redirect inside one tab.
+2. **`Cookie: ssoHandOffMessage=You may now close this tab and continue in the extension`
+   is not Vaultwarden's.** Vaultwarden's binding cookie is `VW_SSO_BINDING` and its own
+   hand-off page has different wording; `ssoHandOffMessage` is set by the Bitwarden
+   client's `clientId === 'browser'` SSO connector. If you front the vault with a portal
+   (Authentik, Cloudflare Access, oauth2-proxy), that portal may be terminating the browser
+   SSO entirely, and "the web vault works with SSO" may mean *the portal logged in*, never
+   the vault. **Check which system actually authenticated you before reasoning about
+   `VW_SSO_BINDING` at all** — if it was the portal, you have no working vault SSO to
+   compare against, and the CLI's failure is unexplained rather than contradicted.
 
-Binding applies to `web` and `cli` identically (`binding_hash` is passed for every client in
-`sso::authorize_url`), so if web passes and cli fails the difference is the **browser leg**,
-not server policy. The decisive observation:
+A live example of how badly this can go: with Authentik in front, portal-SSO succeeding and
+CLI-SSO failing at `VW_SSO_BINDING` looks like a client bug, but it can equally mean
+Vaultwarden's own `[sso]` provider settings are wrong or unreachable (the server must fetch
+the OIDC discovery document), and the two failures are then unrelated. Nothing in a browser
+header can tell those apart; Vaultwarden's log can, and it is the only place to look.
 
-> DevTools → Network → click the failing `oidc-signin` request → Request Headers →
-> `Cookie:`. `VW_SSO_BINDING` **absent** → the browser would not send it (a Secure/loopback
-> or third-party-cookie question; note Safari does *not* exempt `http://localhost` from
-> `Secure`). **Present** → server-side. `HttpOnly` stops page JS reading it; it does not hide
-> it from the Network panel, which is why this works as an experiment at all.
-
-Server-side checks worth ruling out: `DOMAIN_PATH` must be empty unless the vault really is
-served from a sub-path (on 1.36.0 the cookie is set at `/identity/connect/` and removed at
-the same path, so a non-empty `DOMAIN_PATH` breaks the web vault too), and an authenticating
-reverse proxy in front of the vault can consume the browser session and leave the binding
-cookie set in a session that no longer exists by callback time.
+Useful, since it is unauthenticated and cheap:
+```sh
+curl -s <server>/identity/sso/prevalidate     # 200 + {"token": …} = SSO_ENABLED=true
+```
+`/version` and `/config` are newer additions; their absence is itself a version signal.
 
 The device that opens the URL must be the one whose cookie jar receives the redirect — so open the URL **on the same machine** that runs the command,
 and use `--manual` only when that machine has a browser you can see but the terminal cannot
@@ -310,7 +312,7 @@ collections, `device-encryption` (key-pair) unlock, attachments, or your actual 
 | `2FA is required` | the password grant hit a 2FA policy. Use the API key instead (`apikey`), which bypasses it. |
 | `unrecognised response shape` | your server returns something unexpected — the error lists its keys, and it deliberately refuses to read that as an empty vault |
 | `the creds store is locked` | `f creds unlock` — the vault cannot be consulted or written to while locked |
-| `SSO session binding mismatch` | The callback reached the server without the `VW_SSO_BINDING` cookie set at `/identity/connect/`. **Split by what else works:** if the **web vault also fails**, that is the #7163/#7187 cookie-path bug and `vaultwarden -V` decides it (1.36.0 broken, ≥1.37.0 fixed). If the **web vault works and only this client fails**, it is *not* that bug — web and `client_id=cli` take different redirect paths, so suspect the `http://localhost:PORT` hop or a bug in this client. Not fixed by editing `SSO_*` settings either way. |
+| `SSO session binding mismatch` | Check the failing request's **`Sec-Fetch-Site`** first: `none` means the URL was opened directly, so that tab has no binding cookie and the error proves nothing — redo it by following every redirect inside one tab. Then check whether a **portal** (Authentik / Cloudflare Access / oauth2-proxy) is what really signed you in; `Cookie: ssoHandOffMessage=…continue in the extension` is the Bitwarden browser connector's or the portal's, **not** Vaultwarden's `VW_SSO_BINDING`. If the portal does your SSO, "the web vault works" says nothing about the vault's own `[sso]` block, and the CLI failure has a separate cause — read Vaultwarden's log, the only place that separates "cookie absent" from "OIDC discovery against the provider failed". Then decode the `state`: 22 chars after base64-decode = this CLI's flow; long + `_identifier=` = the web vault's. |
 | `this account has no master password` | SSO succeeded but the account uses device-key unlock, which this uck cannot enrol. Do **not** run `config --master-password`; there is no password to store. Use an API key on an account that has one, or enrol the device in a web vault. |
 | `sso login` opens the browser, then times out | the redirect never reached the callback. Check the port: `ss -tlnp \| grep -E ':806[5-9]\|:8070'`. A listener bound to `127.0.0.1` only is the classic cause — `localhost` resolves to `::1` first, so the browser's connection is refused. This uck binds both loopbacks; if you patched it to bind one, restore that. |
 | `port N is in use` / `no free port` with nothing obviously listening | a previous attempt's listener is still shutting down, or a stale process holds it. Kill it — the message names the port. It does not fall back to another port on purpose: the IdP was told to redirect to that exact one. |
