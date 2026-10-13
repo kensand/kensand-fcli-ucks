@@ -187,6 +187,10 @@ const t = (label, cond, extra = "") => { if (cond) { pass++; console.log(`ok   $
 
 // Start a real daemon in the temp HOME, via the same socket/lockfile protocol
 // the uck uses, so the provider's own creds helpers work against this store.
+// The daemon detaches, so it outlives this process by design. Track its pid so
+// teardown can stop it: otherwise every run of this suite leaks a daemon that sits
+// in memory until its TTL (30m here) — seven accumulated after a few runs.
+const daemonPids = [];
 const DAEMON = path.join(CREDS_UCK, "daemon.js");
 // Must match exactly what the creds uck itself uses (~/.f/.creds.sock and
 // ~/.f/.creds-daemon). A daemon on any other socket path starts happily and then
@@ -201,28 +205,8 @@ const LOCK = path.join(TMP, ".f/.creds-daemon");
   // process group, so the signal a shell sends to the foreground group when this
   // test exits kills it — and the next read then reports "creds are locked",
   // which is indistinguishable from a real store bug. setsid gives it its own
-  // group; without it (or on a box without setsid) we fall back and the store
-  // simply dies at teardown, which the leak check below catches.
-  // Recursion tripwire: if provider discovery ever re-enters itself the process
-  // count explodes and the test box locks up. Stop the run and record parentage
-  // instead of letting it multiply.
-  const probeEntries = () => {
-    try {
-      return execSync(`pgrep -fc ${JSON.stringify("vaultwarden[/]index\\.js")} || true`, { encoding: "utf8" }).trim();
-    } catch { return "0"; }
-  };
-  const trip = setInterval(() => {
-    const n = Number(probeEntries() || "0");
-    if (n > 40) {
-      clearInterval(trip);
-      try { execSync("ps -eo pid=,ppid=,args= | grep 'vaultwarden[/]index' | grep -v grep | head -6 > /tmp/vw-trace.txt"); } catch {}
-      console.error(`\nTRIPWIRE: ${n} provider probe processes — discovery is recursing. Halting.`);
-      try { execSync("pkill -9 -f 'vaultwarden[/]index'"); } catch {}
-      process.exit(9);
-    }
-  }, 250);
-  trip.unref?.();
-
+  // group; without it (or on a box without setsid) we fall back and the daemon
+  // dies at teardown, and the pid-based lock below stops it instead.
   const launch = () => {
     const cmd = fs.existsSync("/usr/bin/setsid") ? "/usr/bin/setsid" : null;
     const child = cmd
@@ -240,6 +224,7 @@ const LOCK = path.join(TMP, ".f/.creds-daemon");
       child.stdout.resume();
       child.stderr.resume();
     }
+    child.once("spawn", () => daemonPids.push(child.pid));
     child.unref();
     return child;
   };
@@ -496,6 +481,13 @@ t("sync was used once for the initial key unwrap", SYNC_HITS >= 1, `sync=${SYNC_
 console.log(`\n${pass} passed, ${fail} failed   (tmp home: ${TMP})`);
 console.log(`counts: prelogin=${PRELOGIN_HITS} sync=${SYNC_HITS} ciphers=${CIPHERS_HITS}`);
 server.close();
+// Stop the daemon we started, via the protocol rather than a signal: it zeroes
+// its key and removes its own socket/lockfile. Killing it would leave both behind.
+for (const pid of daemonPids) {
+  if (!pid) continue;
+  try { execFileSync("f", ["creds", "lock"], { cwd: SAFE_CWD, timeout: 15000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, HOME: TMP } }); } catch { /* best effort */ }
+  try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+}
 try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
 try { fs.rmSync(SAFE_CWD, { recursive: true, force: true }); } catch {}
 process.exit(fail ? 1 : 0);
