@@ -454,5 +454,74 @@ await t("duplicate names are detectable by the resolver", () => {
   assert.equal(named.length, 2, "fixture must contain a name collision to be useful");
 });
 
+await t("an absent Kdf is refused rather than assumed to be PBKDF2", () => {
+  // Falling back to PBKDF2 here derived a WRONG key and the failure surfaced as
+  // "MAC verification failed", i.e. the operator was told their master password was
+  // wrong. The algorithm must never be guessed.
+  assert.throws(
+    () => C.VaultwardenApi.keysFromSsoToken(
+      { Key: "0.aabb.cc", UserDecryptionOptions: { HasMasterPassword: true } },
+      { email: "a@b.c", masterPassword: "x" }),
+    /did not report which KDF|refusing to guess/i,
+  );
+});
+
+const deriveWithArgon2 = () => C.VaultwardenApi.keysFromSsoToken(
+  { Kdf: 1, KdfIterations: 3, Key: "0.aabb.cc", UserDecryptionOptions: { HasMasterPassword: true } },
+  { email: "a@b.c", masterPassword: "x" });
+
+await t("Kdf=1 is named as Argon2id and never blamed on the master password", () => {
+  // The real-world case: a live account with kdf:1 (Argon2id, iterations 3). Deriving it
+  // with PBKDF2 produced a MAC failure and an accusation against a perfectly good password.
+  let err = null;
+  try {
+    C.VaultwardenApi.keysFromSsoToken(
+      { Kdf: 1, KdfIterations: 3, Key: "0.aabb.cc", UserDecryptionOptions: { HasMasterPassword: true } },
+      { email: "a@b.c", masterPassword: "x" });
+  } catch (e) { err = e; }
+  assert.ok(err, "must refuse, not derive a wrong key");
+  assert.match(err.message, /Argon2id/, "must name the algorithm so the operator can change it");
+  // Pin the CLIENT too, not just openVault's guard: the old code said the useless
+  // "unsupported kdf type 1" without naming the algorithm or the setting that fixes it.
+  assert.throws(
+    () => deriveWithArgon2(),
+    /Argon2id/,
+    "vwclient itself must name Argon2id, so the message is not only the caller's");
+  assert.doesNotMatch(err.message, /master password is wrong|MAC verification/,
+    "must not tell the operator to retype a credential that is not the problem");
+});
+
+await t("prelogin reports the kdf type and refuses to invent iterations", async () => {
+  // Dropping `kdf` is what let an Argon2id vault be derived as PBKDF2; defaulting
+  // iterations to 600000 compounded it, because Argon2 accounts report tiny counts (3).
+  const srv = (await import("node:http")).default.createServer((req, res) => {
+    let b = ""; req.on("data", (c) => (b += c));
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      // Keyed off the email in the request body: prelogin always posts to the same
+      // path, so branching on req.url made every request take the same branch and the
+      // rejection assertion below passed vacuously until it was checked.
+      let email = "";
+      try { email = JSON.parse(b).email ?? ""; } catch { email = new URLSearchParams(b).get("email") ?? ""; }
+      res.end(/noka/.test(email)
+        ? JSON.stringify({ kdf: 1 })
+        : JSON.stringify({ kdf: 1, kdfIterations: 3, kdfMemory: 64, kdfParallelism: 4 }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const a = new C.VaultwardenApi({ server: base, allowInsecureHttp: true, timeoutMs: 4000 });
+    const pre = await a.prelogin("kdf-account@example.com");
+    assert.equal(pre.kdf, 1, "kdf type must survive prelogin");
+    assert.equal(pre.kdfIterations, 3, "an Argon2 iteration count must be reported as-is, not replaced by 600000");
+    assert.equal(pre.kdfMemory, 64, "memory/parallelism are needed if Argon2id is ever implemented");
+    const b = new C.VaultwardenApi({ server: base, allowInsecureHttp: true, timeoutMs: 4000 });
+    // A response with no iterations must fail loudly; inventing one derives a wrong key.
+    await assert.rejects(b.prelogin("noka@example.com"), /no usable kdfIterations.*refusing to guess/i);
+  } finally { srv.close(); }
+});
+
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

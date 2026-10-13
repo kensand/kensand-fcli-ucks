@@ -312,8 +312,16 @@ export class VaultwardenApi {
       if (e.status !== 400 && e.status !== 415) throw e;
       return this.#request("/identity/accounts/prelogin", { method: "POST", form: { email }, auth: false });
     });
-    const kdfIterations = Number(j?.kdfIterations ?? 600000);
-    return { kdf: Number(j?.kdf ?? 0), kdfIterations: Number.isFinite(kdfIterations) && kdfIterations > 0 ? kdfIterations : 600000 };
+    const kdf = Number(j?.kdf ?? 0);
+    const kdfIterations = Number(j?.kdfIterations ?? 0);
+    if (!Number.isFinite(kdfIterations) || kdfIterations <= 0) {
+      // A missing iteration count used to become 600000. For an Argon2id account that
+      // number is meaningless (the server said 3), and inventing one derives a wrong key.
+      throw new Error(`prelogin returned no usable kdfIterations (${j?.kdfIterations}) for ${email}; refusing to guess`);
+    }
+    // Both fields matter: kdf selects the algorithm (0 = PBKDF2-SHA256, 1 = Argon2id) and
+    // the caller must reject anything but 0 rather than derive with the wrong algorithm.
+    return { kdf, kdfIterations, kdfMemory: j?.kdfMemory ?? null, kdfParallelism: j?.kdfParallelism ?? null };
   }
 
   /** API-key grant. Skips 2FA; yields a token but CANNOT decrypt anything. */
@@ -563,7 +571,12 @@ export class VaultwardenApi {
     const encKey = tokenJson?.Key ?? tokenJson?.key
       ?? udo?.MasterPasswordUnlock?.MasterKeyEncryptedUserKey
       ?? udo?.MasterPasswordUnlock?.MasterKeyWrappedUserKey ?? null;
-    const kdfType = Number(tokenJson?.Kdf ?? tokenJson?.kdf ?? KDF_PBKDF2_SHA256);
+    // Never default this. An absent Kdf used to fall back to PBKDF2, which then derived a
+    // WRONG key and reported "MAC verification failed" — i.e. it accused the operator of
+    // typing the wrong master password when the real problem was the algorithm. Bitwarden
+    // Kdf 1 is Argon2id, which this client does not implement; it must be named, not
+    // silently reinterpreted as PBKDF2.
+    const kdfType = Number(tokenJson?.Kdf ?? tokenJson?.kdf ?? Number.NaN);
     const iterations = Number(tokenJson?.KdfIterations ?? tokenJson?.kdfIterations ?? 0);
 
     if (!hasMaster) {
@@ -585,8 +598,11 @@ export class VaultwardenApi {
         `  f vaultwarden config --master-password`,
       );
     }
+    if (!Number.isInteger(kdfType)) {
+      throw new Error("the server did not report which KDF this account uses; refusing to guess (see preloginKdfMismatch)");
+    }
     if (kdfType !== KDF_PBKDF2_SHA256) {
-      throw new Error(`unsupported kdf type ${kdfType} (only PBKDF2-SHA256 is implemented)`);
+      throw new Error(kdfUnsupportedMessage(kdfType));
     }
     if (!Number.isInteger(iterations) || iterations <= 0) {
       throw new Error(`SSO response had no usable KdfIterations: ${tokenJson?.KdfIterations}`);
@@ -729,6 +745,21 @@ export function ssoRequiresMasterPassword(tokenJson) {
   const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};
   const hasMaster = udo.HasMasterPassword ?? udo.hasMasterPassword ?? true;
   return !!hasMaster;
+}
+
+/**
+ * The vault's KDF is per-account and the client cannot choose it. Bitwarden's enum:
+ * 0 = PBKDF2-SHA256, 1 = Argon2id. Saying "unsupported kdf 1" is useless; name the
+ * algorithm and the setting that controls it.
+ */
+function kdfUnsupportedMessage(kdfType) {
+  const name = kdfType === 1 ? "Argon2id" : `KDF type ${kdfType}`;
+  return (
+    `this account uses ${name}, which this client cannot derive keys with (only\n` +
+    `  PBKDF2-SHA256 is implemented). Nothing is wrong with your master password — the\n` +
+    `  algorithm is. Web vault -> Settings -> Security -> Keys -> Encryption key type\n` +
+    `  switches the account to PBKDF2 (it re-encrypts the vault; export a backup first).`
+  );
 }
 
 export function deriveKeys({ email, password, kdfIterations, encryptedKey }) {

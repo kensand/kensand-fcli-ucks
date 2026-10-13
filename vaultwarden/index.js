@@ -456,6 +456,28 @@ function namesForItem(item, cfg) {
  * Order: cached derived keys -> API-key token + master password -> error with
  * the exact thing to fix. Never attempts a password grant (see file header).
  */
+/**
+ * Refuse to derive when the account does not use PBKDF2.
+ *
+ * prelogin() used to discard the KDF *type*, keeping only the iteration count, so an
+ * Argon2id account (kdf: 1) was derived with PBKDF2 using Argon2's iteration count — 3,
+ * where PBKDF2 wants hundreds of thousands. The result is a wrong key whose MAC check
+ * fails, and the operator was told "your master password is wrong, do not retry blindly".
+ * That is a false accusation, and it wastes the one credential that must not be brute
+ * forced. Check the type first, before any PBKDF2 is paid.
+ */
+function assertPbkdf2(pre) {
+  const kdf = Number(pre?.kdf ?? 0);
+  if (kdf !== 0) {
+    throw new Error(
+      `this account's encryption key type is ${kdf === 1 ? "Argon2id" : `type ${kdf}`}, which this\n` +
+      `  client cannot derive (only PBKDF2-SHA256 is implemented). Your master password is not\n` +
+      `  the problem here. Web vault -> Settings -> Security -> Keys -> Encryption key type\n` +
+      `  switches to PBKDF2 (re-encrypts the vault: export a backup first).`,
+    );
+  }
+}
+
 async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp = false } = {}) {
   const cfg = vwConfig();
   if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
@@ -498,6 +520,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
       // which is why this branch requires `master`.
       try {
         const pre = await api.prelogin(cfg.email);
+        assertPbkdf2(pre);
         const sync = await api.sync();
         const encKey = sync?.profile?.key;
         if (!encKey) throw new Error("sync returned no profile.key");
@@ -553,6 +576,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
   }
   await api.loginApiKey({ clientId, clientSecret });
   const pre = await api.prelogin(cfg.email);
+  assertPbkdf2(pre);
   const sync = await api.sync();
   const encKey = sync?.profile?.key;
   if (!encKey) throw new Error(`sync returned no profile.key — account may not be set up, or the token lacks vault scope`);
