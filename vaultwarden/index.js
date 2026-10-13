@@ -226,12 +226,14 @@ async function ssoManualPrompt(authorizeUrl, port) {
     + `     whole address bar (it starts with http://localhost:${port}/?code=…) and\n`
     + "     paste it below\n"
     + "\n"
-    + "  Opening it on a DIFFERENT device cannot work: the server binds the flow to a\n"
-    + "  cookie set in the browser that opened the URL (VW_SSO_BINDING) and rejects the\n"
-    + "  callback without it. From a remote terminal, forward the port and open the URL\n"
-    + "  on your own machine — the cookie and the redirect then share a browser, and the\n"
-    + "  default (non-manual) flow works:\n"
+    + "  The flow is bound to a cookie set in the browser that opened the URL\n"
+    + "  (VW_SSO_BINDING), so open it where the redirect will be received. From a remote\n"
+    + "  terminal, forward the port and open it on your own machine — cookie and redirect\n"
+    + "  then share a browser, and the default (non-manual) flow works:\n"
     + `     ssh -L ${port}:localhost:${port} <host>\n`
+    + "  If a browser on THIS machine still reports `SSO session binding mismatch`, that is\n"
+    + "  not you: Vaultwarden 1.36.x has a broken cookie path and rejects every SSO login.\n"
+    + "  Check `vaultwarden -V`; the fix shipped in 1.37.0.\n"
     + "\n"
     + "Paste the redirect URL (or just the code), then press Enter:\n\n> ",
   );
@@ -249,6 +251,12 @@ async function ssoManualPrompt(authorizeUrl, port) {
 
   const raw = String(line ?? "").trim();
   if (!raw) throw new Error("nothing pasted — nothing was exchanged");
+  // The browser may have been shown the server's JSON error rather than a redirect
+  // with a code. That error names the real problem, so surface it instead of the
+  // generic "could not find a code".
+  const serverError = extractSsoServerError(raw);
+  if (serverError) throw new Error(serverError);
+
   const code = extractSsoCode(raw);
   if (!code) {
     throw new Error("could not find an authorization code in what you pasted\n  paste the full address-bar URL (http://localhost:…/?code=…) or the code value alone");
@@ -261,6 +269,32 @@ async function ssoManualPrompt(authorizeUrl, port) {
  * shape and strict about content: a copied URL may carry the code first or last, may be
  * wrapped in quotes or angle brackets by a terminal, and may have the state appended.
  */
+/**
+ * Recognise the server-side failures that arrive *in place of* a redirect.
+ *
+ * When the callback is rejected, Vaultwarden does not redirect at all: the browser is
+ * left showing a JSON error body, which is what the operator has available to paste.
+ * Reporting "no code found" there hides the only useful diagnostic, so match the
+ * failures that have a known cause and say what it is.
+ */
+export function extractSsoServerError(input) {
+  if (!/binding mismatch/i.test(input)) return null;
+  // `SSO session binding mismatch` is produced by oidcsignin_redirect when the
+  // VW_SSO_BINDING cookie is absent or does not hash to the stored value. Two distinct
+  // causes reach it, and they need different fixes, so both are offered.
+  return [
+    "the identity provider rejected the callback: SSO session binding mismatch",
+    "  The flow is bound to a cookie set in the browser that opened the authorize URL.",
+    "  Cause A — you opened the URL on a different device than the one finishing the",
+    "            flow. Open it on the machine that will receive the redirect, or forward",
+    "            the port: ssh -L 8065:localhost:8065 <host>, then use the default flow.",
+    "  Cause B — your Vaultwarden is 1.36.x, which has a broken cookie path and rejects",
+    "            *every* SSO login, web vault included (#7163 introduced it, #7187 fixed",
+    "            it, first shipped in 1.37.0). Run `vaultwarden -V`; if it says 1.36,",
+    "            upgrade rather than changing your configuration.",
+  ].join("\n");
+}
+
 export function extractSsoCode(input) {
   let t = input.trim().replace(/^["'<`]+|["'`>]+$/g, "");
   // A full URL: take the query parameter, which is unambiguous when present.

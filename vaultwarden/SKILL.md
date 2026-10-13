@@ -93,13 +93,31 @@ Prints the URL, binds **no port at all**, and waits for you to paste the redirec
 address-bar URL, a bare code, quotes, trailing commas, and `code=` in any parameter
 position; it refuses an IdP `error=` redirect rather than reading it as a code.
 
-**Do not open the printed URL on a different device.** It looks like the natural move and
-it cannot work. Vaultwarden sets a browser-binding cookie at
-`GET /identity/connect/authorize` (`VW_SSO_BINDING`, path `<domain>/identity/connect/`,
-`SameSite=Lax`, `HttpOnly`) and stores only its SHA-256. On the callback it requires that
-cookie back (`identity.rs`, `oidcsignin_redirect`) and otherwise fails with
-`SSO session binding mismatch`. The device that opens the URL must be the one whose cookie
-jar receives the redirect — so open the URL **on the same machine** that runs the command,
+**Open the URL on the same machine that finishes the flow.** Vaultwarden sets a
+browser-binding cookie at `GET /identity/connect/authorize` (`VW_SSO_BINDING`, path
+`<domain>/identity/connect/`, `SameSite=Lax`, `HttpOnly`) and stores only its SHA-256; on
+the callback it requires that cookie back (`identity.rs`, `oidcsignin_redirect`) and
+otherwise fails with `SSO session binding mismatch`.
+
+That check is also a **broken-on-release** hazard, and it is easy to misread as your own
+mistake:
+
+- **#7163** (in 1.36.0, released 2026-05-03) added the binding cookie with path
+  `/identity/connect/`. If `DOMAIN` has a path component, or the cookie is otherwise not
+  returned, **every** SSO login fails — web vault included. This hit multiple deployments
+  on release (v1.36.0 discussion #7177, DEX/YunoHost reports).
+- **#7187** "Fix SSO Cookie path" merged **2026-05-15**, i.e. *after* 1.36.0 shipped. It is
+  absent from the `1.36.0` tag and present from **`1.37.0`** onward. So **1.36.x is the
+  broken band**; 1.35.x has no binding check at all and 1.37.x works.
+- If you see `SSO session binding mismatch`, run `vaultwarden -V` **before** changing any
+  config. On 1.36.x, upgrade. `f vaultwarden sso login --manual` now says this when it
+  sees that string pasted back.
+- The cookie is not `Secure`-gated when the request is http, so an https server redirecting
+  to `http://localhost:PORT` does not inherently lose it; `Secure` is set to
+  `secure.https`. A `Secure` cookie is still sent to `http://localhost` ( browsers treat
+  localhost as trustworthy), so that combination is not the cause either.
+
+The device that opens the URL must be the one whose cookie jar receives the redirect — so open the URL **on the same machine** that runs the command,
 and use `--manual` only when that machine has a browser you can see but the terminal cannot
 drive (a remote terminal session, a container with a mounted display, a browser that
 refused `xdg-open`).
@@ -217,7 +235,7 @@ else; nothing in the resolution path can mutate the vault.
 ```
 node test/run-all.mjs            # all three suites
 node test/crypto.test.mjs        # 31: crypto vectors, envelope handling, error shapes
-node test/sso.test.mjs           # 28: OIDC flow + the loopback callback listener
+node test/sso.test.mjs           # 29: OIDC flow + the loopback callback listener
 node test/e2e.test.mjs           # 32: whole provider ladder vs a mock Vaultwarden
 ```
 
@@ -259,7 +277,7 @@ collections, `device-encryption` (key-pair) unlock, attachments, or your actual 
 | `2FA is required` | the password grant hit a 2FA policy. Use the API key instead (`apikey`), which bypasses it. |
 | `unrecognised response shape` | your server returns something unexpected — the error lists its keys, and it deliberately refuses to read that as an empty vault |
 | `the creds store is locked` | `f creds unlock` — the vault cannot be consulted or written to while locked |
-| `SSO session binding mismatch` | you opened the authorize URL on a device other than the one that will receive the redirect. Vaultwarden binds the flow to a browser cookie; see "Signing in from a terminal that has no browser". `--manual` does not lift this — it only stops the local listener. SSH-forward the port instead, or use an API key on that machine. |
+| `SSO session binding mismatch` | **First run `vaultwarden -V`.** On **1.36.x** this is a server bug, not your config: #7163 shipped a cookie path that breaks every SSO login, fixed by #7187 (merged after 1.36.0 released), first shipped in **1.37.0** — so 1.35.x has no such check and 1.37.x works, and 1.36.x is the broken band. Upgrading is the fix; editing SSO config is not. On 1.37.x it means the authorize URL was opened on a different device than the one receiving the redirect (the flow is bound to a browser cookie). `--manual` does not lift that — it stops the local listener, not the cookie. SSH-forward the port, or use an API key on that machine. |
 | `this account has no master password` | SSO succeeded but the account uses device-key unlock, which this uck cannot enrol. Do **not** run `config --master-password`; there is no password to store. Use an API key on an account that has one, or enrol the device in a web vault. |
 | `sso login` opens the browser, then times out | the redirect never reached the callback. Check the port: `ss -tlnp \| grep -E ':806[5-9]\|:8070'`. A listener bound to `127.0.0.1` only is the classic cause — `localhost` resolves to `::1` first, so the browser's connection is refused. This uck binds both loopbacks; if you patched it to bind one, restore that. |
 | `port N is in use` / `no free port` with nothing obviously listening | a previous attempt's listener is still shutting down, or a stale process holds it. Kill it — the message names the port. It does not fall back to another port on purpose: the IdP was told to redirect to that exact one. |

@@ -499,6 +499,22 @@ await t("extractSsoCode survives what a paste actually looks like", async () => 
   }
 });
 
+await t("a pasted 'binding mismatch' body is explained, not called a missing code", async () => {
+  // When the callback is refused the browser shows a JSON error and never redirects, so
+  // this text is all the operator has. "Could not find an authorization code" would
+  // throw away the only diagnostic in it.
+  const mod = await import(pathToFileURL(path.join(here, "..", "index.js")).href + `?srvErr=${Date.now()}`);
+  const detect = mod.extractSsoServerError;
+  assert.equal(typeof detect, "function", "must be exported for testing");
+  const body = String.raw`{"message":"SSO session binding mismatch for HLRQ7RfKM0r6okaCr2fUpA","validationErrors":{"":["x"]},"object":"error"}`;
+  const out = detect(body);
+  assert.match(out, /binding mismatch/i);
+  assert.match(out, /1\.36/, "must name the broken release: it is a server bug, not operator error");
+  assert.match(out, /ssh -L/, "and must offer the port-forward for the same-device cause");
+  // A successful redirect must not be mistaken for an error.
+  assert.equal(detect("http://localhost:8065/?code=abc123&state=xy"), null);
+});
+
 await t("a named port that is taken fails loudly instead of binding another", async () => {
   // Silently moving to a free port would produce a hang the operator cannot diagnose,
   // because the IdP was told to redirect to the first one.
