@@ -47,6 +47,17 @@ const DEVICE_TYPE_CLI = 14;
 // refused with "Scope not supported", so the original form could never log in.
 // Field names are sent in both cases: cheap insurance against a server that
 // validates one spelling or the other, and unknown fields are ignored.
+/**
+ * Device fields are required -- omit them entirely and the server answers
+ * "device_identifier cannot be blank". Send them in ONE spelling: snake_case works, camelCase
+ * works, and BOTH TOGETHER produce that same "cannot be blank" error, because Rocket's form
+ * binder refuses a field supplied more than once. Verified against a live Vaultwarden for both
+ * the password and client_credentials grants; the duplication here is what made every real
+ * login fail while every test passed.
+ *
+ * It is also the reason the mock below must reject the duplication rather than tolerate it: a
+ * mock that accepts a request the real server rejects is how this survived the whole test suite.
+ */
 const DEVICE_IDENTIFIER = "f-vaultwarden-uck";
 const DEVICE_NAME = "f creds (vaultwarden provider)";
 /**
@@ -292,9 +303,7 @@ export class VaultwardenApi {
       form: {
         grant_type: "client_credentials", scope: API_SCOPE,
         client_id: clientId, client_secret: clientSecret,
-        deviceType: String(DEVICE_TYPE_CLI),
-        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
-        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
+        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME, device_type: String(DEVICE_TYPE_CLI),
       },
     });
     if (!j?.access_token) throw new Error("token response had no access_token");
@@ -321,9 +330,7 @@ export class VaultwardenApi {
       form: {
         grant_type: "password", username: email, password: passwordHash.toString("base64"),
         scope: PASSWORD_SCOPE, client_id: "device",
-        deviceType: String(DEVICE_TYPE_CLI),
-        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
-        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
+        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME, device_type: String(DEVICE_TYPE_CLI),
       },
     });
     if (!j?.access_token) {

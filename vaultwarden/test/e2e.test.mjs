@@ -87,6 +87,7 @@ const CIPHERS = [
 ];
 
 let TOKEN_SEEN = null;
+const TOKEN_LOG = []; // one entry per token request, with the device field names it carried
 const GRANTS = []; // every grant the client actually asked for, in order
 let PW_GRANT_SEEN = null;
 let FIRST_RUN_GRANTS = 0; // grants consumed by the first vault-open attempt
@@ -155,13 +156,27 @@ const server = http.createServer((req, res) => {
       if (p.grant_type === "password" && p.password !== EXPECTED_PW_HASH) {
         return send(400, { message: "Username or password is incorrect. Try again", validationErrors: { "": ["Username or password is incorrect. Try again"] }, error_description: "" });
       }
-      if (!p.device_identifier && !p.device_identifier?.length) {
-        if (!p.device_identifier) return send(400, { message: "device_identifier cannot be blank", validationErrors: { "": ["device_identifier cannot be blank"] }, error_description: "" });
+      // The device fields are required, and they must arrive in ONE spelling. Sending
+      // snake_case and camelCase together makes the real server answer
+      // "device_identifier cannot be blank" -- Rocket's binder rejects a field bound twice --
+      // and that is exactly the bug this mock used to hide by reading whichever key it liked.
+      const dupes = ["device_identifier", "device_name", "device_type"]
+        .filter((k) => p[k] !== undefined && p[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] !== undefined);
+      if (dupes.length) {
+        return send(400, {
+          message: `${dupes[0]} cannot be blank`,
+          validationErrors: { "": [`${dupes[0]} cannot be blank`] }, error_description: "",
+          _note: "sent both snake_case and camelCase for the same field",
+        });
+      }
+      if (!p.device_identifier) {
+        return send(400, { message: "device_identifier cannot be blank", validationErrors: { "": ["device_identifier cannot be blank"] }, error_description: "" });
       }
       if (!p.device_name) return send(400, { message: "device_name cannot be blank", validationErrors: { "": ["device_name cannot be blank"] }, error_description: "" });
       if (p.grant_type === "client_credentials" && (p.client_id !== "user.test-id" || p.client_secret !== "test-secret")) return send(400, { message: "Invalid client_id", validationErrors: { "": ["Invalid client_id"] }, error_description: "" });
-      TOKEN_SEEN = { grant: p.grant_type, clientId: p.client_id, scope: p.scope, deviceType: p.deviceType };
+      TOKEN_SEEN = { grant: p.grant_type, clientId: p.client_id, scope: p.scope, deviceType: p.device_type ?? p.deviceType };
       GRANTS.push(p.grant_type);
+      TOKEN_LOG.push({ grant: p.grant_type, status: null, sentDevice: Object.keys(p).filter((k) => /^device/i.test(k)) });
       // The "first run" is the first batch of grant attempts ending in a
       // success. Recorded when a grant succeeds so the assertion below cannot pass
       // vacuously off an empty slice.
@@ -486,6 +501,18 @@ t("password grant sent the master-password proof + a supported scope",
   !!PW_GRANT_SEEN && PW_GRANT_SEEN.password === EXPECTED_PW_HASH && PW_GRANT_SEEN.scope === "api offline_access",
   JSON.stringify({ ...PW_GRANT_SEEN, password: PW_GRANT_SEEN?.password === EXPECTED_PW_HASH ? "MATCH" : `MISMATCH want=${EXPECTED_PW_HASH.slice(0,8)}` }));
 t("prelogin was consulted for KDF params", PRELOGIN_HITS >= 1, `hits=${PRELOGIN_HITS}`);
+// The device fields must reach the server exactly once each. The real server rejects the
+// duplication outright, so a client that sends both spellings cannot log in at all -- and a
+// mock that tolerated it kept this suite green through a completely broken login.
+{
+  // Evidence, not inference: the mock rejects a duplicated device field with a 400 before it
+  // ever hands out a token, so if any request carried both spellings, some request either got
+  // a 400 (and the auth assertions below fail) or the field list here shows the duplication.
+  const dupRequests = TOKEN_LOG.filter((e) => e.sentDevice.some((k) => /[A-Z]/.test(k)) && e.sentDevice.some((k) => k.includes("_")));
+  t("every token request sent device fields in exactly one spelling",
+    TOKEN_LOG.length > 0 && dupRequests.length === 0,
+    `${TOKEN_LOG.length} request(s), duplicated in ${dupRequests.length}: ${JSON.stringify(TOKEN_LOG[0]?.sentDevice)}`);
+}
 
 // 8b. rate limiting must be explained, not shown as a bare status code
 {
