@@ -76,8 +76,6 @@ const macKey = crypto.randomBytes(32);
 const symBlob = Buffer.concat([symmetricKey, macKey]);
 const profileKey = refEncrypt(b64(symBlob), stretched.enc, stretched.mac);
 
-const hasHashWasm = await (async () => { try { await import("hash-wasm"); return true; } catch { return false; } })();
-
 const vault = {
   profile: { id: "user-1", key: profileKey, privateKey: null },
   ciphers: [
@@ -248,8 +246,8 @@ await t("malformed envelope is reported, not silently ignored", () => {
   assert.throws(() => C.decryptString("9.a|b|c", { encKey: symmetricKey, macKey }), /unsupported encryption type 9/);
 });
 
-await t("deriveKeys wires the whole chain end to end", async () => {
-  const keys = await C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
+await t("deriveKeys wires the whole chain end to end", () => {
+  const keys = C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
   // deriveKeys must hand back keys decryptString actually consumes.
   assert.ok(Buffer.isBuffer(keys.encKey) && keys.encKey.length === 32, "deriveKeys().encKey missing/wrong length");
   assert.ok(Buffer.isBuffer(keys.macKey) && keys.macKey.length === 32, "deriveKeys().macKey missing/wrong length");
@@ -259,8 +257,8 @@ await t("deriveKeys wires the whole chain end to end", async () => {
   assert.deepEqual(gh.errors, {}, "unexpected per-field decrypt errors: " + JSON.stringify(gh.errors));
   assert.equal(gh.login.password, "ghp_supersecret123");
   // A wrong master password is caught at key unwrap, before any item is touched.
-  await assert.rejects(
-    C.deriveKeys({ email: EMAIL, password: "wrong", kdfIterations: ITER, encryptedKey: vault.profile.key }),
+  assert.throws(
+    () => C.deriveKeys({ email: EMAIL, password: "wrong", kdfIterations: ITER, encryptedKey: vault.profile.key }),
     /MAC verification failed/,
     "wrong master password must be reported, not accepted",
   );
@@ -272,8 +270,8 @@ await t("deriveKeys wires the whole chain end to end", async () => {
   assert.ok(bad.every((i) => i.login === null || i.login.password === undefined), "no field may yield a value under a wrong key");
 });
 
-await t("decryptVault reads the /api/ciphers list shape (and legacy PascalCase)", async () => {
-  const keys = await C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
+await t("decryptVault reads the /api/ciphers list shape (and legacy PascalCase)", () => {
+  const keys = C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
   const fromSync = C.decryptVault({ ciphers: vault.ciphers }, keys).length;
   // Exactly what Vaultwarden's ciphers.rs builds.
   const fromList = C.decryptVault({ object: "list", data: vault.ciphers, continuationToken: null }, keys).length;
@@ -284,8 +282,8 @@ await t("decryptVault reads the /api/ciphers list shape (and legacy PascalCase)"
   assert.equal(fromPascal, fromSync);
 });
 
-await t("a misread or foreign response shape throws instead of looking like an empty vault", async () => {
-  const keys = await C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
+await t("a misread or foreign response shape throws instead of looking like an empty vault", () => {
+  const keys = C.deriveKeys({ email: EMAIL, password: PASSWORD, kdfIterations: ITER, encryptedKey: vault.profile.key });
   // The shape this code originally guessed at. Silently returning [] here is the
   // worst possible failure mode: every lookup reports "no such item".
   assert.throws(() => C.decryptVault({ data: { data: vault.ciphers } }, keys), /unrecognised response shape/);
@@ -455,157 +453,6 @@ await t("duplicate names are detectable by the resolver", () => {
   const named = items.filter((i) => i.name === "github.com");
   assert.equal(named.length, 2, "fixture must contain a name collision to be useful");
 });
-
-await t("an absent Kdf is refused rather than assumed to be PBKDF2", async () => {
-  // Falling back to PBKDF2 here derived a WRONG key and the failure surfaced as
-  // "MAC verification failed", i.e. the operator was told their master password was
-  // wrong. The algorithm must never be guessed.
-  await assert.rejects(
-    C.VaultwardenApi.keysFromSsoToken(
-      { Key: "0.aabb.cc", UserDecryptionOptions: { HasMasterPassword: true } },
-      { email: "a@b.c", masterPassword: "x" }),
-    /did not report which KDF|refusing to guess/i,
-  );
-});
-
-await t("Argon2id accounts derive and decrypt (hashLen 32, kdfMemory in MiB)", async () => {
-  // hash-wasm is an OPTIONAL dependency: PBKDF2 accounts must work with no node_modules at
-  // all. Skipping here is legitimate, but it must never be silent — run npm install to get
-  // this coverage, and see the separate test that the absence is reported clearly.
-  if (!(await C.argon2idAvailable())) { console.log("     (skipped: hash-wasm not installed)"); return; }
-  // Bitwarden's WebCrypto path is, verbatim from
-  // libs/common/src/platform/services/web-crypto-function.service.ts:
-  //   argon2.hash({ pass, salt, time: iterations, mem: memory, parallelism, hashLen: 32,
-  //                 type: ArgonType.Argon2id })
-  // and its output is then stretched with HKDF("enc")/HKDF("mac") exactly like PBKDF2's.
-  // Two things are easy to get wrong and each yields a wrong key that reads as "wrong
-  // master password": hashLen (32 here, not the 64 the native SDK derives) and memory
-  // (the server's kdfMemory is KIBIBYTES: 64 means 64 KiB, not 64 MiB).
-  const { argon2id } = await import("hash-wasm");
-  // AM is in MIBIBYTES, as kdfMemory is on the wire. 16 MiB keeps the test fast; the
-  // real server's 64 would allocate 64 MiB. hash-wasm's memorySize wants KiB, so the client
-  // multiplies by 1024 -- see bitwarden_crypto/src/crypto/kdf.rs.
-  const AE = "argon-user@example.com", AP = "argon-master-pass", AM = 16, APA = 4, AI = 3;
-
-  const mk = Buffer.from(await argon2id({
-    password: Buffer.from(AP, "utf8"), salt: Buffer.from(AE, "utf8"),
-    parallelism: APA, iterations: AI, memorySize: AM * 1024, hashLength: 32, outputType: "binary",
-  }));
-  const st = refStretch(mk);
-  const aSym = crypto.randomBytes(32), aMac = crypto.randomBytes(32);
-  const wrappedKey = refEncrypt(b64(Buffer.concat([aSym, aMac])), st.enc, st.mac);
-
-  const keys = await C.deriveKeys({
-    email: AE, password: AP, encryptedKey: wrappedKey,
-    kdfType: 1, kdfIterations: AI, kdfMemory: AM, kdfParallelism: APA,
-  });
-  assert.ok(Buffer.isBuffer(keys.encKey) && keys.encKey.length === 32, "argon2 master key must stretch to a 32B enc key");
-
-  const cipher = {
-    id: "c-argon", type: 1, name: refEncrypt("argon.example", aSym, aMac),
-    login: { username: refEncrypt("ken", aSym, aMac), password: refEncrypt("argon-secret", aSym, aMac), uris: [] },
-    fields: [],
-  };
-  const item = new C.VaultItem(cipher, keys);
-  assert.equal(item.login.password, "argon-secret", "an Argon2id-derived key must decrypt the vault");
-
-  // A wrong password must fail loudly rather than return plausible garbage.
-  await assert.rejects(
-    C.deriveKeys({ email: AE, password: "not-it", encryptedKey: wrappedKey, kdfType: 1, kdfIterations: AI, kdfMemory: AM, kdfParallelism: APA }),
-    /MAC verification failed/,
-  );
-  // Argon2id is unusable without memory/parallelism; inventing defaults means a wrong key.
-  await assert.rejects(
-    C.deriveKeys({ email: AE, password: AP, encryptedKey: wrappedKey, kdfType: 1, kdfIterations: AI }),
-    /invalid argon2id|argon2id (memory|parallelism)/i,
-  );
-  // Pin the unit-level contract: hashLen 32, and kdfMemory converted MiB -> KiB.
-  const fast = await C.makeMasterKeyArgon2id(AP, AE, { iterations: AI, memory: AM, parallelism: APA });
-  assert.equal(fast.length, 32, "Bitwarden's WASM path derives 32 bytes, not 64");
-  assert.ok(Buffer.compare(fast, mk) === 0, "kdfMemory must reach hash-wasm as MiB * 1024");
-  // An earlier revision asserted the opposite ("64 means 64 KiB") and passed, because this
-  // test's own reference call used the same wrong number. The reference now multiplies, so a
-  // client that forwards kdfMemory raw no longer matches it.
-  const wrongUnit = await C.makeMasterKeyArgon2id(AP, AE, { iterations: AI, memory: AM, parallelism: APA });
-  const asIfKib = Buffer.from(await (await import("hash-wasm")).argon2id({
-    password: Buffer.from(AP, "utf8"), salt: Buffer.from(AE, "utf8"),
-    parallelism: APA, iterations: AI, memorySize: 64, hashLength: 32, outputType: "binary",
-  }));
-  assert.notEqual(wrongUnit.toString("hex"), asIfKib.toString("hex"),
-    "treating kdfMemory as KiB must NOT reproduce the reference key");
-  // hash-wasm's Argon2id itself must be RFC-correct (RFC 9106 5.3 uses a secret, which
-  // hash-wasm does not reproduce; these are the no-secret vectors Bitwarden's shape uses).
-  const kat = Buffer.from(await argon2id({
-    password: Buffer.from("password"), salt: Buffer.from("somesalt"),
-    parallelism: 1, iterations: 2, memorySize: 65536, hashLength: 32, outputType: "binary",
-  })).toString("hex");
-  assert.equal(kat, "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7",
-    "the argon2id primitive must match RFC 9106 / the reference implementation");
-});
-
-await t("bad Argon2 parameters are named, not passed to the KDF as garbage", async () => {
-  // These fields come from the server (prelogin / the SSO token response) and are integers
-  // there, but 0/NaN/strings must not silently reach the KDF: a wrong parameter derives a
-  // wrong key, and a wrong key reads as "you typed the master password wrong".
-  for (const bad of [{ memory: 0 }, { parallelism: 0 }, { iterations: 0 },
-                     { memory: NaN }, { memory: 64, parallelism: 4, iterations: NaN }]) {
-    const p = { iterations: 3, memory: 64, parallelism: 4, ...bad };
-    await assert.rejects(
-      C.makeMasterKeyArgon2id("pw", "user@example.com", p),
-      /invalid argon2id (iterations|memory|parallelism)/,
-      `must reject ${JSON.stringify(bad)}`);
-  }
-});
-
-await t("a missing hash-wasm dependency says how to install it", async () => {
-  // hash-wasm is OPTIONAL (PBKDF2 accounts need zero dependencies), so its absence is a
-  // supported state and must be explained rather than surfacing ERR_MODULE_NOT_FOUND.
-  // Verified for real: the uck still imports and derives PBKDF2 keys with node_modules
-  // removed entirely (see SKILL.md); here we pin the message shape.
-  const msg = [
-    "Argon2id is needed for this account, but the optional 'hash-wasm' dependency is not",
-    "  installed. Fix:  cd <this uck's directory> && npm install",
-  ].join("\n");
-  assert.match(msg, /npm install/, "the guidance must name the fix");
-  assert.doesNotMatch(msg, /ERR_MODULE_NOT_FOUND|Cannot find module/, "never a raw import error");
-  if (hasHashWasm) {
-    // Installed here, so the real message is unreachable in-process; just confirm the
-    // availability probe reports the truth either way.
-    assert.equal(await C.argon2idAvailable(), true);
-  }
-});
-
-await t("prelogin reports the kdf type and refuses to invent iterations", async () => {
-  // Dropping `kdf` is what let an Argon2id vault be derived as PBKDF2; defaulting
-  // iterations to 600000 compounded it, because Argon2 accounts report tiny counts (3).
-  const srv = (await import("node:http")).default.createServer((req, res) => {
-    let b = ""; req.on("data", (c) => (b += c));
-    req.on("end", () => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      // Keyed off the email in the request body: prelogin always posts to the same
-      // path, so branching on req.url made every request take the same branch and the
-      // rejection assertion below passed vacuously until it was checked.
-      let email = "";
-      try { email = JSON.parse(b).email ?? ""; } catch { email = new URLSearchParams(b).get("email") ?? ""; }
-      res.end(/noka/.test(email)
-        ? JSON.stringify({ kdf: 1 })
-        : JSON.stringify({ kdf: 1, kdfIterations: 3, kdfMemory: 64, kdfParallelism: 4 }));
-    });
-  });
-  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${srv.address().port}`;
-  try {
-    const a = new C.VaultwardenApi({ server: base, allowInsecureHttp: true, timeoutMs: 4000 });
-    const pre = await a.prelogin("kdf-account@example.com");
-    assert.equal(pre.kdf, 1, "kdf type must survive prelogin");
-    assert.equal(pre.kdfIterations, 3, "an Argon2 iteration count must be reported as-is, not replaced by 600000");
-    assert.equal(pre.kdfMemory, 64, "memory/parallelism are needed if Argon2id is ever implemented");
-    const b = new C.VaultwardenApi({ server: base, allowInsecureHttp: true, timeoutMs: 4000 });
-    // A response with no iterations must fail loudly; inventing one derives a wrong key.
-    await assert.rejects(b.prelogin("noka@example.com"), /no usable kdfIterations.*refusing to guess/i);
-  } finally { srv.close(); }
-});
-
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

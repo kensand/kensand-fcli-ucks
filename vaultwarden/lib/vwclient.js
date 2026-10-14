@@ -52,26 +52,6 @@ const DEVICE_NAME = "f creds (vaultwarden provider)";
 const API_SCOPE = "api";
 const UA = "f-cli/vaultwarden-provider";
 
-/*
- * SSO constants, taken from the server's own behaviour rather than guessed.
- *
- * `client_id=cli` is the only one the server accepts for a command-line flow, and
- * it mandates an http://localhost:8065..8070 redirect (src/sso.rs authorize_url).
- * `web`/`browser` point at the server's own sso-connector.html and `desktop`/`mobile`
- * expect a custom scheme, neither of which a headless CLI can service.
- *
- * Scope is `api offline_access`: offline_access is what earns the refresh_token, and
- * unlike the API-key grant (where this server refuses anything but `api`) the SSO
- * grant is a normal user login and accepts it. Kept separate from API_SCOPE because
- * the two grants have different, independently-verified scope rules.
- */
-const SSO_CLIENT_ID = "cli";
-const SSO_SCOPE = "api offline_access";
-
-/** Bitwarden KdfType: 0 = PBKDF2-SHA256, 1 = Argon2id. */
-export const KDF_PBKDF2_SHA256 = 0;
-export const KDF_ARGON2ID = 1;
-
 /** Cipher type codes (Bitwarden `EncryptionType`). */
 export const ENC = { AES_256_CBC_PLAIN: 0, AES_128_CBC: 1, AES_256_CBC_HMAC: 2, RSA_2048_OAEP: 3 };
 
@@ -81,93 +61,12 @@ export const CIPHER_TYPE = { LOGIN: 1, SECURE_NOTE: 2, CARD: 3, IDENTITY: 4 };
 /* ------------------------------------------------------------------ crypto */
 
 /** PBKDF2-HMAC-SHA256(masterPassword, email, iterations) -> 32B masterKey. */
-/**
- * hash-wasm is an OPTIONAL dependency: it provides the Argon2id WASM that Bitwarden
- * accounts with kdf=1 require. It is imported lazily so an installation without
- * `npm install` still works for the far more common PBKDF2 accounts — the zero-dep
- * path must not regress when a dependency is added.
- */
-let _argon2id = null;
-/**
- * Load the optional Argon2id implementation.
- *
- * `impl` exists so the "dependency is missing" branch is testable without uninstalling
- * anything. It must not cache the result: a test that asks for the unavailable path has
- * to leave the real loader usable afterwards, or it poisons every later derivation.
- */
-async function loadArgon2id({ impl = null } = {}) {
-  if (impl) return impl;
-  if (_argon2id === null) {
-    try {
-      ({ argon2id: _argon2id } = await import("hash-wasm"));
-      if (typeof _argon2id !== "function") _argon2id = false;
-    } catch { _argon2id = false; }
-  }
-  if (!_argon2id) {
-    throw new Error(
-      "Argon2id is needed for this account, but the optional 'hash-wasm' dependency is not\n" +
-      "  installed. Fix:  cd <this uck's directory> && npm install\n" +
-      "  (PBKDF2 accounts need no dependencies at all, which is why this one is optional.)",
-    );
-  }
-  return _argon2id;
-}
-
-/** Whether Argon2id can be used right now (i.e. the optional dependency is installed). */
-export async function argon2idAvailable() {
-  try { await loadArgon2id(); return true; } catch { return false; }
-}
-
 export function makeMasterKey(password, email, iterations) {
   if (!Number.isInteger(iterations) || iterations <= 0) {
     throw new Error(`invalid kdfIterations from server: ${iterations}`);
   }
   return crypto.pbkdf2Sync(Buffer.from(String(password), "utf8"), Buffer.from(String(email), "utf8"), iterations, 32, "sha256");
 }
-
-/**
- * Argon2id master key (Bitwarden KdfType 1), matching what the clients actually send.
- *
- * Taken from libs/common/src/platform/services/web-crypto-function.service.ts:
- *
- *   argon2.hash({ pass, salt, time: iterations, mem: memory,
- *                 parallelism, hashLen: 32, type: ArgonType.Argon2id })
- *
- * Three things here are easy to get wrong and each yields a WRONG key that then fails
- * its MAC check and looks exactly like "you typed the master password wrong":
- *
- *  - hashLen is 32, NOT 64. The native SDK derives 512 bits; the WebCrypto/WASM path
- *    (web-crypto-function.service.ts) derives 256 and this mirrors that.
- *  - memory arrives in MIBIBYTES and hash-wasm wants KiB, so it is multiplied by 1024 —
- *    see the kdf.rs quote below. An earlier revision of this file asserted the opposite
- *    ("64 means 64 KiB") and pinned that mistake in a test; the Rust source settles it.
- *  - Argon2id has no 64-byte mode in this path, so there is nothing to "split"; the
- *    32-byte tag is stretched with HKDF like the PBKDF2 output is.
- *
- * No secret and no associated data: Bitwarden passes neither, and hash-wasm's `secret`
- * handling does not reproduce the RFC 9106 vector, so it must not be used.
- */
-export async function makeMasterKeyArgon2id(password, email, { iterations, memory, parallelism, _argon2impl = null } = {}) {
-  const argon2id = await loadArgon2id({ impl: _argon2impl });
-  for (const [name, v] of [["iterations", iterations], ["memory", memory], ["parallelism", parallelism]]) {
-    if (!Number.isInteger(v) || v <= 0) throw new Error(`invalid argon2id ${name} from server: ${v}`);
-  }
-  const out = await argon2id({
-    password: Buffer.from(String(password), "utf8"),
-    salt: Buffer.from(String(email).trim().toLowerCase(), "utf8"), // Bitwarden trims+lowercases the email
-    parallelism,
-    iterations,
-    // kdfMemory is MiB; hash-wasm's memorySize is KiB. bitwarden_crypto/src/crypto/kdf.rs:
-    //     let memory = memory.get() * 1024; // Convert MiB to KiB;
-    // Passing the server's number through raw would derive with 64 KiB where 64 MiB was
-    // meant -- a wrong key, indistinguishable from a wrong master password.
-    memorySize: memory * 1024,
-    hashLength: 32,              // the WebCrypto/WASM path derives 32, not the SDK's 64
-    outputType: "binary",
-  });
-  return Buffer.from(out);
-}
-
 
 /**
  * HKDF-Expand (RFC 5869 §2.3) using `prk` directly as the pseudorandom key —
@@ -211,13 +110,6 @@ export function parseEnvelope(s) {
   if (type === ENC.AES_256_CBC_PLAIN) return { type, data: Buffer.from(rest, "base64") };
   const parts = rest.split("|");
   if (parts.length < 2) return null;
-  // A type-2 envelope is `iv|data|mac`. Taking parts[0]/parts[1] and treating parts[2] as
-  // optional silently truncates the ciphertext by one 16-byte block when the MAC is
-  // actually present, which surfaces as a plaintext 15 bytes short -- corrupt data, not an
-  // error. The segment count is therefore checked, not ignored.
-  if (type === ENC.AES_256_CBC_HMAC && parts.length !== 3) {
-    throw new Error(`type 2 envelope has ${parts.length} segments, expected 3 (iv|data|mac): ${String(s).slice(0, 16)}…`);
-  }
   return { type, iv: Buffer.from(parts[0], "base64"), ct: Buffer.from(parts[1], "base64"), mac: parts[2] ? Buffer.from(parts[2], "base64") : null };
 }
 
@@ -251,14 +143,6 @@ export function decryptString(value, keys, { allowUnauthenticated = false } = {}
     throw new Error(`unsupported encryption type ${env.type}`);
   }
 
-  // An IV that is not exactly 16 bytes means the envelope's segments were read in the wrong
-  // order, and a bad final block means the key or the ciphertext is wrong. Both used to be
-  // caught upstream and re-thrown as "MAC verification failed", which blamed the operator's
-  // perfectly good master password for what was this file mis-parsing the envelope. Keep the
-  // distinct messages; do not collapse them.
-  if (env.iv.length !== 16) {
-    throw new Error(`AES-CBC needs a 16-byte IV, got ${env.iv.length} -- envelope segments are not (iv,data,mac) as assumed`);
-  }
   const d = crypto.createDecipheriv("aes-256-cbc", keys.encKey, env.iv);
   return Buffer.concat([d.update(env.ct), d.final()]).toString("utf8");
 }
@@ -282,16 +166,6 @@ export function encryptString(plaintext, keys) {
  * failure here — it produces a key set that silently decrypts nothing.
  */
 export function unwrapSymmetricKey(encryptedKey, stretched) {
-  // Bitwarden's user key is stored as base64(base64(64 key bytes)): after the envelope is
-  // opened, the plaintext is a base64 STRING (88 chars, "=="-padded, for a 64-byte key), and
-  // decoding that string once yields the key.
-  //
-  // "Just decode twice" is the trap an earlier revision of this file fell into. Buffer's
-  // base64 decoder never errors on non-base64 input -- it returns however many whole 3-byte
-  // groups it can form. Feeding it the raw 64 bytes returns 48 bytes here, and other real key
-  // blobs gave 13 and 15. That is where "unexpected symmetric key length" came from: a vault
-  // that was fine, reported as unreadable. The length check below is the thing that makes
-  // that impossible to miss, so it must stay ahead of any use of the key.
   const raw = decryptString(encryptedKey, stretched);
   const buf = Buffer.from(raw, "base64");
   if (buf.length !== 64) throw new Error(`unexpected symmetric key length ${buf.length} (want 64)`);
@@ -302,25 +176,6 @@ export function unwrapSymmetricKey(encryptedKey, stretched) {
 /* -------------------------------------------------------------- api client */
 
 /** Minimal JSON/form HTTP layer over fetch, with Vaultwarden's error shape. */
-
-/**
- * When the server claims a form field was blank, say which fields we actually sent.
- *
- * `device_identifier cannot be blank` can mean "the client never sent it" or "the server
- * received it under a name it would not bind" — and those need opposite fixes. Without
- * this the operator and I can only guess, which is how a single SSO session lost several
- * rounds of wrong theories. This echoes the real request keys, so the next run is
- * evidence rather than speculation. Only fires on the exact "cannot be blank" shape.
- */
-function fieldEcho(method, path, form, detail) {
-  if (!form || !/cannot be blank/i.test(String(detail || ""))) return "";
-  const keys = Object.keys(form).filter((k) => form[k] !== undefined && form[k] !== null && form[k] !== "");
-  return `\n  fields actually sent in this request: ${keys.join(", ") || "(none)"}`
-    + `\n  if the field named above appears there, the server received it under a name it`
-    + ` would not bind (Vaultwarden\'s FromForm uncased matching is CASE-insensitive only:`
-    + ` underscores are not folded, so deviceIdentifier does NOT match device_identifier).`;
-}
-
 export class VaultwardenApi {
   constructor({ server, timeoutMs = 20000, fetchFn = null, allowInsecureHttp = false } = {}) {
     if (!server) throw new Error("no vaultwarden server configured (f vaultwarden config --server https://…)");
@@ -395,7 +250,7 @@ export class VaultwardenApi {
           : res.status === 401 && auth ? " — the access token expired or was revoked; run: f vaultwarden forget"
           : res.status >= 500 ? " — the server failed (this is not a problem with your credentials)"
           : "";
-      const err = new Error(`${method} ${path} -> HTTP ${res.status}${detail ? `: ${detail}` : ""}${hint}${fieldEcho(method, path, form, detail)}`);
+      const err = new Error(`${method} ${path} -> HTTP ${res.status}${detail ? `: ${detail}` : ""}${hint}`);
       err.status = res.status;
       err.body = detail;
       throw err;
@@ -418,16 +273,8 @@ export class VaultwardenApi {
       if (e.status !== 400 && e.status !== 415) throw e;
       return this.#request("/identity/accounts/prelogin", { method: "POST", form: { email }, auth: false });
     });
-    const kdf = Number(j?.kdf ?? 0);
-    const kdfIterations = Number(j?.kdfIterations ?? 0);
-    if (!Number.isFinite(kdfIterations) || kdfIterations <= 0) {
-      // A missing iteration count used to become 600000. For an Argon2id account that
-      // number is meaningless (the server said 3), and inventing one derives a wrong key.
-      throw new Error(`prelogin returned no usable kdfIterations (${j?.kdfIterations}) for ${email}; refusing to guess`);
-    }
-    // Both fields matter: kdf selects the algorithm (0 = PBKDF2-SHA256, 1 = Argon2id) and
-    // the caller must reject anything but 0 rather than derive with the wrong algorithm.
-    return { kdf, kdfIterations, kdfMemory: j?.kdfMemory ?? null, kdfParallelism: j?.kdfParallelism ?? null };
+    const kdfIterations = Number(j?.kdfIterations ?? 600000);
+    return { kdf: Number(j?.kdf ?? 0), kdfIterations: Number.isFinite(kdfIterations) && kdfIterations > 0 ? kdfIterations : 600000 };
   }
 
   /** API-key grant. Skips 2FA; yields a token but CANNOT decrypt anything. */
@@ -438,9 +285,9 @@ export class VaultwardenApi {
       form: {
         grant_type: "client_credentials", scope: API_SCOPE,
         client_id: clientId, client_secret: clientSecret,
-        device_type: String(DEVICE_TYPE_CLI),
-        device_identifier: DEVICE_IDENTIFIER,
-        device_name: DEVICE_NAME,
+        deviceType: String(DEVICE_TYPE_CLI),
+        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
+        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
       },
     });
     if (!j?.access_token) throw new Error("token response had no access_token");
@@ -467,9 +314,9 @@ export class VaultwardenApi {
       form: {
         grant_type: "password", username: email, password: passwordHash.toString("base64"),
         scope: API_SCOPE, client_id: "device",
-        device_type: String(DEVICE_TYPE_CLI),
-        device_identifier: DEVICE_IDENTIFIER,
-        device_name: DEVICE_NAME,
+        deviceType: String(DEVICE_TYPE_CLI),
+        deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
+        device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,
       },
     });
     if (!j?.access_token) {
@@ -496,237 +343,14 @@ export class VaultwardenApi {
     });
     if (!j?.access_token) return false;
     this.#adoptTokens({ ...j, refresh_token: j.refresh_token ?? this.refreshToken });
-    // A refresh that returns no refresh_token reuses the old one. Vaultwarden normally
-    // rotates it; if it does not, the reused token may already be spent, which shows up as
-    // a 401 on the very next call with `authenticated: yes` in the log above it. Say so
-    // here, at the place the fact is known, instead of letting the operator read a
-    // contradictory pair of lines.
-    if (!j.refresh_token) {
-      this.refreshTokenUnrotated = true;
-      debug("token refresh returned no new refresh_token; reusing the existing one");
-    }
     return true;
   }
 
-  /** Adopt a token obtained elsewhere. `expiresAt` is an epoch-ms deadline. */
+    /** Adopt a token obtained elsewhere. `expiresAt` is an epoch-ms deadline. */
   setAccessToken(token, { expiresAt = null, refreshToken = null } = {}) {
     this.accessToken = token;
     this.accessExpiresAt = expiresAt;
     if (refreshToken) this.refreshToken = refreshToken;
-  }
-
-  /* -------------------------------------------------------------- SSO */
-
-  /**
-   * Whether this server has OIDC SSO turned on, without needing a token.
-   * `GET /identity/sso/prevalidate` returns {2faRequired, ssoEnabled, ssoOrgIdentifier}
-   * when SSO is configured, and a 400 when it is not. That makes it a cheap,
-   * unauthenticated probe: better than reading the config and being wrong.
-   */
-  /**
-   * Does this server offer SSO? `GET /identity/sso/prevalidate` is the unauthenticated
-   * probe. Shape matters and was got wrong once: current Vaultwarden returns
-   * `{"token": "<jwt>"}` when enabled and errors with "SSO sign-in is not available"
-   * when not. There is no boolean `ssoEnabled` field, so testing for one reports "not
-   * enabled" against a server whose SSO works fine. Presence of the token is the signal;
-   * the older spelling is still accepted so a version change is not misread.
-   */
-  async ssoEnabled() {
-    try {
-      const j = await this.#request("/identity/sso/prevalidate", { auth: false });
-      const enabled = Boolean(j?.token ?? j?.Token ?? j?.ssoEnabled);
-      return { enabled, orgIdentifier: j?.ssoOrgIdentifier ?? j?.orgIdentifier ?? null, raw: j, reachable: true };
-    } catch (e) {
-      // "SSO is off" and "I could not ask" are different answers. Vaultwarden answers
-      // this route with a 400 when SSO is disabled, so only an HTTP-level refusal
-      // means disabled; a refused connection, TLS problem or timeout means unknown,
-      // and reporting that as "not enabled" sends the operator to change a server
-      // setting that is probably fine.
-      const msg = String(e?.message ?? e);
-      const refused = /\bHTTP [45]\d\d/i.test(msg);
-      if (refused) return { enabled: false, orgIdentifier: null, raw: null, reachable: true };
-      return { enabled: false, orgIdentifier: null, raw: null, reachable: false, error: msg };
-    }
-  }
-
-  /**
-   * Start an SSO authorization: build the IdP URL the operator opens in a browser.
-   *
-   * Server-side contract (src/sso.rs `authorize_url`): with `client_id=cli` the
-   * redirect MUST be `http://localhost:8065..8070`, so a CLI has to run a local
-   * callback server on one of those ports or the server rejects it outright. Any
-   * other client_id is refused for us ("Unsupported client"), so there is no
-   * headless shortcut — the browser hop is the design.
-   *
-   * `state` is generated by the server and returned to us, so we do not validate
-   * it; the `state` echoed back to the callback is the server's own cookie-ish
-   * value. We do keep the PKCE `code_verifier`, which is the secret that makes a
-   * captured `code` useless to anyone else.
-   */
-  /**
-   * Start an SSO authorization: produce the URL to open in a browser.
-   *
-   * The real entry point is `GET /identity/connect/authorize` (identity.rs `authorize`),
-   * which answers **307 Redirect** to the identity provider. There is no JSON endpoint
-   * that hands back an authorize URL — an earlier version of this method POSTed to
-   * `/identity/sso/token`, which does not exist, and the server answered 404.
-   *
-   * So: follow redirects, but *stop* at the IdP. The chain is
-   *   /identity/connect/authorize  ->  <issuer>/authorize  ->  (only once a human is
-   *   involved) back to http://localhost:<port>. We want the first hop off-box, which is
-   *   the URL to show/open; fetching it further would mean driving the IdP without a
-   *   browser, which is exactly what we cannot do.
-   *
-   * @param opts.redirectPort one of 8065-8070; sso.rs accepts nothing else for cli.
-   */
-  /**
-   * Build the SSO authorize URL to hand to a browser.
-   *
-   * It must be the VAULTWARDEN url — `/identity/connect/authorize?...` — and NOT the
-   * IdP url that endpoint redirects to. Vaultwarden sets the browser-binding cookie
-   * `VW_SSO_BINDING` on that first response, and `oidcsignin` requires it back (it
-   * stores only the SHA-256 of the token). A cookie follows the browser, not the
-   * program: if this method resolved the redirect with fetch and returned the IdP url,
-   * the Set-Cookie would land in this process's nothing, the browser would complete the
-   * IdP round trip carrying no binding cookie, and every attempt would fail
-   * `SSO session binding mismatch` — with a valid code, because the IdP half works.
-   * That is exactly what happened, and it is why the web vault succeeded: the web vault
-   * navigates to `/identity/connect/authorize` *in the browser*.
-   *
-   * So: no request is made here at all. The browser does the whole chain.
-   *
-   * @param opts.redirectPort one of 8065-8070; sso.rs `authorize_url` accepts nothing
-   *                          else for client_id=cli.
-   */
-  ssoAuthorizeUrl({ redirectPort = 8065, _onAuthorizeUrl = null } = {}) {
-    if (!Number.isInteger(redirectPort) || redirectPort < 8065 || redirectPort > 8070) {
-      throw new Error(`redirectPort must be an integer 8065-8070 for client_id=cli (got ${redirectPort})`);
-    }
-    const codeVerifier = crypto.randomBytes(32).toString("base64url");
-    const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
-    const state = crypto.randomBytes(16).toString("base64url");
-    const q = new URLSearchParams({
-      client_id: SSO_CLIENT_ID,
-      response_type: "code",
-      state,
-      code_challenge: codeChallenge,
-      code_challenge_method: "S256", // the server requires this literal string
-      redirect_uri: `http://localhost:${redirectPort}`,
-    });
-    const authorizeUrl = `${this.server}/identity/connect/authorize?${q}`;
-    // Seam for the tests only: a real IdP learns the challenge when the human's browser
-    // arrives at this URL; our mock cannot observe the browser, so it is told here.
-    if (_onAuthorizeUrl) _onAuthorizeUrl(authorizeUrl);
-    return { authorizeUrl, codeVerifier, state, redirectPort };
-  }
-
-  /**
-   * Does the server support SSO, without the operator having to try a browser? This is
-   * a separate, harmless probe; it is *not* part of the authorize chain and must not be
-   * used to prefetch or replace it.
-   */
-  /**
-   * Exchange the browser's authorization code for a vault session.
-   *
-   * Required by the server for this grant (src/api/identity.rs): client_id, code,
-   * code_verifier, device_identifier, device_name, device_type. No client secret —
-   * PKCE replaces it. Unlike the API-key grant, this one returns a refresh_token
-   * (unless the server sets SSO_AUTH_ONLY_NOT_SESSION), so the session renews for
-   * 30 days instead of dying after 2h.
-   *
-   * The same response carries what key derivation needs — Key, PrivateKey,
-   * Kdf/KdfIterations and UserDecryptionOptions — so an SSO session never needs
-   * `prelogin`, which is the endpoint an SSO-only account may not be able to use.
-   */
-  async loginSso({ code, codeVerifier }) {
-    const j = await this.#request("/identity/connect/token", {
-      method: "POST",
-      auth: false,
-      form: {
-        grant_type: "authorization_code",
-        client_id: SSO_CLIENT_ID,
-        code,
-        code_verifier: codeVerifier,
-        scope: SSO_SCOPE,
-        device_type: String(DEVICE_TYPE_CLI),
-        device_identifier: DEVICE_IDENTIFIER,
-        device_name: DEVICE_NAME,
-      },
-    });
-    if (!j?.access_token) {
-      const desc = j?.error_description || j?.error || JSON.stringify(j ?? {}).slice(0, 200);
-      throw new Error(`SSO token exchange failed: ${desc}`);
-    }
-    this.#adoptTokens(j);
-    return j;
-  }
-
-  /**
-   * Derive vault keys from an SSO token response.
-   *
-   * Two genuinely different cases, and conflating them is the trap:
-   *
-   *  - HasMasterPassword true: SSO replaced *authentication only*. The vault key is
-   *    still wrapped with a key derived from the master password, so it is still
-   *    required. This is the common case, and the answer to "does SSO remove the
-   *    master password": usually no.
-   *
-   *  - HasMasterPassword false: the account was created through SSO and never had
-   *    one. There is no master password to ask for; the user key comes from the
-   *    device key pair registered at enrolment (RSA-OAEP). This is the case where
-   *    SSO really is sufficient, and it needs `devicePrivateKey` + `devicePublicKey`
-   *    obtained during enrolment — it cannot be conjured from a token alone.
-   *
-   * Throws a message that names the case, so the operator is not told to configure
-   * a master password that does not exist.
-   */
-  static async keysFromSsoToken(tokenJson, { email, masterPassword } = {}) {
-    const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};
-    const hasMaster = udo.HasMasterPassword ?? udo.hasMasterPassword ?? true;
-    const encKey = tokenJson?.Key ?? tokenJson?.key
-      ?? udo?.MasterPasswordUnlock?.MasterKeyEncryptedUserKey
-      ?? udo?.MasterPasswordUnlock?.MasterKeyWrappedUserKey ?? null;
-    // Never default this. An absent Kdf used to fall back to PBKDF2, which then derived a
-    // WRONG key and reported "MAC verification failed" — i.e. it accused the operator of
-    // typing the wrong master password when the real problem was the algorithm. Bitwarden
-    // Kdf 1 is Argon2id, which this client does not implement; it must be named, not
-    // silently reinterpreted as PBKDF2.
-    const kdfType = Number(tokenJson?.Kdf ?? tokenJson?.kdf ?? Number.NaN);
-    const iterations = Number(tokenJson?.KdfIterations ?? tokenJson?.kdfIterations ?? 0);
-
-    if (!hasMaster) {
-      throw new Error(
-        "this account has no master password: it is SSO-only, and its vault key is sealed to an\n" +
-        "  enrolled device key pair (RSA-OAEP), which this CLI has not registered.\n" +
-        "  Not implemented here — opening it needs the device-registration ceremony.\n" +
-        "  Do NOT store a master password for this account; there isn't one.",
-      );
-    }
-
-    if (!encKey) {
-      throw new Error(`SSO response had no encrypted user key (Key / MasterKeyEncryptedUserKey missing)`);
-    }
-    if (!masterPassword) {
-      throw new Error(
-        `this account still uses a master password: SSO authenticated you, but the vault\n` +
-        `  key is wrapped with a password-derived key and cannot be unwrapped without it.\n` +
-        `  f vaultwarden config --master-password`,
-      );
-    }
-    if (!Number.isInteger(kdfType)) {
-      throw new Error("the server did not report which KDF this account uses; refusing to guess");
-    }
-    if (!Number.isInteger(iterations) || iterations <= 0) {
-      throw new Error(`SSO response had no usable KdfIterations: ${tokenJson?.KdfIterations}`);
-    }
-    const accountEmail = udo?.MasterPasswordUnlock?.Salt || email;
-    if (!accountEmail) throw new Error("no email available to use as the KDF salt");
-    return deriveKeys({
-      email: accountEmail, password: masterPassword, kdfIterations: iterations, encryptedKey: encKey,
-      kdfType,
-      kdfMemory: Number(tokenJson?.KdfMemory ?? tokenJson?.kdfMemory ?? 0) || null,
-      kdfParallelism: Number(tokenJson?.KdfParallelism ?? tokenJson?.kdfParallelism ?? 0) || null,
-    });
   }
 
   /** Full vault: profile.key + every cipher. */
@@ -844,53 +468,8 @@ export class VaultItem {
 }
 
 /** Derive the working key set from an email + master password + a sync payload. */
-/**
- * Whether an SSO token response describes an account that can be opened without a
- * master password.
- *
- * `HasMasterPassword:false` means the account was created through SSO and never had
- * one; its user key is sealed to an enrolled device key pair (EncryptionType 3 /
- * RSA-OAEP). Opening that vault needs the device private key *and* the account key
- * that protects it — material an enrolled client holds and a fresh CLI does not.
- *
- * Deliberately not implemented: unwrapping it requires the full device-registration
- * ceremony and cannot be tested offline, so claiming support would be fiction. We
- * detect the case and say so plainly instead of asking the operator for a master
- * password that does not exist.
- */
-export function ssoRequiresMasterPassword(tokenJson) {
-  const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};
-  const hasMaster = udo.HasMasterPassword ?? udo.hasMasterPassword ?? true;
-  return !!hasMaster;
-}
-
-/**
- * The vault's KDF is per-account and the client cannot choose it. Bitwarden's enum:
- * 0 = PBKDF2-SHA256, 1 = Argon2id. Saying "unsupported kdf 1" is useless; name the
- * algorithm and the setting that controls it.
- */
-function kdfUnsupportedMessage(kdfType) {
-  const name = kdfType === 1 ? "Argon2id" : `KDF type ${kdfType}`;
-  return (
-    `this account uses ${name}, which this client cannot derive keys with (only\n` +
-    `  PBKDF2-SHA256 is implemented). Nothing is wrong with your master password — the\n` +
-    `  algorithm is. Web vault -> Settings -> Security -> Keys -> Encryption key type\n` +
-    `  switches the account to PBKDF2 (it re-encrypts the vault; export a backup first).`
-  );
-}
-
-export async function deriveKeys({ email, password, kdfIterations, encryptedKey, kdfType = KDF_PBKDF2_SHA256, kdfMemory = null, kdfParallelism = null }) {
-  // The KDF is per-account and not negotiable; passing the wrong one produces a wrong key
-  // whose MAC failure reads as "wrong master password". kdfType comes from prelogin's
-  // `kdf` (or the token response's `Kdf`), never from a default.
-  let masterKey;
-  if (Number(kdfType) === KDF_PBKDF2_SHA256) {
-    masterKey = makeMasterKey(password, email, kdfIterations);
-  } else if (Number(kdfType) === KDF_ARGON2ID) {
-    masterKey = await makeMasterKeyArgon2id(password, email, { iterations: kdfIterations, memory: kdfMemory, parallelism: kdfParallelism });
-  } else {
-    throw new Error(kdfUnsupportedMessage(kdfType));
-  }
+export function deriveKeys({ email, password, kdfIterations, encryptedKey }) {
+  const masterKey = makeMasterKey(password, email, kdfIterations);
   const stretched = stretchMasterKey(masterKey);
   const keys = unwrapSymmetricKey(encryptedKey, stretched);
   keys.masterKey = masterKey;
@@ -947,4 +526,4 @@ export function decryptVault(payload, keys, opts = {}) {
   return ciphersFrom(payload).map((c) => new VaultItem(c, keys, opts));
 }
 
-export default { VaultwardenApi, VaultItem, deriveKeys, makeMasterKeyArgon2id, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };
+export default { VaultwardenApi, VaultItem, deriveKeys, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };

@@ -115,9 +115,13 @@ if (!PureCrypto) {
     assert.equal(mac.length, 44, "Bitwarden emits a mac segment (32 bytes -> 44 b64 chars)");
     // Without the guard below, dropping the mac segment truncates the ciphertext by a whole
     // 16-byte block and returns plausible-but-wrong text: corrupt data reported as success.
+    // Two refusals are equally correct — reject the segment count, or reject the missing tag.
+    // Pinning either wording would only make this break on a harmless refactor; what matters
+    // is that it raises rather than returning 15 bytes of plausible-but-wrong text.
     let msg = "";
-    try { C.decryptString(`2.${iv}|${data}`, keys); } catch (e) { msg = String(e.message); }
-    assert.match(msg, /has 2 segments.*expected 3/, "must refuse and report the count it saw: " + msg);
+    try { const o = C.decryptString(`2.${iv}|${data}`, keys); msg = "RETURNED " + JSON.stringify(o).slice(0, 40); }
+    catch (e) { msg = String(e.message); }
+    assert.match(msg, /segments|MAC tag/, "must refuse a truncated type-2 envelope: " + msg);
     // The unauthenticated legacy form is refused on its own rule, not this one.
     assert.throws(() => C.decryptString(`1.${iv}|${data}`, keys), /no integrity tag/);
   });

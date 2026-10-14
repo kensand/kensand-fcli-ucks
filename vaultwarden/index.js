@@ -30,7 +30,7 @@ import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 
 import { uckMain } from "../../fcli-ucks/lib/uckmain.js";
 import {
@@ -39,10 +39,8 @@ import {
   decryptVault,
   decryptString,
   encryptString,
-  ssoRequiresMasterPassword,
   CIPHER_TYPE,
 } from "./lib/vwclient.js";
-import { captureSsoCode } from "./lib/sso-callback.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const F = path.join(process.env.HOME ?? "", ".f");
@@ -56,7 +54,6 @@ const C_CLIENT_SECRET = "vaultwarden.client-secret";
 const C_MASTER = "vaultwarden.master-password";
 const C_TOKEN = "vaultwarden.access-token";
 const C_REFRESH = "vaultwarden.refresh-token";
-const C_EXPIRES = "vaultwarden.access-expires-at";
 const C_KEY_CACHE = "vaultwarden.key-cache";
 
 /** How long a mirrored value may sit before `f creds` re-asks the vault. */
@@ -195,159 +192,6 @@ function credsRm(name) {
   }
 }
 
-/**
- * Best-effort browser launch for the SSO hop. Deliberately loud about failing:
- * on a headless box or a remote shell this cannot work, and silently doing nothing
- * would leave the operator staring at a listener that no browser will ever reach.
- * The URL is always printed regardless, so the flow is never blocked by this.
- */
-/**
- * Read the redirect URL (or a bare code) from the terminal, for the case where the
- * browser is on another device.
- *
- * Why this exists at all: the default flow listens on 127.0.0.1, so the redirect only
- * arrives if the browser's localhost *is* this machine. On SSH, in a container, or in
- * any terminal whose host has no browser, the operator opens the URL on a phone or
- * laptop and the redirect lands there instead. `--manual` prints the URL, waits for a
- * paste, and never binds a port.
- *
- * The pasted thing is whatever the browser shows after the redirect, which varies: a
- * URL with a query string, a bare code, or a page the operator paraphrased. So accept a
- * full URL, extract `code`, and otherwise treat the input as the code itself.
- *
- * The read is line-based and tolerant of a missing trailing newline, which is what a
- * terminal paste actually looks like when the operator hits Enter once.
- */
-async function ssoManualPrompt(authorizeUrl, port) {
-  const { createInterface } = await import("node:readline");
-  process.stderr.write(
-    "  1. open it in a browser ON THIS MACHINE\n"
-    + "  2. sign in there\n"
-    + "  3. the browser lands on a dead localhost URL — that is expected. Copy the\n"
-    + `     whole address bar (it starts with http://localhost:${port}/?code=…) and\n`
-    + "     paste it below\n"
-    + "\n"
-    + "  The flow is bound to a cookie set in the browser that opened the URL\n"
-    + "  (VW_SSO_BINDING), so open it where the redirect will be received. From a remote\n"
-    + "  terminal, forward the port and open it on your own machine — cookie and redirect\n"
-    + "  then share a browser, and the default (non-manual) flow works:\n"
-    + `     ssh -L ${port}:localhost:${port} <host>\n`
-    + "  Keep the browser and this terminal on the SAME machine: the authorize URL and\n"
-    + "  the redirect must share one cookie jar. If it fails, the server log\n"
-    + "  (docker logs <vault> around /identity/connect/oidc-signin) is the ground truth —\n"
-    + "  do not guess from the browser.\n"
-    + "\n"
-    + "Paste the redirect URL (or just the code), then press Enter:\n\n> ",
-  );
-
-  const rl = createInterface({ input: process.stdin, output: process.stderr, terminal: true });
-  let line;
-  try {
-    line = await new Promise((resolve, reject) => {
-      rl.question("", resolve);
-      rl.once("SIGINT", () => reject(new Error("cancelled — nothing was exchanged")));
-    });
-  } finally {
-    rl.close();
-  }
-
-  const raw = String(line ?? "").trim();
-  if (!raw) throw new Error("nothing pasted — nothing was exchanged");
-  // The browser may have been shown the server's JSON error rather than a redirect
-  // with a code. That error names the real problem, so surface it instead of the
-  // generic "could not find a code".
-  const serverError = extractSsoServerError(raw);
-  if (serverError) throw new Error(serverError);
-
-  const code = extractSsoCode(raw);
-  if (!code) {
-    throw new Error("could not find an authorization code in what you pasted\n  paste the full address-bar URL (http://localhost:…/?code=…) or the code value alone");
-  }
-  return code;
-}
-
-/**
- * Pull the code out of whatever the operator pasted. Deliberately forgiving about
- * shape and strict about content: a copied URL may carry the code first or last, may be
- * wrapped in quotes or angle brackets by a terminal, and may have the state appended.
- */
-/**
- * Recognise the server-side failures that arrive *in place of* a redirect.
- *
- * When the callback is rejected, Vaultwarden does not redirect at all: the browser is
- * left showing a JSON error body, which is what the operator has available to paste.
- * Reporting "no code found" there hides the only useful diagnostic, so match the
- * failures that have a known cause and say what it is.
- */
-export function extractSsoServerError(input) {
-  if (!/binding mismatch/i.test(input)) return null;
-  // `SSO session binding mismatch` is produced by oidcsignin_redirect when the
-  // VW_SSO_BINDING cookie is absent or does not hash to the stored value. Two distinct
-  // causes reach it, and they need different fixes, so both are offered.
-  return [
-    "the vault rejected the callback: SSO session binding mismatch",
-    "  Vaultwarden sets VW_SSO_BINDING on the /identity/connect/authorize response and",
-    "  requires the same token back at /identity/connect/oidc-signin. It only matches if",
-    "  the BROWSER that opened the authorize URL is the one that completes it — a cookie",
-    "  follows the browser, not the program. This CLI used to fetch that hop itself, which",
-    "  put the cookie in the wrong process; that is fixed, so if you still see this, the",
-    "  most likely cause is that the URL was opened somewhere other than where the redirect",
-    "  lands (a different browser, a remote machine, or a tab where it was pasted rather",
-    "  than followed — Sec-Fetch-Site: none in DevTools proves the paste case). From a",
-    "  remote terminal, forward the port and open the URL on your OWN machine so the cookie",
-    "  and the redirect share one browser: ssh -L 8065:localhost:8065 <host>, then run",
-    "  without --manual. Decode the state in the error if you need to know whose flow it",
-    "  is: 22 base64url chars is this CLI; the web vault's is longer and ends in",
-    "  '_identifier=' — they are separate sessions with separate binding cookies.",
-    "  Ground truth is the server log, not the browser: ask for the lines around the",
-    "  failing oidc-signin, and compare the request SEQUENCE of a WORKING web-vault login",
-    "  (it shows prevalidate then '=> 307') against the failing one. That diff settles what",
-    "  no browser header can.",
-  ].join("\n");
-}
-
-export function extractSsoCode(input) {
-  let t = input.trim().replace(/^["'<`]+|["'`>]+$/g, "");
-  // A full URL: take the query parameter, which is unambiguous when present.
-  if (/[?&]code=/i.test(t)) {
-    for (const part of t.split(/[?&]/)) {
-      const [k, v] = [part.slice(0, part.indexOf("=")), part.slice(part.indexOf("=") + 1)];
-      if (/^code$/i.test(k) && v) return decodeURIComponent(v);
-    }
-  }
-  // Bare code, possibly with stray whitespace or a trailing comma from a selection.
-  const bare = t.replace(/[,;\s]+$/, "");
-  return /^[A-Za-z0-9._~+/=-]{8,}$/.test(bare) ? bare : null;
-}
-
-function tryOpenBrowser(url) {
-  const cands = process.platform === "darwin"
-    ? [["open", [url]]]
-    : process.platform === "win32"
-      ? [["cmd", ["/c", "start", "", url]]]
-      : [["xdg-open", [url]]];
-  for (const [cmd, args] of cands) {
-    try {
-      // stdio fully detached: a browser helper that writes to stderr or blocks on
-      // stdin must not be able to wedge or delay this command.
-      const child = spawnDetached(cmd, args);
-      if (child) return true;
-    } catch { /* fall through to the message below */ }
-  }
-  process.stderr.write("  (no browser opened — copy the URL above into one that can reach your identity provider)\n");
-  return false;
-}
-
-function spawnDetached(cmd, args) {
-  const c = spawn(cmd, args, { stdio: "ignore", detached: true });
-  // A missing xdg-open surfaces here, not as a throw: spawn() reports ENOENT
-  // asynchronously, so the return value alone cannot tell success from failure.
-  let ok = true;
-  c.on("error", () => { ok = false; });
-  c.unref();
-  return ok ? c : null;
-}
-
 function credsStatus() {
   try {
     const out = execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, F_CREDS_NO_PROVIDER: "1" } });
@@ -457,48 +301,6 @@ function namesForItem(item, cfg) {
  * Order: cached derived keys -> API-key token + master password -> error with
  * the exact thing to fix. Never attempts a password grant (see file header).
  */
-/**
- * The account's own KDF parameters, as reported by prelogin.
- *
- * The KDF is per-account: the client cannot choose it, and using the wrong one derives a
- * wrong key whose MAC failure reads as "wrong master password" — which is what an earlier
- * version of this file did to a real user, because prelogin()'s kdf type was discarded and
- * PBKDF2 was assumed. Both algorithms are now followed. kdfMemory is in KiB and is passed
- * through unchanged: a server reporting 64 means 64 KiB, not 64 MiB.
- */
-function kdfConfigFor(pre, email) {
-  const kdfType = Number(pre?.kdf ?? 0);
-  const iterations = Number(pre?.kdfIterations ?? 0);
-  if (!Number.isInteger(iterations) || iterations <= 0) throw new Error(`prelogin gave no usable kdfIterations (${pre?.kdfIterations}) for ${email}`);
-  if (kdfType === 0) return { kdfType, kdfIterations };
-  if (kdfType === 1) {
-    const memory = Number(pre?.kdfMemory ?? 0);
-    const parallelism = Number(pre?.kdfParallelism ?? 0);
-    if (!Number.isInteger(memory) || memory <= 0 || !Number.isInteger(parallelism) || parallelism <= 0) {
-      throw new Error(`prelogin reported Argon2id without usable memory/parallelism (memory=${pre?.kdfMemory}, parallelism=${pre?.kdfParallelism})`);
-    }
-    return { kdfType, kdfIterations, kdfMemory: memory, kdfParallelism: parallelism };
-  }
-  throw new Error(
-    `this account uses an unsupported KDF type ${kdfType}; only PBKDF2-SHA256 (0) and Argon2id (1) are implemented`,
-  );
-}
-
-/**
- * Store the session tokens and how long the access token is good for.
- *
- * Vaultwarden rotates refresh tokens, and a rotated one is single-use: a refresh whose new
- * token is not persisted immediately is a refresh token burned. Saving it only at the end
- * of a successful login left a real user with invalid_grant — the run spent the token, hit
- * an error in a later step, and never stored the replacement. So persist first, and record
- * `expires-at` so a later run can tell an aged-out token from a revoked one.
- */
-function persistSsoTokens(api) {
-  if (api.accessToken) credsSet(C_TOKEN, api.accessToken);
-  if (api.refreshToken) credsSet(C_REFRESH, api.refreshToken);
-  if (api.accessExpiresAt) credsSet(C_EXPIRES, String(api.accessExpiresAt));
-}
-
 async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp = false } = {}) {
   const cfg = vwConfig();
   if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
@@ -519,66 +321,18 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     if (hit) return { api, cfg, keys: hit.keys, items: decryptVault(hit.payload, hit.keys), fromCache: true };
   }
 
-  // An SSO login left a refreshable token in the store. Use it before demanding an API
-  // key: `sso login` mints one valid for ~30 days, and refusing to read it made an SSO
-  // user configure credentials they did not need.
-  const ssoAccess = credsGet(C_TOKEN);
-  const ssoRefresh = credsGet(C_REFRESH);
-  const master = credsGet(cfg.masterPasswordCred);
-  if ((ssoAccess || ssoRefresh) && master) {
-    api.setAccessToken(ssoAccess, { refreshToken: ssoRefresh });
-    // Prove the token is still good before spending ~1s on PBKDF2, and refresh once if
-    // the access token has aged out — this is the whole point of SSO having a refresh token.
-    // NOTE: refresh() consumes the refresh token. Vaultwarden rotates them by default, so
-    // a refresh that is not persisted immediately burns the token — a later run then gets
-    // invalid_grant. Do not call refresh() speculatively; only do it when the bearer token
-    // actually failed, and store the replacement before anything else can throw.
-    let payload = await api.ciphers().catch(async (e) => {
-      if (!/HTTP 401|HTTP 403/.test(String(e?.message))) throw e;
-      const refreshed = await api.refresh().catch((e2) => {
-        process.stderr.write(`token refresh failed: ${String(e2.message).split("\n")[0].slice(0, 120)}\n`);
-        return false;
-      });
-      if (!refreshed) return null;
-      persistSsoTokens(api);
-      return await api.ciphers().catch(() => null);
-    });
-    if (payload) {
-      // Keys come from prelogin + sync + master password, exactly as the API-key path
-      // does them: prelogin yields only KDF params, and the wrapped user key is
-      // sync.profile.key. SSO authenticates; it does not replace the master password,
-      // which is why this branch requires `master`.
-      try {
-        const pre = await api.prelogin(cfg.email);
-        const kdfCfg = kdfConfigFor(pre, cfg.email);
-        const sync = await api.sync();
-        const encKey = sync?.profile?.key;
-        if (!encKey) throw new Error("sync returned no profile.key");
-        const keys = await deriveKeys({ email: cfg.email, password: master, encryptedKey: encKey, ...kdfCfg });
-        await writeKeyCache(cfg, keys, api);
-        const items = decryptVault(payload, keys);
-        return { api, cfg, keys, items: items.length ? items : decryptVault(sync, keys), fromCache: false };
-      } catch (e) {
-        const m = String(e.message ?? e);
-        // Distinguish "your master password is wrong" from "the token was fine but
-        // something else failed": falling through to an unrelated "no API key stored"
-        // is what sent an operator off to create an API key they did not need.
-        throw new Error(
-          (/MAC verification failed/.test(m)
-            ? `the SSO session works but the stored master password does not unlock the vault — do not retry blindly, retype it:`
-            : `the SSO session works but the vault could not be opened: ${m.split("\n")[0]}\n  `) +
-          `  f vaultwarden config --master-password`,
-        );
-      }
-    }
-    // Nothing usable was said, so fall through to the API key below.
-  }
-
   const clientId = credsGet(C_CLIENT_ID);
   const clientSecret = credsGet(C_CLIENT_SECRET);
-  // Master password first, and before the API-key check: without it nothing decrypts,
-  // whether the token comes from SSO or from an API key. Checking the key first made this
-  // message unreachable for the common "no API key yet" case.
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      `no API key stored, and a master password alone cannot obtain a token\n` +
+      `  web vault -> Settings -> Security -> Keys -> API key:\n` +
+      `  f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
+      `  f creds set ${C_CLIENT_SECRET} '<client secret>'\n` +
+      `  (the API key exists to skip 2FA; it cannot decrypt anything by itself)`,
+    );
+  }
+  const master = credsGet(cfg.masterPasswordCred);
   if (!master) {
     throw new Error(
       `no master password stored — the vault cannot be decrypted without one\n` +
@@ -587,32 +341,15 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
       `  with a key derived from the master password, which the API key cannot replace.`,
     );
   }
-  if (!clientId || !clientSecret) {
-    const ssoOnly = !!(ssoAccess || ssoRefresh);
-    throw new Error(
-      ssoOnly
-        // The operator HAS an SSO session; "no API key stored" sent them off to configure
-        // credentials they did not need. Say what actually happened: the token is spent.
-        ? `the stored SSO session could not be used (expired or revoked) and there is no API key to fall back on\n` +
-          `  f vaultwarden sso login        (re-authenticate; the master password is already stored)`
-        : `no API key stored, and a master password alone cannot obtain a token\n` +
-          `  web vault -> Settings -> Security -> Keys -> API key:\n` +
-          `  f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
-          `  f creds set ${C_CLIENT_SECRET} '<client secret>'\n` +
-          `  or, if this account uses single sign-on:\n` +
-          `  f vaultwarden sso login\n` +
-          `  (the API key exists to skip 2FA; it cannot decrypt anything by itself)`,
-    );
-  }
+
   await api.loginApiKey({ clientId, clientSecret });
   const pre = await api.prelogin(cfg.email);
-  const kdfCfg = kdfConfigFor(pre, cfg.email);
   const sync = await api.sync();
   const encKey = sync?.profile?.key;
   if (!encKey) throw new Error(`sync returned no profile.key — account may not be set up, or the token lacks vault scope`);
   let keys;
   try {
-    keys = await deriveKeys({ email: cfg.email, password: master, encryptedKey: encKey, ...kdfCfg });
+    keys = deriveKeys({ email: cfg.email, password: master, kdfIterations: pre.kdfIterations, encryptedKey: encKey });
   } catch (e) {
     if (/MAC verification failed/.test(String(e.message))) {
       throw new Error(`master password is wrong (key unwrap failed MAC check) — do not retry blindly, retype it: f vaultwarden config --master-password`);
@@ -911,29 +648,13 @@ const USAGE =
   "  set-totp <name> <secret>          WRITE: store a TOTP secret on an item\n" +
   "  cache [--clear]                   vault key cache (skips PBKDF2 per read)\n" +
   "  forget                            clear the key cache and cached tokens\n" +
-  "  sso status                        does the server have OIDC SSO enabled\n" +
-  "                                    (unauthenticated probe)\n" +
-  "  sso login [--port <8065-8070>]    sign in through the identity provider in a\n" +
-  "      [--timeout <sec>] [--force]   browser, then exchange the PKCE code.\n" +
-  "                                    --force skips the 'is SSO enabled' probe\n" +
-  "  sso login --manual                same, but binds no port: open the URL on any\n" +
-  "                                    device, then paste the redirect URL (or just\n" +
-  "                                    the code) back here. Use over ssh, in a\n" +
-  "                                    container, or wherever the browser's localhost\n" +
-  "                                    is not this machine.\n" +
   "\n" +
   "name forms: 'github.com'  'Item Name'  'Item Name::username'  '<cred>::totp'\n" +
   "fields:     password (default) | username | totp | note | uri | field:<name>\n" +
   "\n" +
   "as a credential provider: `f creds get <name>` falls through to this uck on a\n" +
-  "local miss and mirrors the answer as mirror:<name> for " + (MIRROR_TTL_SEC / 60) + "m.\n" +
-  "\n" +
-  "on sso: it replaces the *login*, never the *decryption*. The vault key stays\n" +
-  "wrapped in a key derived from the master password, which no SSO token carries, so\n" +
-  "the master password is still needed unless the account genuinely has none. What\n" +
-  "SSO does buy: it works when the server sets SSO_ONLY and refuses password logins,\n" +
-  "and it yields a refresh_token, so the session renews for ~30 days without a browser\n" +
-  "— an API key gives you neither.\n";
+  "local miss and mirrors the answer as mirror:<name> for " + MIRROR_TTL_SEC / 60 + "m.\n" +
+  "A master password is unavoidable — an API key authenticates but cannot decrypt.\n";
 
 export function register(ctx) {
   return {
@@ -948,7 +669,6 @@ export function register(ctx) {
 /* Flags that take a value. Kept explicit so parsing is unambiguous. */
 const VALUE_FLAGS = new Set([
   "--server", "--email", "--search", "--ttl", "--iterations", "--field", "--map",
-  "--port", "--timeout",
 ]);
 
 async function main(argv) {
@@ -1176,100 +896,6 @@ async function main(argv) {
       credsRm(C_TOKEN);
       credsRm(C_REFRESH);
       process.stdout.write("cleared\tkey cache + cached tokens (master password and api key kept)\n");
-      break;
-    }
-    case "sso": {
-      const sub = rest[0];
-      if (sub === "status") {
-        const cfg = vwConfig();
-        if (!cfg.server) return usage("sso needs a server first: f vaultwarden config --server https://vault.example.com");
-        const api = new VaultwardenApi({ server: cfg.server, timeoutMs: cfg.timeoutMs, allowInsecureHttp: !!cfg.allowInsecureHttp });
-        const st = await api.ssoEnabled();
-        if (!st.reachable) {
-          process.stdout.write("sso\tunknown (could not reach the server)\n");
-          process.stdout.write(`error\t${st.error}\n`);
-          break;
-        }
-        process.stdout.write(`sso\t${st.enabled ? "enabled" : "not enabled on this server"}\n`);
-        if (st.orgIdentifier) process.stdout.write(`org\t${st.orgIdentifier}\n`);
-        if (!st.enabled) {
-          process.stdout.write("note\tthe server refused /identity/sso/prevalidate, which is what a server with SSO_ENABLED=false does\n");
-          process.stdout.write("hint\tuse it anyway with: f vaultwarden sso login --force\n");
-        }
-        break;
-      }
-      if (sub === "login" || sub === undefined) {
-        const cfg = vwConfig();
-        if (!cfg.server) return usage("sso needs a server first: f vaultwarden config --server https://vault.example.com");
-        const api = new VaultwardenApi({ server: cfg.server, email: cfg.email, timeoutMs: cfg.timeoutMs, allowInsecureHttp: !!cfg.allowInsecureHttp });
-
-        // Confirm SSO unless told to skip the check. prevalidate is unauthenticated
-        // and cheap, and failing here beats sending a human to a browser for nothing.
-        if (!has("force")) {
-          const st = await api.ssoEnabled();
-          if (!st.enabled) {
-            return usage(`this server does not report SSO as enabled (${cfg.server})\n  re-run with --force if you know it is configured, or check SSO_ENABLED on the server`);
-          }
-        }
-
-        // Two ways to get the code back, and which one applies depends on where the
-        // browser is relative to this process -- see ssoManual below for the case that
-        // decides it. Default keeps the listener; --manual never binds a port.
-        const manual = has("manual");
-        const port = Number(has("port") ? flagVal("port") : 8065);
-        const { authorizeUrl, codeVerifier } = api.ssoAuthorizeUrl({ redirectPort: port });
-
-        process.stderr.write("\nOpen this URL to sign in with your identity provider:\n\n");
-        process.stderr.write(`  ${authorizeUrl}\n\n`);
-
-        let code;
-        if (manual) {
-          code = await ssoManualPrompt(authorizeUrl, port);
-        } else {
-          process.stderr.write(`Waiting for the redirect on http://localhost:${port} …\n`);
-          process.stderr.write("  (on a machine with no browser, or one whose localhost is not this machine, re-run with --manual)\n");
-          // Only useful when a browser can reach this host. Stated, not assumed.
-          tryOpenBrowser(authorizeUrl);
-          code = await captureSsoCode({
-            expectedState: null,
-            timeoutMs: has("timeout") ? Number(flagVal("timeout")) * 1000 : 180_000,
-            log: (bound) => process.stderr.write(`  listening on ${bound}\n`),
-          });
-        }
-
-        const tok = await api.loginSso({ code, codeVerifier });
-        const hasMaster = ssoRequiresMasterPassword(tok);
-        process.stdout.write(`authenticated\tyes${hasMaster ? " (master password still needed to decrypt)" : " (no master password on this account)"}\n`);
-        process.stdout.write(`refresh token\t${api.refreshToken ? "yes — sessions renew without a browser for ~30 days" : "no"}\n`);
-        if (tok?.KdfIterations) process.stdout.write(`kdf\tpbkdf2-sha256 ${tok.KdfIterations} iterations\n`);
-
-        // Persist the session, but never the master password: that stays in `f creds`
-        // where it belongs, entered through its own prompt.
-        credsSet(C_TOKEN, api.accessToken);
-        persistSsoTokens(api);
-
-        if (hasMaster) {
-          try {
-            const keys = await VaultwardenApi.keysFromSsoToken(tok, { email: cfg.email, masterPassword: credsGet(cfg.masterPasswordCred) });
-            await writeKeyCache(cfg, keys, api);
-            process.stdout.write("key cache\tprimed — later reads skip PBKDF2\n");
-          } catch (e) {
-            const m = String(e.message ?? e);
-            if (/no master password stored|still uses a master password/.test(m)) {
-              process.stdout.write(`next\t${m.split("\n")[0]}\n`);
-              process.stdout.write("run\tf vaultwarden config --master-password\n");
-            } else if (/no master password: it is SSO-only/.test(m)) {
-              process.stdout.write(`blocked\t${m.split("\n")[0]}\n`);
-            } else {
-              throw e;
-            }
-          }
-        } else {
-          process.stdout.write("note\tthis account has no master password; opening it needs an enrolled device key pair, which this uck does not do\n");
-        }
-        break;
-      }
-      usage(`unknown sso subcommand: ${sub}`);
       break;
     }
     default:
