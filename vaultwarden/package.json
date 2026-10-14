@@ -1,5 +1,10 @@
 {
-  "dependencies": {
+  "dependencies": {},
+  "name": "@fcli/uck-vaultwarden",
+  "version": "0.1.0",
+  "description": "f vaultwarden: native Vaultwarden client (PBKDF2 + Argon2id)",
+  "type": "module",
+  "optionalDependencies": {
     "hash-wasm": "^4.12.0"
   }
 }
