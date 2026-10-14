@@ -50,18 +50,30 @@ const sym = crypto.randomBytes(32), symMac = crypto.randomBytes(32);
 const enc = (p) => {
   const iv = crypto.randomBytes(16);
   const c = crypto.createCipheriv("aes-256-cbc", sym, iv);
-  const ct = Buffer.concat([c.update(Buffer.from(String(p))), c.final()]);
+  // Buffers must go through unmodified. Buffer.from(String(buffer)) stringifies byte-wise into
+  // UTF-8, and every byte >= 0x80 becomes U+FFFD -- so a 64-byte random key arrived as ~121
+  // bytes here, which is how the mock stopped matching the real server it is meant to imitate.
+  const data = Buffer.isBuffer(p) ? p : Buffer.from(String(p), "utf8");
+  const ct = Buffer.concat([c.update(data), c.final()]);
   const tag = crypto.createHmac("sha256", symMac).update(iv).update(ct).digest();
   return `2.${b64(iv)}|${b64(ct)}|${b64(tag)}`;
 };
 const encWith = (encKey, macKey, p) => {
   const iv = crypto.randomBytes(16);
   const c = crypto.createCipheriv("aes-256-cbc", encKey, iv);
-  const ct = Buffer.concat([c.update(Buffer.from(String(p))), c.final()]);
+  // Same rule as enc() above, and the reason it needs stating twice: the FIRST time this was
+  // fixed it was fixed in enc(), and this function -- the one that actually builds the profile
+  // key -- kept corrupting high bytes. A wrong helper is worse than no helper.
+  const data = Buffer.isBuffer(p) ? p : Buffer.from(String(p), "utf8");
+  const ct = Buffer.concat([c.update(data), c.final()]);
   const tag = crypto.createHmac("sha256", macKey).update(iv).update(ct).digest();
   return `2.${b64(iv)}|${b64(ct)}|${b64(tag)}`;
 };
-const profileKey = encWith(st.enc, st.mac, b64(Buffer.concat([sym, symMac])));
+// The wrapped user key holds the 64 RAW key bytes, not their base64 -- pinned against a real
+// Vaultwarden account, whose profile.key decrypts to a plaintext beginning 0x01 0x9E 0xAC.
+// Wrapping base64 here (as this line used to) makes the mock disagree with the server and lets
+// a client that cannot read a real vault pass the whole suite.
+const profileKey = encWith(st.enc, st.mac, Buffer.concat([sym, symMac]));
 
 const login = (id, name, { user, pass, totp, uris = [], fields = [] }) => ({
   id, organizationId: null, folderId: null, type: 1, favorite: false,

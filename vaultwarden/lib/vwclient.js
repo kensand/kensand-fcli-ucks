@@ -142,6 +142,27 @@ function tagEqual(a, b) {
  * Returns undefined for null/empty input (many optional fields are absent).
  * Throws on a MAC mismatch — that is a wrong key, not corrupted data.
  */
+/**
+ * Decrypt to raw BYTES. The text API cannot be used for binary payloads: it returns a utf8 JS
+ * string, so any byte >= 0x80 is lost -- which is exactly how the wrapped user key stopped
+ * being readable. Anything that is not text (the user key, attachments) must use this.
+ */
+export function decryptBytes(encrypted, keys) {
+  const env = parseEnvelope(encrypted);
+  if (!env) throw new Error(`unrecognised ciphertext envelope: ${String(encrypted).slice(0, 24)}…`);
+  if (env.iv.length !== 16) throw new Error(`ciphertext envelope has a ${env.iv.length}-byte IV (want 16) — refusing`);
+  if (env.type === ENC.AES_128_CBC) throw new Error("type 1 ciphertext has no integrity tag — refusing (pass --allow-insecure-crypto if you really must)");
+  if (env.type !== ENC.AES_256_CBC_HMAC) {
+    if (env.type === ENC.AES_256_CBC_PLAIN) return env.data;
+    throw new Error(`unsupported encryption type ${env.type}`);
+  }
+  if (!env.mac) throw new Error(`type-2 ciphertext missing its MAC tag: ${String(encrypted).slice(0, 24)}…`);
+  const want = crypto.createHmac("sha256", keys.macKey).update(env.iv).update(env.ct).digest();
+  if (!tagEqual(want, env.mac)) throw new Error("MAC verification failed (wrong key, or tampered ciphertext)");
+  const d = crypto.createDecipheriv("aes-256-cbc", keys.encKey, env.iv);
+  return Buffer.concat([d.update(env.ct), d.final()]);
+}
+
 export function decryptString(value, keys, { allowUnauthenticated = false } = {}) {
   if (value == null || value === "") return undefined;
   const env = parseEnvelope(value);
@@ -184,9 +205,42 @@ export function encryptString(plaintext, keys) {
  * failure here — it produces a key set that silently decrypts nothing.
  */
 export function unwrapSymmetricKey(encryptedKey, stretched) {
-  const raw = decryptString(encryptedKey, stretched);
-  const buf = Buffer.from(raw, "base64");
-  if (buf.length !== 64) throw new Error(`unexpected symmetric key length ${buf.length} (want 64)`);
+  // The wrapped user key decrypts to 64 RAW key bytes -- enc(32) || mac(32). Not base64, and
+  // not "base64 of base64": measured against a real Vaultwarden, `sync.profile.key` and
+  // `userDecryption.masterPasswordUnlock.masterKeyEncryptedUserKey` are the same envelope and
+  // its plaintext begins 0x01 0x9E 0xAC ... (raw binary). Both earlier guesses here -- "double
+  // base64", then "88 chars of base64" -- came from reading a spec page instead of the bytes,
+  // and both would have been caught by one real account, which is what the fixture in
+  // test/crypto.test.mjs now is.
+  //
+  // Verify the MAC on the CIPHERTEXT first, exactly as Bitwarden does, and only then decrypt.
+  // Decrypting first -- which this function used to do via decryptString -- destroys the
+  // distinction that matters: with the wrong master key the CBC plaintext is random, so
+  // PKCS#7 unpadding throws here, and the operator sees
+  //     unexpected symmetric key length 13 (want 64)
+  // for what is actually a wrong master password. That message cost hours: it was read as a
+  // vault-shape bug on a server nobody could inspect, while the password was correct all
+  // along and the real fault was the order of these two operations.
+  const env = parseEnvelope(encryptedKey);
+  if (!env) throw new Error(`unrecognised wrapped-key envelope: ${String(encryptedKey).slice(0, 24)}…`);
+  if (env.type !== ENC.AES_256_CBC_HMAC) {
+    if (env.type === ENC.AES_128_CBC) throw new Error("wrapped key uses unauthenticated type 1 ciphertext — refusing (pass --allow-insecure-crypto if you really must)");
+    throw new Error(`unsupported wrapped-key encryption type ${env.type}`);
+  }
+  if (!env.mac) throw new Error("wrapped key has no MAC tag");
+  const want = crypto.createHmac("sha256", stretched.macKey).update(env.iv).update(env.ct).digest();
+  if (!tagEqual(want, env.mac)) throw new Error("MAC verification failed (wrong key, or tampered ciphertext)");
+
+  const d = crypto.createDecipheriv("aes-256-cbc", stretched.encKey, env.iv);
+  // Keep this BINARY. The plaintext is 64 raw key bytes, not text and not base64: converting
+  // it with toString("utf8") replaces every byte above 0x7F with U+FFFD, and re-decoding that
+  // damaged string yields 13 bytes. That is where the "unexpected symmetric key length 13"
+  // that haunted this uck actually came from -- not a weird vault shape, not a wrong master
+  // password, but a Buffer->string round trip through UTF-8. Verified against a real Vaultwarden.
+  const buf = Buffer.concat([d.update(env.ct), d.final()]);
+  if (buf.length !== 64) {
+    throw new Error(`unexpected symmetric key length ${buf.length} (want 64)`);
+  }
   const encKey = buf.subarray(0, 32);
   return { encKey, macKey: buf.subarray(32, 64), symmetricKey: encKey };
 }

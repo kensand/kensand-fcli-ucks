@@ -58,7 +58,11 @@ function refStretch(masterKey) {
 function refEncrypt(plaintext, encKey, macKey) {
   const iv = crypto.randomBytes(16);
   const c = crypto.createCipheriv("aes-256-cbc", encKey, iv);
-  const ct = Buffer.concat([c.update(Buffer.from(String(plaintext), "utf8")), c.final()]);
+  // Accept raw Buffers as well as strings. String(buffer) stringifies byte-wise into UTF-8 and
+  // silently corrupts anything >= 0x80 -- the exact defect that made a real vault unreadable in
+  // lib/vwclient.js, so the reference side must not repeat it.
+  const data = Buffer.isBuffer(plaintext) ? plaintext : Buffer.from(String(plaintext), "utf8");
+  const ct = Buffer.concat([c.update(data), c.final()]);
   const mac = crypto.createHmac("sha256", macKey).update(iv).update(ct).digest();
   return `2.${b64(iv)}|${b64(ct)}|${b64(mac)}`;
 }
@@ -74,7 +78,14 @@ const stretched = refStretch(masterKey);
 const symmetricKey = crypto.randomBytes(32);
 const macKey = crypto.randomBytes(32);
 const symBlob = Buffer.concat([symmetricKey, macKey]);
-const profileKey = refEncrypt(b64(symBlob), stretched.enc, stretched.mac);
+// The real shape, measured against a live Vaultwarden account: the wrapped user key
+// encrypts the 64 RAW key bytes, NOT their base64. The old version of this line was
+//     refEncrypt(b64(symBlob), ...)
+// which is 88 bytes of base64 text, so unwrapSymmetricKey had to base64-decode to pass -- and
+// every test stayed green while the client could not open a real vault (the raw 64 bytes came
+// back as 88 after that decode). A fixture that agrees with the code it tests proves nothing;
+// this one is pinned to server-observed bytes.
+const profileKey = refEncrypt(symBlob, stretched.enc, stretched.mac);
 
 const vault = {
   profile: { id: "user-1", key: profileKey, privateKey: null },
@@ -175,6 +186,41 @@ await t("rejected kdfIterations", () => {
 await t("masterPasswordHash = HMAC-SHA256(masterKey, password)", () => {
   const ref = crypto.createHmac("sha256", masterKey).update(Buffer.from(PASSWORD)).digest();
   assert.deepEqual([...C.masterPasswordHash(masterKey, PASSWORD)], [...ref]);
+});
+
+await t("a wrapped key with high bytes survives (no UTF-8 round trip)", () => {
+  // The bug this pins: unwrapSymmetricKey used to do
+  //     Buffer.concat(...).toString("utf8") then Buffer.from(_, "base64")
+  // A real user key is 64 RAW BYTES, and every byte >= 0x80 becomes U+FFFD through UTF-8, so
+  // the re-decode yielded 13 bytes and the vault was reported unreadable -- with a message
+  // ("unexpected symmetric key length 13") that reads like a vault-shape problem and was in
+  // fact a Buffer->string round trip. Measured against a real Vaultwarden account whose key
+  // begins 0x01 0x9E 0xAC ..., so more than half its bytes are >= 0x80 and any lossy
+  // conversion changes the length, not just the value. Fixtures here must include high bytes
+  // or they cannot catch it: a key made of ASCII-only bytes round-trips happily through UTF-8.
+  const raw = Buffer.concat([Buffer.from([0x01]), crypto.randomBytes(63)]);
+  assert.ok([...raw].some((b) => b >= 0x80), "fixture must contain high bytes to be meaningful");
+  // Wrap the RAW bytes, as the server does -- base64-ing them first reproduces the very
+  // misunderstanding this test exists to prevent (and yields 88 bytes, which is how the
+  // failure looked when it did).
+  const wrapped = refEncrypt(raw, stretched.enc, stretched.mac);
+  const keys = C.unwrapSymmetricKey(wrapped, { encKey: stretched.enc, macKey: stretched.mac });
+  assert.ok(Buffer.compare(keys.encKey, raw.subarray(0, 32)) === 0, "encKey must survive byte-for-byte");
+  assert.ok(Buffer.compare(keys.macKey, raw.subarray(32, 64)) === 0, "macKey must survive byte-for-byte");
+  // The UTF-8 path specifically: prove the old approach really does lose bytes on this input.
+  const damaged = Buffer.from(Buffer.from(raw).toString("utf8"), "base64");
+  assert.notEqual(damaged.length, 64, "if this ever equals 64 the fixture lost its high bytes");
+});
+
+await t("MAC is verified before decryption, so a wrong key says so", () => {
+  // Decrypt-first hides a wrong key behind a PKCS#7 padding failure, which surfaces as a key
+  // LENGTH error and misdirects the operator. Verify-then-decrypt is Bitwarden's order.
+  const wrongStretched = C.stretchMasterKey(crypto.randomBytes(32));
+  assert.throws(
+    () => C.unwrapSymmetricKey(vault.profile.key, { encKey: wrongStretched.encKey, macKey: wrongStretched.macKey }),
+    /MAC verification failed/,
+    "a wrong key must be reported as such, not as an unexpected length",
+  );
 });
 
 await t("unwrapSymmetricKey yields the 32+32 key pair", () => {
