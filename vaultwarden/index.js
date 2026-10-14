@@ -56,6 +56,7 @@ const C_CLIENT_SECRET = "vaultwarden.client-secret";
 const C_MASTER = "vaultwarden.master-password";
 const C_TOKEN = "vaultwarden.access-token";
 const C_REFRESH = "vaultwarden.refresh-token";
+const C_EXPIRES = "vaultwarden.access-expires-at";
 const C_KEY_CACHE = "vaultwarden.key-cache";
 
 /** How long a mirrored value may sit before `f creds` re-asks the vault. */
@@ -483,6 +484,21 @@ function kdfConfigFor(pre, email) {
   );
 }
 
+/**
+ * Store the session tokens and how long the access token is good for.
+ *
+ * Vaultwarden rotates refresh tokens, and a rotated one is single-use: a refresh whose new
+ * token is not persisted immediately is a refresh token burned. Saving it only at the end
+ * of a successful login left a real user with invalid_grant — the run spent the token, hit
+ * an error in a later step, and never stored the replacement. So persist first, and record
+ * `expires-at` so a later run can tell an aged-out token from a revoked one.
+ */
+function persistSsoTokens(api) {
+  if (api.accessToken) credsSet(C_TOKEN, api.accessToken);
+  if (api.refreshToken) credsSet(C_REFRESH, api.refreshToken);
+  if (api.accessExpiresAt) credsSet(C_EXPIRES, String(api.accessExpiresAt));
+}
+
 async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp = false } = {}) {
   const cfg = vwConfig();
   if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
@@ -513,9 +529,18 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     api.setAccessToken(ssoAccess, { refreshToken: ssoRefresh });
     // Prove the token is still good before spending ~1s on PBKDF2, and refresh once if
     // the access token has aged out — this is the whole point of SSO having a refresh token.
+    // NOTE: refresh() consumes the refresh token. Vaultwarden rotates them by default, so
+    // a refresh that is not persisted immediately burns the token — a later run then gets
+    // invalid_grant. Do not call refresh() speculatively; only do it when the bearer token
+    // actually failed, and store the replacement before anything else can throw.
     let payload = await api.ciphers().catch(async (e) => {
       if (!/HTTP 401|HTTP 403/.test(String(e?.message))) throw e;
-      if (!(await api.refresh().catch(() => false))) return null;
+      const refreshed = await api.refresh().catch((e2) => {
+        process.stderr.write(`token refresh failed: ${String(e2.message).split("\n")[0].slice(0, 120)}\n`);
+        return false;
+      });
+      if (!refreshed) return null;
+      persistSsoTokens(api);
       return await api.ciphers().catch(() => null);
     });
     if (payload) {
@@ -1221,7 +1246,7 @@ async function main(argv) {
         // Persist the session, but never the master password: that stays in `f creds`
         // where it belongs, entered through its own prompt.
         credsSet(C_TOKEN, api.accessToken);
-        if (api.refreshToken) credsSet(C_REFRESH, api.refreshToken);
+        persistSsoTokens(api);
 
         if (hasMaster) {
           try {

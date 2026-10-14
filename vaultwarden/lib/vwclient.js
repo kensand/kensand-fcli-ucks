@@ -466,6 +466,15 @@ export class VaultwardenApi {
     });
     if (!j?.access_token) return false;
     this.#adoptTokens({ ...j, refresh_token: j.refresh_token ?? this.refreshToken });
+    // A refresh that returns no refresh_token reuses the old one. Vaultwarden normally
+    // rotates it; if it does not, the reused token may already be spent, which shows up as
+    // a 401 on the very next call with `authenticated: yes` in the log above it. Say so
+    // here, at the place the fact is known, instead of letting the operator read a
+    // contradictory pair of lines.
+    if (!j.refresh_token) {
+      this.refreshTokenUnrotated = true;
+      debug("token refresh returned no new refresh_token; reusing the existing one");
+    }
     return true;
   }
 
