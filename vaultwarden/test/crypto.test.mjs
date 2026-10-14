@@ -468,7 +468,7 @@ await t("an absent Kdf is refused rather than assumed to be PBKDF2", async () =>
   );
 });
 
-await t("Argon2id accounts derive and decrypt (hashLen 32, memory in KiB)", async () => {
+await t("Argon2id accounts derive and decrypt (hashLen 32, kdfMemory in MiB)", async () => {
   // hash-wasm is an OPTIONAL dependency: PBKDF2 accounts must work with no node_modules at
   // all. Skipping here is legitimate, but it must never be silent — run npm install to get
   // this coverage, and see the separate test that the absence is reported clearly.
@@ -482,11 +482,14 @@ await t("Argon2id accounts derive and decrypt (hashLen 32, memory in KiB)", asyn
   // master password": hashLen (32 here, not the 64 the native SDK derives) and memory
   // (the server's kdfMemory is KIBIBYTES: 64 means 64 KiB, not 64 MiB).
   const { argon2id } = await import("hash-wasm");
-  const AE = "argon-user@example.com", AP = "argon-master-pass", AM = 64, APA = 4, AI = 3;
+  // AM is in MIBIBYTES, as kdfMemory is on the wire. 16 MiB keeps the test fast; the
+  // real server's 64 would allocate 64 MiB. hash-wasm's memorySize wants KiB, so the client
+  // multiplies by 1024 -- see bitwarden_crypto/src/crypto/kdf.rs.
+  const AE = "argon-user@example.com", AP = "argon-master-pass", AM = 16, APA = 4, AI = 3;
 
   const mk = Buffer.from(await argon2id({
     password: Buffer.from(AP, "utf8"), salt: Buffer.from(AE, "utf8"),
-    parallelism: APA, iterations: AI, memorySize: AM, hashLength: 32, outputType: "binary",
+    parallelism: APA, iterations: AI, memorySize: AM * 1024, hashLength: 32, outputType: "binary",
   }));
   const st = refStretch(mk);
   const aSym = crypto.randomBytes(32), aMac = crypto.randomBytes(32);
@@ -516,10 +519,20 @@ await t("Argon2id accounts derive and decrypt (hashLen 32, memory in KiB)", asyn
     C.deriveKeys({ email: AE, password: AP, encryptedKey: wrappedKey, kdfType: 1, kdfIterations: AI }),
     /invalid argon2id|argon2id (memory|parallelism)/i,
   );
-  // Pin the unit-level contract too: hashLen 32, and memorySize passed through as KiB.
+  // Pin the unit-level contract: hashLen 32, and kdfMemory converted MiB -> KiB.
   const fast = await C.makeMasterKeyArgon2id(AP, AE, { iterations: AI, memory: AM, parallelism: APA });
   assert.equal(fast.length, 32, "Bitwarden's WASM path derives 32 bytes, not 64");
-  assert.ok(Buffer.compare(fast, mk) === 0, "kdfMemory must be forwarded as KiB, unchanged");
+  assert.ok(Buffer.compare(fast, mk) === 0, "kdfMemory must reach hash-wasm as MiB * 1024");
+  // An earlier revision asserted the opposite ("64 means 64 KiB") and passed, because this
+  // test's own reference call used the same wrong number. The reference now multiplies, so a
+  // client that forwards kdfMemory raw no longer matches it.
+  const wrongUnit = await C.makeMasterKeyArgon2id(AP, AE, { iterations: AI, memory: AM, parallelism: APA });
+  const asIfKib = Buffer.from(await (await import("hash-wasm")).argon2id({
+    password: Buffer.from(AP, "utf8"), salt: Buffer.from(AE, "utf8"),
+    parallelism: APA, iterations: AI, memorySize: 64, hashLength: 32, outputType: "binary",
+  }));
+  assert.notEqual(wrongUnit.toString("hex"), asIfKib.toString("hex"),
+    "treating kdfMemory as KiB must NOT reproduce the reference key");
   // hash-wasm's Argon2id itself must be RFC-correct (RFC 9106 5.3 uses a secret, which
   // hash-wasm does not reproduce; these are the no-secret vectors Bitwarden's shape uses).
   const kat = Buffer.from(await argon2id({
@@ -538,7 +551,7 @@ await t("bad Argon2 parameters are named, not passed to the KDF as garbage", asy
                      { memory: NaN }, { memory: 64, parallelism: 4, iterations: NaN }]) {
     const p = { iterations: 3, memory: 64, parallelism: 4, ...bad };
     await assert.rejects(
-      C.makeMasterKeyArgon2id("pw", "a@b.c", p),
+      C.makeMasterKeyArgon2id("pw", "user@example.com", p),
       /invalid argon2id (iterations|memory|parallelism)/,
       `must reject ${JSON.stringify(bad)}`);
   }

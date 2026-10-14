@@ -137,9 +137,10 @@ export function makeMasterKey(password, email, iterations) {
  * its MAC check and looks exactly like "you typed the master password wrong":
  *
  *  - hashLen is 32, NOT 64. The native SDK derives 512 bits; the WebCrypto/WASM path
- *    this uck mirrors derives 256. Sending 64 here produces a different key.
- *  - memory is in KIBIBYTES. A server reporting kdfMemory=64 means 64 KiB, not 64 MiB.
- *    Passing 65536 would allocate 64 MiB and derive a key nobody can verify.
+ *    (web-crypto-function.service.ts) derives 256 and this mirrors that.
+ *  - memory arrives in MIBIBYTES and hash-wasm wants KiB, so it is multiplied by 1024 —
+ *    see the kdf.rs quote below. An earlier revision of this file asserted the opposite
+ *    ("64 means 64 KiB") and pinned that mistake in a test; the Rust source settles it.
  *  - Argon2id has no 64-byte mode in this path, so there is nothing to "split"; the
  *    32-byte tag is stretched with HKDF like the PBKDF2 output is.
  *
@@ -156,8 +157,12 @@ export async function makeMasterKeyArgon2id(password, email, { iterations, memor
     salt: Buffer.from(String(email).trim().toLowerCase(), "utf8"), // Bitwarden trims+lowercases the email
     parallelism,
     iterations,
-    memorySize: memory,          // KiB, exactly as the server reports it
-    hashLength: 32,              // NOT 64 — see the comment above
+    // kdfMemory is MiB; hash-wasm's memorySize is KiB. bitwarden_crypto/src/crypto/kdf.rs:
+    //     let memory = memory.get() * 1024; // Convert MiB to KiB;
+    // Passing the server's number through raw would derive with 64 KiB where 64 MiB was
+    // meant -- a wrong key, indistinguishable from a wrong master password.
+    memorySize: memory * 1024,
+    hashLength: 32,              // the WebCrypto/WASM path derives 32, not the SDK's 64
     outputType: "binary",
   });
   return Buffer.from(out);
@@ -206,6 +211,13 @@ export function parseEnvelope(s) {
   if (type === ENC.AES_256_CBC_PLAIN) return { type, data: Buffer.from(rest, "base64") };
   const parts = rest.split("|");
   if (parts.length < 2) return null;
+  // A type-2 envelope is `iv|data|mac`. Taking parts[0]/parts[1] and treating parts[2] as
+  // optional silently truncates the ciphertext by one 16-byte block when the MAC is
+  // actually present, which surfaces as a plaintext 15 bytes short -- corrupt data, not an
+  // error. The segment count is therefore checked, not ignored.
+  if (type === ENC.AES_256_CBC_HMAC && parts.length !== 3) {
+    throw new Error(`type 2 envelope has ${parts.length} segments, expected 3 (iv|data|mac): ${String(s).slice(0, 16)}…`);
+  }
   return { type, iv: Buffer.from(parts[0], "base64"), ct: Buffer.from(parts[1], "base64"), mac: parts[2] ? Buffer.from(parts[2], "base64") : null };
 }
 
@@ -239,6 +251,14 @@ export function decryptString(value, keys, { allowUnauthenticated = false } = {}
     throw new Error(`unsupported encryption type ${env.type}`);
   }
 
+  // An IV that is not exactly 16 bytes means the envelope's segments were read in the wrong
+  // order, and a bad final block means the key or the ciphertext is wrong. Both used to be
+  // caught upstream and re-thrown as "MAC verification failed", which blamed the operator's
+  // perfectly good master password for what was this file mis-parsing the envelope. Keep the
+  // distinct messages; do not collapse them.
+  if (env.iv.length !== 16) {
+    throw new Error(`AES-CBC needs a 16-byte IV, got ${env.iv.length} -- envelope segments are not (iv,data,mac) as assumed`);
+  }
   const d = crypto.createDecipheriv("aes-256-cbc", keys.encKey, env.iv);
   return Buffer.concat([d.update(env.ct), d.final()]).toString("utf8");
 }
@@ -262,6 +282,16 @@ export function encryptString(plaintext, keys) {
  * failure here — it produces a key set that silently decrypts nothing.
  */
 export function unwrapSymmetricKey(encryptedKey, stretched) {
+  // Bitwarden's user key is stored as base64(base64(64 key bytes)): after the envelope is
+  // opened, the plaintext is a base64 STRING (88 chars, "=="-padded, for a 64-byte key), and
+  // decoding that string once yields the key.
+  //
+  // "Just decode twice" is the trap an earlier revision of this file fell into. Buffer's
+  // base64 decoder never errors on non-base64 input -- it returns however many whole 3-byte
+  // groups it can form. Feeding it the raw 64 bytes returns 48 bytes here, and other real key
+  // blobs gave 13 and 15. That is where "unexpected symmetric key length" came from: a vault
+  // that was fine, reported as unreadable. The length check below is the thing that makes
+  // that impossible to miss, so it must stay ahead of any use of the key.
   const raw = decryptString(encryptedKey, stretched);
   const buf = Buffer.from(raw, "base64");
   if (buf.length !== 64) throw new Error(`unexpected symmetric key length ${buf.length} (want 64)`);
