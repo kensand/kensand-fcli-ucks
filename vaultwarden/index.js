@@ -457,25 +457,30 @@ function namesForItem(item, cfg) {
  * the exact thing to fix. Never attempts a password grant (see file header).
  */
 /**
- * Refuse to derive when the account does not use PBKDF2.
+ * The account's own KDF parameters, as reported by prelogin.
  *
- * prelogin() used to discard the KDF *type*, keeping only the iteration count, so an
- * Argon2id account (kdf: 1) was derived with PBKDF2 using Argon2's iteration count — 3,
- * where PBKDF2 wants hundreds of thousands. The result is a wrong key whose MAC check
- * fails, and the operator was told "your master password is wrong, do not retry blindly".
- * That is a false accusation, and it wastes the one credential that must not be brute
- * forced. Check the type first, before any PBKDF2 is paid.
+ * The KDF is per-account: the client cannot choose it, and using the wrong one derives a
+ * wrong key whose MAC failure reads as "wrong master password" — which is what an earlier
+ * version of this file did to a real user, because prelogin()'s kdf type was discarded and
+ * PBKDF2 was assumed. Both algorithms are now followed. kdfMemory is in KiB and is passed
+ * through unchanged: a server reporting 64 means 64 KiB, not 64 MiB.
  */
-function assertPbkdf2(pre) {
-  const kdf = Number(pre?.kdf ?? 0);
-  if (kdf !== 0) {
-    throw new Error(
-      `this account's encryption key type is ${kdf === 1 ? "Argon2id" : `type ${kdf}`}, which this\n` +
-      `  client cannot derive (only PBKDF2-SHA256 is implemented). Your master password is not\n` +
-      `  the problem here. Web vault -> Settings -> Security -> Keys -> Encryption key type\n` +
-      `  switches to PBKDF2 (re-encrypts the vault: export a backup first).`,
-    );
+function kdfConfigFor(pre, email) {
+  const kdfType = Number(pre?.kdf ?? 0);
+  const iterations = Number(pre?.kdfIterations ?? 0);
+  if (!Number.isInteger(iterations) || iterations <= 0) throw new Error(`prelogin gave no usable kdfIterations (${pre?.kdfIterations}) for ${email}`);
+  if (kdfType === 0) return { kdfType, kdfIterations };
+  if (kdfType === 1) {
+    const memory = Number(pre?.kdfMemory ?? 0);
+    const parallelism = Number(pre?.kdfParallelism ?? 0);
+    if (!Number.isInteger(memory) || memory <= 0 || !Number.isInteger(parallelism) || parallelism <= 0) {
+      throw new Error(`prelogin reported Argon2id without usable memory/parallelism (memory=${pre?.kdfMemory}, parallelism=${pre?.kdfParallelism})`);
+    }
+    return { kdfType, kdfIterations, kdfMemory: memory, kdfParallelism: parallelism };
   }
+  throw new Error(
+    `this account uses an unsupported KDF type ${kdfType}; only PBKDF2-SHA256 (0) and Argon2id (1) are implemented`,
+  );
 }
 
 async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp = false } = {}) {
@@ -520,11 +525,11 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
       // which is why this branch requires `master`.
       try {
         const pre = await api.prelogin(cfg.email);
-        assertPbkdf2(pre);
+        const kdfCfg = kdfConfigFor(pre, cfg.email);
         const sync = await api.sync();
         const encKey = sync?.profile?.key;
         if (!encKey) throw new Error("sync returned no profile.key");
-        const keys = deriveKeys({ email: cfg.email, password: master, kdfIterations: pre.kdfIterations, encryptedKey: encKey });
+        const keys = await deriveKeys({ email: cfg.email, password: master, encryptedKey: encKey, ...kdfCfg });
         await writeKeyCache(cfg, keys, api);
         const items = decryptVault(payload, keys);
         return { api, cfg, keys, items: items.length ? items : decryptVault(sync, keys), fromCache: false };
@@ -576,13 +581,13 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
   }
   await api.loginApiKey({ clientId, clientSecret });
   const pre = await api.prelogin(cfg.email);
-  assertPbkdf2(pre);
+  const kdfCfg = kdfConfigFor(pre, cfg.email);
   const sync = await api.sync();
   const encKey = sync?.profile?.key;
   if (!encKey) throw new Error(`sync returned no profile.key — account may not be set up, or the token lacks vault scope`);
   let keys;
   try {
-    keys = deriveKeys({ email: cfg.email, password: master, kdfIterations: pre.kdfIterations, encryptedKey: encKey });
+    keys = await deriveKeys({ email: cfg.email, password: master, encryptedKey: encKey, ...kdfCfg });
   } catch (e) {
     if (/MAC verification failed/.test(String(e.message))) {
       throw new Error(`master password is wrong (key unwrap failed MAC check) — do not retry blindly, retype it: f vaultwarden config --master-password`);
@@ -1220,7 +1225,7 @@ async function main(argv) {
 
         if (hasMaster) {
           try {
-            const keys = VaultwardenApi.keysFromSsoToken(tok, { email: cfg.email, masterPassword: credsGet(cfg.masterPasswordCred) });
+            const keys = await VaultwardenApi.keysFromSsoToken(tok, { email: cfg.email, masterPassword: credsGet(cfg.masterPasswordCred) });
             await writeKeyCache(cfg, keys, api);
             process.stdout.write("key cache\tprimed — later reads skip PBKDF2\n");
           } catch (e) {

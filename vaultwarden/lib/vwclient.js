@@ -81,12 +81,88 @@ export const CIPHER_TYPE = { LOGIN: 1, SECURE_NOTE: 2, CARD: 3, IDENTITY: 4 };
 /* ------------------------------------------------------------------ crypto */
 
 /** PBKDF2-HMAC-SHA256(masterPassword, email, iterations) -> 32B masterKey. */
+/**
+ * hash-wasm is an OPTIONAL dependency: it provides the Argon2id WASM that Bitwarden
+ * accounts with kdf=1 require. It is imported lazily so an installation without
+ * `npm install` still works for the far more common PBKDF2 accounts — the zero-dep
+ * path must not regress when a dependency is added.
+ */
+let _argon2id = null;
+/**
+ * Load the optional Argon2id implementation.
+ *
+ * `impl` exists so the "dependency is missing" branch is testable without uninstalling
+ * anything. It must not cache the result: a test that asks for the unavailable path has
+ * to leave the real loader usable afterwards, or it poisons every later derivation.
+ */
+async function loadArgon2id({ impl = null } = {}) {
+  if (impl) return impl;
+  if (_argon2id === null) {
+    try {
+      ({ argon2id: _argon2id } = await import("hash-wasm"));
+      if (typeof _argon2id !== "function") _argon2id = false;
+    } catch { _argon2id = false; }
+  }
+  if (!_argon2id) {
+    throw new Error(
+      "Argon2id is needed for this account, but the optional 'hash-wasm' dependency is not\n" +
+      "  installed. Fix:  cd <this uck's directory> && npm install\n" +
+      "  (PBKDF2 accounts need no dependencies at all, which is why this one is optional.)",
+    );
+  }
+  return _argon2id;
+}
+
+/** Whether Argon2id can be used right now (i.e. the optional dependency is installed). */
+export async function argon2idAvailable() {
+  try { await loadArgon2id(); return true; } catch { return false; }
+}
+
 export function makeMasterKey(password, email, iterations) {
   if (!Number.isInteger(iterations) || iterations <= 0) {
     throw new Error(`invalid kdfIterations from server: ${iterations}`);
   }
   return crypto.pbkdf2Sync(Buffer.from(String(password), "utf8"), Buffer.from(String(email), "utf8"), iterations, 32, "sha256");
 }
+
+/**
+ * Argon2id master key (Bitwarden KdfType 1), matching what the clients actually send.
+ *
+ * Taken from libs/common/src/platform/services/web-crypto-function.service.ts:
+ *
+ *   argon2.hash({ pass, salt, time: iterations, mem: memory,
+ *                 parallelism, hashLen: 32, type: ArgonType.Argon2id })
+ *
+ * Three things here are easy to get wrong and each yields a WRONG key that then fails
+ * its MAC check and looks exactly like "you typed the master password wrong":
+ *
+ *  - hashLen is 32, NOT 64. The native SDK derives 512 bits; the WebCrypto/WASM path
+ *    this uck mirrors derives 256. Sending 64 here produces a different key.
+ *  - memory is in KIBIBYTES. A server reporting kdfMemory=64 means 64 KiB, not 64 MiB.
+ *    Passing 65536 would allocate 64 MiB and derive a key nobody can verify.
+ *  - Argon2id has no 64-byte mode in this path, so there is nothing to "split"; the
+ *    32-byte tag is stretched with HKDF like the PBKDF2 output is.
+ *
+ * No secret and no associated data: Bitwarden passes neither, and hash-wasm's `secret`
+ * handling does not reproduce the RFC 9106 vector, so it must not be used.
+ */
+export async function makeMasterKeyArgon2id(password, email, { iterations, memory, parallelism, _argon2impl = null } = {}) {
+  const argon2id = await loadArgon2id({ impl: _argon2impl });
+  for (const [name, v] of [["iterations", iterations], ["memory", memory], ["parallelism", parallelism]]) {
+    if (!Number.isInteger(v) || v <= 0) throw new Error(`invalid argon2id ${name} from server: ${v}`);
+  }
+  const out = await argon2id({
+    password: Buffer.from(String(password), "utf8"),
+    salt: Buffer.from(String(email).trim().toLowerCase(), "utf8"), // Bitwarden trims+lowercases the email
+    parallelism,
+    iterations,
+    memorySize: memory,          // KiB, exactly as the server reports it
+    hashLength: 32,              // NOT 64 — see the comment above
+    outputType: "binary",
+  });
+  return Buffer.from(out);
+}
+
 
 /**
  * HKDF-Expand (RFC 5869 §2.3) using `prk` directly as the pseudorandom key —
@@ -565,7 +641,7 @@ export class VaultwardenApi {
    * Throws a message that names the case, so the operator is not told to configure
    * a master password that does not exist.
    */
-  static keysFromSsoToken(tokenJson, { email, masterPassword } = {}) {
+  static async keysFromSsoToken(tokenJson, { email, masterPassword } = {}) {
     const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};
     const hasMaster = udo.HasMasterPassword ?? udo.hasMasterPassword ?? true;
     const encKey = tokenJson?.Key ?? tokenJson?.key
@@ -599,17 +675,19 @@ export class VaultwardenApi {
       );
     }
     if (!Number.isInteger(kdfType)) {
-      throw new Error("the server did not report which KDF this account uses; refusing to guess (see preloginKdfMismatch)");
-    }
-    if (kdfType !== KDF_PBKDF2_SHA256) {
-      throw new Error(kdfUnsupportedMessage(kdfType));
+      throw new Error("the server did not report which KDF this account uses; refusing to guess");
     }
     if (!Number.isInteger(iterations) || iterations <= 0) {
       throw new Error(`SSO response had no usable KdfIterations: ${tokenJson?.KdfIterations}`);
     }
     const accountEmail = udo?.MasterPasswordUnlock?.Salt || email;
     if (!accountEmail) throw new Error("no email available to use as the KDF salt");
-    return deriveKeys({ email: accountEmail, password: masterPassword, kdfIterations: iterations, encryptedKey: encKey });
+    return deriveKeys({
+      email: accountEmail, password: masterPassword, kdfIterations: iterations, encryptedKey: encKey,
+      kdfType,
+      kdfMemory: Number(tokenJson?.KdfMemory ?? tokenJson?.kdfMemory ?? 0) || null,
+      kdfParallelism: Number(tokenJson?.KdfParallelism ?? tokenJson?.kdfParallelism ?? 0) || null,
+    });
   }
 
   /** Full vault: profile.key + every cipher. */
@@ -762,8 +840,18 @@ function kdfUnsupportedMessage(kdfType) {
   );
 }
 
-export function deriveKeys({ email, password, kdfIterations, encryptedKey }) {
-  const masterKey = makeMasterKey(password, email, kdfIterations);
+export async function deriveKeys({ email, password, kdfIterations, encryptedKey, kdfType = KDF_PBKDF2_SHA256, kdfMemory = null, kdfParallelism = null }) {
+  // The KDF is per-account and not negotiable; passing the wrong one produces a wrong key
+  // whose MAC failure reads as "wrong master password". kdfType comes from prelogin's
+  // `kdf` (or the token response's `Kdf`), never from a default.
+  let masterKey;
+  if (Number(kdfType) === KDF_PBKDF2_SHA256) {
+    masterKey = makeMasterKey(password, email, kdfIterations);
+  } else if (Number(kdfType) === KDF_ARGON2ID) {
+    masterKey = await makeMasterKeyArgon2id(password, email, { iterations: kdfIterations, memory: kdfMemory, parallelism: kdfParallelism });
+  } else {
+    throw new Error(kdfUnsupportedMessage(kdfType));
+  }
   const stretched = stretchMasterKey(masterKey);
   const keys = unwrapSymmetricKey(encryptedKey, stretched);
   keys.masterKey = masterKey;
@@ -820,4 +908,4 @@ export function decryptVault(payload, keys, opts = {}) {
   return ciphersFrom(payload).map((c) => new VaultItem(c, keys, opts));
 }
 
-export default { VaultwardenApi, VaultItem, deriveKeys, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };
+export default { VaultwardenApi, VaultItem, deriveKeys, makeMasterKeyArgon2id, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };
