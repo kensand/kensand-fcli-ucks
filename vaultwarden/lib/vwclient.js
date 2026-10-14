@@ -49,7 +49,14 @@ const DEVICE_TYPE_CLI = 14;
 // validates one spelling or the other, and unknown fields are ignored.
 const DEVICE_IDENTIFIER = "f-vaultwarden-uck";
 const DEVICE_NAME = "f creds (vaultwarden provider)";
+/**
+ * Vaultwarden rejects the bare `api` scope outright — "Scope (api) not supported" — so the
+ * password grant never reaches credential validation with it. `api offline_access` is the
+ * spelling that gets through. Do not reuse it for client_credentials: that grant has its own
+ * accepted scope set and answers "Scope not supported" for offline_access.
+ */
 const API_SCOPE = "api";
+const PASSWORD_SCOPE = "api offline_access";
 const UA = "f-cli/vaultwarden-provider";
 
 /** Cipher type codes (Bitwarden `EncryptionType`). */
@@ -313,7 +320,7 @@ export class VaultwardenApi {
       auth: false,
       form: {
         grant_type: "password", username: email, password: passwordHash.toString("base64"),
-        scope: API_SCOPE, client_id: "device",
+        scope: PASSWORD_SCOPE, client_id: "device",
         deviceType: String(DEVICE_TYPE_CLI),
         deviceIdentifier: DEVICE_IDENTIFIER, deviceName: DEVICE_NAME,
         device_identifier: DEVICE_IDENTIFIER, device_name: DEVICE_NAME,

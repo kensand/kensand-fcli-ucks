@@ -39,6 +39,8 @@ import {
   decryptVault,
   decryptString,
   encryptString,
+  makeMasterKey,
+  masterPasswordHash,
   CIPHER_TYPE,
 } from "./lib/vwclient.js";
 
@@ -301,6 +303,72 @@ function namesForItem(item, cfg) {
  * Order: cached derived keys -> API-key token + master password -> error with
  * the exact thing to fix. Never attempts a password grant (see file header).
  */
+/**
+ * Get a bearer token. The password grant comes first; the API key is a fallback.
+ *
+ * An API key is NOT required to read a vault, which is what an earlier version of this file
+ * asserted. Bitwarden's password grant authenticates with HMAC(masterKey, password), computed
+ * locally — the server never sees the password or any key material. The API key's real and
+ * only job is to get past 2FA. Scope rules are per-grant and were probed against a live
+ * Vaultwarden with a nonexistent account (no real credential was ever sent):
+ *
+ *   password           scope=api                 -> "Scope (api) not supported"
+ *   password           scope=api offline_access  -> reaches credential validation
+ *   client_credentials scope=api                 -> reaches client-id validation  (correct)
+ *   client_credentials scope=api.device/.offline -> "Scope not supported"
+ *
+ * So a "Scope ... not supported" line is THIS CODE's bug, never the operator's credentials,
+ * and the messages below say so instead of sending them off to retype a correct password.
+ */
+async function authenticate(api, { email, passwordHash }) {
+  const errs = [];
+  try {
+    await api.loginPassword({ email, passwordHash });
+    return "password";
+  } catch (e) {
+    // Do not fall through on a server-side throttle: retrying with another credential only
+    // extends the lockout, and reporting this as a "miss" would let the provider layer cache
+    // it, so every later lookup answers "not found" for a vault that is actually fine.
+    if (e.status === 429 || /rate-limiting|Too many login/i.test(String(e.message))) throw e;
+    // A rejected password is a verdict, not a hint to try a different credential. Falling
+    // through here let a valid API key authenticate the run, which then unwrapped the vault
+    // with the wrong master key and reported a bad password as "no such item".
+    if (/Username or password is incorrect/i.test(String(e.message))) {
+      throw new Error(
+        `the server rejected the master password for ${email}\n` +
+        `  do not retry blindly (repeated attempts trigger a lockout) — retype it:\n` +
+        `  f vaultwarden config --master-password\n` +
+        `  check the account's email too: the email is the KDF salt, so a stale one in\n` +
+        `  f.config.json makes every derived key wrong no matter what you type`,
+      );
+    }
+    if (e.twoFactor) {
+      throw new Error(
+        `this account requires 2FA, which the password grant cannot satisfy from a CLI\n` +
+        `  types offered: ${Object.keys(e.twoFactor).join(", ")}\n` +
+        `  use an API key — bypassing 2FA is exactly what it is for:\n` +
+        `  web vault -> Settings -> Security -> Keys -> API key\n` +
+        `    f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
+        `    f creds set ${C_CLIENT_SECRET} '<client secret>'`,
+      );
+    }
+    errs.push(`password grant: ${String(e.message).split("\n")[0].slice(0, 140)}`);
+  }
+  const clientId = credsGet(C_CLIENT_ID), clientSecret = credsGet(C_CLIENT_SECRET);
+  if (clientId && clientSecret) {
+    try { await api.loginApiKey({ clientId, clientSecret }); return "apikey"; }
+    catch (e) {
+      if (e.status === 429 || /rate-limiting|Too many login/i.test(String(e.message))) throw e;
+      errs.push(`api-key grant: ${String(e.message).split("\n")[0].slice(0, 140)}`);
+    }
+  } else {
+    errs.push("api-key grant: not configured (optional; only needed when 2FA is on)");
+  }
+  throw new Error(`could not authenticate to ${api.server}\n  ${errs.join("\n  ")}\n` +
+    `  a "Scope ... not supported" line means THIS CODE sent a scope the server does not` +
+    `  accept -- it is not a problem with your credentials or your server.`);
+}
+
 async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp = false } = {}) {
   const cfg = vwConfig();
   if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
@@ -321,29 +389,25 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     if (hit) return { api, cfg, keys: hit.keys, items: decryptVault(hit.payload, hit.keys), fromCache: true };
   }
 
-  const clientId = credsGet(C_CLIENT_ID);
-  const clientSecret = credsGet(C_CLIENT_SECRET);
-  if (!clientId || !clientSecret) {
-    throw new Error(
-      `no API key stored, and a master password alone cannot obtain a token\n` +
-      `  web vault -> Settings -> Security -> Keys -> API key:\n` +
-      `  f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
-      `  f creds set ${C_CLIENT_SECRET} '<client secret>'\n` +
-      `  (the API key exists to skip 2FA; it cannot decrypt anything by itself)`,
-    );
-  }
   const master = credsGet(cfg.masterPasswordCred);
   if (!master) {
     throw new Error(
-      `no master password stored — the vault cannot be decrypted without one\n` +
-      `  f vaultwarden config --master-password   (prompts, then stores it)\n` +
-      `  An API key alone is not enough: vault contents are end-to-end encrypted\n` +
-      `  with a key derived from the master password, which the API key cannot replace.`,
+      `no master password stored — nothing can be decrypted, and there is no login proof either\n` +
+      `  f vaultwarden config --master-password   (prompts, no echo)\n` +
+      `  It does double duty: it is the login credential AND the key that unlocks the vault.`,
     );
   }
 
-  await api.loginApiKey({ clientId, clientSecret });
   const pre = await api.prelogin(cfg.email);
+  // The master key is needed on BOTH sides, so derive once and use it twice: the server
+  // receives HMAC(masterKey, password) as the login proof, and the vault needs the HKDF-
+  // stretched key to unwrap profile.key. Because the proof is computable offline, logging in
+  // needs nothing but the password -- which is why an API key is optional here, not required.
+  const masterKey = makeMasterKey(master, cfg.email, pre.kdfIterations);
+  const passwordHash = masterPasswordHash(masterKey, master);
+
+  await authenticate(api, { email: cfg.email, passwordHash });
+
   const sync = await api.sync();
   const encKey = sync?.profile?.key;
   if (!encKey) throw new Error(`sync returned no profile.key — account may not be set up, or the token lacks vault scope`);

@@ -11,18 +11,31 @@ no `bw` binary, no npm deps, just `node:crypto` and `fetch`. It is wired into
 store first and only falls through to the vault on a miss, mirroring a successful
 hit locally under a TTL.
 
-The one thing to internalise: **an API key alone cannot decrypt a vault.** API
-keys authenticate; the master password is what unlocks the cryptography. So this
-uck needs *both*, and the master password is itself kept inside the `f creds`
-box (`vaultwarden.master-password`) — the vault cannot bootstrap itself.
+The thing to internalise: **the master password does two jobs.** It is the login
+credential *and* the key that unlocks the vault. An API key does neither — it
+only exists to get past 2FA — so it is **optional**, and you do not need one when
+2FA is off.
+
+Login is tried as password-grant-first, API-key-fallback. Scope rules are
+per-grant and were probed against a live server with a nonexistent account: the
+password grant needs `api offline_access` (bare `api` is rejected outright),
+while `client_credentials` needs exactly `api`. So **a "Scope ... not supported"
+error is this uck's bug, not your credentials** — report it rather than retyping
+a correct password.
+
+One secret does remain: the master password lives inside the `f creds` box
+(`vaultwarden.master-password`), so the vault cannot bootstrap itself — `f creds
+unlock` must come from something else.
 
 ## Setup (once)
 
 ```
 f vaultwarden config --server https://vault.example.com --email you@example.com
-f vaultwarden apikey <client-id> <client-secret>   # from the web vault: Settings > API Key
 f vaultwarden config --master-password             # prompts, no echo
 f vaultwarden test                                 # login + decrypt + report
+
+# only if the account has 2FA on -- the password grant cannot satisfy it from a CLI:
+f vaultwarden apikey <client-id> <client-secret>   # web vault: Settings > API Key
 ```
 
 `f vaultwarden test` is the thing to run first: it authenticates, unwraps the
@@ -146,7 +159,8 @@ or your actual KDF. `f vaultwarden test` covers those against the live server.
 | `Scope not supported` | server rejects the OAuth scope; current code sends `scope=api` (verified live) |
 | `device_identifier cannot be blank` | server wants snake_case device fields; current code sends both spellings |
 | `Too many login requests` (429) | rate-limited; **stop retrying**, it extends the lockout |
-| `2FA is required` | the password grant hit a 2FA policy. Use the API key instead (`apikey`), which bypasses it. |
+| `requires 2FA` | the password grant hit a 2FA policy. Add an API key (`apikey`) — bypassing 2FA is its only purpose. |
+| `Scope ... not supported` | a bug in this uck, not in your account: scope rules differ per grant (see above). Report it. |
 | `unrecognised response shape` | your server returns something unexpected — the error lists its keys, and it deliberately refuses to read that as an empty vault |
 | `the creds store is locked` | `f creds unlock` — the vault cannot be consulted or written to while locked |
 

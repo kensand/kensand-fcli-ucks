@@ -87,6 +87,23 @@ const CIPHERS = [
 ];
 
 let TOKEN_SEEN = null;
+const GRANTS = []; // every grant the client actually asked for, in order
+let PW_GRANT_SEEN = null;
+let FIRST_RUN_GRANTS = 0; // grants consumed by the first vault-open attempt
+// The login proof the password grant must carry: HMAC(PBKDF2(pw,email), pw).
+// The login proof the password grant must send: HMAC(PBKDF2(pw,email), pw), base64.
+// Awaited at module level because the mock request handler below is synchronous -- an
+// unawaited Promise here compares unequal to every string and the password grant then fails
+// *silently*, falling back to the API key while the suite still reports green. That is the
+// whole reason this file exists: a mock that accepts the wrong thing proves nothing.
+// Built from the uck's own helpers, which are themselves cross-checked against Bitwarden's
+// official wasm crypto in bitwarden-wasm.test.mjs -- so this is not a circular check.
+const EXPECTED_PW_HASH = await computeExpectedPwHash();
+async function computeExpectedPwHash() {
+  const C = await import(pathToFileURL(path.join(here, "..", "lib", "vwclient.js")).href);
+  return C.masterPasswordHash(C.makeMasterKey(PASSWORD, EMAIL, ITER), PASSWORD).toString("base64");
+}
+
 let PRELOGIN_HITS = 0;
 let SYNC_HITS = 0;
 let CIPHERS_HITS = 0;
@@ -114,17 +131,44 @@ const server = http.createServer((req, res) => {
     }
     if (req.method === "POST" && req.url === "/identity/connect/token") {
       const p = Object.fromEntries(new URLSearchParams(body));
-      // Enforce the rules probed against the live server, so a regression in the
-      // request body fails here rather than at first use in the field.
-      if (p.grant_type !== "client_credentials") return send(400, { message: "unsupported grant", validationErrors: { "": ["unsupported grant"] } });
-      if (p.scope !== "api") return send(400, { message: "Scope not supported", validationErrors: { "": ["Scope not supported"] }, error_description: "" });
+      // Enforce the rules PROBED against the live server, so a regression in the request body
+      // fails here rather than at first use in the field. Scope rules are per-grant, verified
+      // against vault.kensand.net with probe accounts (no real credentials sent):
+      //   password          scope=api                -> "Scope (api) not supported"
+      //   password          scope=api offline_access -> reaches credential validation
+      //   client_credentials scope=api offline_access -> "Scope not supported"
+      // Note the mock deliberately does NOT accept a scope the live server rejects: the
+      // previous revision asserted scope === "api" for client_credentials as if probed, and
+      // that was never actually tested against the real thing.
+      if (p.grant_type !== "client_credentials" && p.grant_type !== "password") {
+        return send(400, { message: "unsupported grant", validationErrors: { "": ["unsupported grant"] } });
+      }
+      // client_credentials accepts ONLY `api`: `api.device`/`api.offline`/`api.push` all come
+      // back "Scope not supported", while `api` proceeds to client-id validation. Verified
+      // with a syntactically valid but nonexistent client id, so no real credential is sent.
+      if (p.grant_type === "client_credentials" && p.scope !== "api") {
+        return send(400, { message: "Scope not supported", validationErrors: { "": ["Scope not supported"] }, error_description: "" });
+      }
+      if (p.grant_type === "password" && p.scope !== "api offline_access") {
+        return send(400, { message: `Scope (${p.scope}) not supported`, validationErrors: { "": [`Scope (${p.scope}) not supported`] }, error_description: "" });
+      }
+      if (p.grant_type === "password" && p.password !== EXPECTED_PW_HASH) {
+        return send(400, { message: "Username or password is incorrect. Try again", validationErrors: { "": ["Username or password is incorrect. Try again"] }, error_description: "" });
+      }
       if (!p.device_identifier && !p.device_identifier?.length) {
         if (!p.device_identifier) return send(400, { message: "device_identifier cannot be blank", validationErrors: { "": ["device_identifier cannot be blank"] }, error_description: "" });
       }
       if (!p.device_name) return send(400, { message: "device_name cannot be blank", validationErrors: { "": ["device_name cannot be blank"] }, error_description: "" });
-      if (p.client_id !== "user.test-id" || p.client_secret !== "test-secret") return send(400, { message: "Invalid client_id", validationErrors: { "": ["Invalid client_id"] }, error_description: "" });
-      TOKEN_SEEN = { clientId: p.client_id, scope: p.scope, deviceType: p.deviceType };
-      return send(200, { access_token: "tok-1", refresh_token: "ref-1", expires_in: 3600, token_type: "Bearer" });
+      if (p.grant_type === "client_credentials" && (p.client_id !== "user.test-id" || p.client_secret !== "test-secret")) return send(400, { message: "Invalid client_id", validationErrors: { "": ["Invalid client_id"] }, error_description: "" });
+      TOKEN_SEEN = { grant: p.grant_type, clientId: p.client_id, scope: p.scope, deviceType: p.deviceType };
+      GRANTS.push(p.grant_type);
+      // The "first run" is the first batch of grant attempts ending in a
+      // success. Recorded when a grant succeeds so the assertion below cannot pass
+      // vacuously off an empty slice.
+      if (FIRST_RUN_GRANTS === 0) FIRST_RUN_GRANTS = GRANTS.length;
+      // Record the first password-grant attempt so an assertion can inspect it directly.
+      if (p.grant_type === "password" && !PW_GRANT_SEEN) PW_GRANT_SEEN = { scope: p.scope, password: p.password, username: p.username, clientId: p.client_id };
+      if (p.grant_type === "password")       return send(200, { access_token: "tok-1", refresh_token: "ref-1", expires_in: 3600, token_type: "Bearer" });
     }
     const bearerOk = auth === "Bearer tok-1";
     if (req.method === "GET" && req.url === "/api/sync") {
@@ -420,12 +464,27 @@ injectVw();
   providers.clearMisses();
   injectVw();
   const r = await freshLookup("brand-new-name.example");
-  t("wrong master password => says so, explicitly", !!r.error && /master password is wrong/.test(r.error), JSON.stringify(r).slice(0, 220));
+  t("wrong master password => says so, explicitly", !!r.error && /server rejected the master password|master password is wrong/.test(r.error), JSON.stringify(r).slice(0, 220));
+  t("a bad password is NOT masked by a working api key", !/no such item|not found/i.test(String(r.error ?? "")),
+    "an api key must not silently authenticate a run whose master password was rejected: " + JSON.stringify(r).slice(0, 160));
   await sockOp({ op: "set", name: "vaultwarden.master-password", value: PASSWORD });
 }
 
 // 8. api key must actually have been used, and only client_credentials
-t("token request used client_credentials + the stored api key", TOKEN_SEEN?.clientId === "user.test-id" && /api/.test(TOKEN_SEEN?.scope ?? ""), JSON.stringify(TOKEN_SEEN));
+// The design changed: an API key is no longer required, and the password grant is tried
+// first because it needs nothing but the master password. Assert the ORDER, not just that a
+// token appeared -- the previous version of this assertion stayed green while the client
+// silently used the API key fallback, because the mock's password check was broken.
+t("password grant is tried first and succeeds", GRANTS[0] === "password", `grants: ${JSON.stringify(GRANTS)}`);
+{
+  const firstRun = GRANTS.slice(0, Math.max(FIRST_RUN_GRANTS, 1));
+  t("the api key is not needed when the password grant works",
+    FIRST_RUN_GRANTS > 0 && firstRun[0] === "password" && !firstRun.includes("client_credentials"),
+    `first-run grants: ${JSON.stringify(firstRun)} (all: ${JSON.stringify(GRANTS)})`);
+}
+t("password grant sent the master-password proof + a supported scope",
+  !!PW_GRANT_SEEN && PW_GRANT_SEEN.password === EXPECTED_PW_HASH && PW_GRANT_SEEN.scope === "api offline_access",
+  JSON.stringify({ ...PW_GRANT_SEEN, password: PW_GRANT_SEEN?.password === EXPECTED_PW_HASH ? "MATCH" : `MISMATCH want=${EXPECTED_PW_HASH.slice(0,8)}` }));
 t("prelogin was consulted for KDF params", PRELOGIN_HITS >= 1, `hits=${PRELOGIN_HITS}`);
 
 // 8b. rate limiting must be explained, not shown as a bare status code
