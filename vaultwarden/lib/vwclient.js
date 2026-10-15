@@ -68,6 +68,23 @@ const DEVICE_NAME = "f creds (vaultwarden provider)";
  */
 const API_SCOPE = "api";
 const PASSWORD_SCOPE = "api offline_access";
+/*
+ * SSO constants, taken from the server's own behaviour rather than guessed.
+ *
+ * `client_id=cli` is the only one the server accepts for a command-line flow, and
+ * it mandates an http://localhost:8065..8070 redirect (src/sso.rs authorize_url).
+ * `web`/`browser` point at the server's own sso-connector.html and `desktop`/`mobile`
+ * expect a custom scheme, neither of which a headless CLI can service.
+ *
+ * Scope is `api offline_access`: offline_access is what earns the refresh_token, and
+ * unlike the API-key grant (where this server refuses anything but `api`) the SSO
+ * grant is a normal user login and accepts it. Kept separate from API_SCOPE and from
+ * PASSWORD_SCOPE because the three grants have different, independently-verified rules.
+ */
+const SSO_CLIENT_ID = "cli";
+const SSO_SCOPE = "api offline_access";
+
+
 const UA = "f-cli/vaultwarden-provider";
 
 /** Cipher type codes (Bitwarden `EncryptionType`). */
@@ -432,6 +449,179 @@ export class VaultwardenApi {
     if (refreshToken) this.refreshToken = refreshToken;
   }
 
+  /* -------------------------------------------------------------- SSO */
+
+    /**
+   * Does this server offer SSO? `GET /identity/sso/prevalidate` is the unauthenticated
+   * probe. Shape matters and was got wrong once: current Vaultwarden returns
+   * `{"token": "<jwt>"}` when enabled and errors with "SSO sign-in is not available"
+   * when not. There is no boolean `ssoEnabled` field, so testing for one reports "not
+   * enabled" against a server whose SSO works fine. Presence of the token is the signal;
+   * the older spelling is still accepted so a version change is not misread.
+   */
+  async ssoEnabled() {
+    try {
+      const j = await this.#request("/identity/sso/prevalidate", { auth: false });
+      const enabled = Boolean(j?.token ?? j?.Token ?? j?.ssoEnabled);
+      return { enabled, orgIdentifier: j?.ssoOrgIdentifier ?? j?.orgIdentifier ?? null, raw: j, reachable: true };
+    } catch (e) {
+      // "SSO is off" and "I could not ask" are different answers. Vaultwarden answers
+      // this route with a 400 when SSO is disabled, so only an HTTP-level refusal
+      // means disabled; a refused connection, TLS problem or timeout means unknown,
+      // and reporting that as "not enabled" sends the operator to change a server
+      // setting that is probably fine.
+      const msg = String(e?.message ?? e);
+      const refused = /\bHTTP [45]\d\d/i.test(msg);
+      if (refused) return { enabled: false, orgIdentifier: null, raw: null, reachable: true };
+      return { enabled: false, orgIdentifier: null, raw: null, reachable: false, error: msg };
+    }
+  }
+
+      /**
+   * Build the SSO authorize URL to hand to a browser.
+   *
+   * It must be the VAULTWARDEN url — `/identity/connect/authorize?...` — and NOT the
+   * IdP url that endpoint redirects to. Vaultwarden sets the browser-binding cookie
+   * `VW_SSO_BINDING` on that first response, and `oidcsignin` requires it back (it
+   * stores only the SHA-256 of the token). A cookie follows the browser, not the
+   * program: if this method resolved the redirect with fetch and returned the IdP url,
+   * the Set-Cookie would land in this process's nothing, the browser would complete the
+   * IdP round trip carrying no binding cookie, and every attempt would fail
+   * `SSO session binding mismatch` — with a valid code, because the IdP half works.
+   * That is exactly what happened, and it is why the web vault succeeded: the web vault
+   * navigates to `/identity/connect/authorize` *in the browser*.
+   *
+   * So: no request is made here at all. The browser does the whole chain.
+   *
+   * @param opts.redirectPort one of 8065-8070; sso.rs `authorize_url` accepts nothing
+   *                          else for client_id=cli.
+   */
+  ssoAuthorizeUrl({ redirectPort = 8065, _onAuthorizeUrl = null } = {}) {
+    if (!Number.isInteger(redirectPort) || redirectPort < 8065 || redirectPort > 8070) {
+      throw new Error(`redirectPort must be an integer 8065-8070 for client_id=cli (got ${redirectPort})`);
+    }
+    const codeVerifier = crypto.randomBytes(32).toString("base64url");
+    const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+    const state = crypto.randomBytes(16).toString("base64url");
+    const q = new URLSearchParams({
+      client_id: SSO_CLIENT_ID,
+      response_type: "code",
+      state,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256", // the server requires this literal string
+      redirect_uri: `http://localhost:${redirectPort}`,
+    });
+    const authorizeUrl = `${this.server}/identity/connect/authorize?${q}`;
+    // Seam for the tests only: a real IdP learns the challenge when the human's browser
+    // arrives at this URL; our mock cannot observe the browser, so it is told here.
+    if (_onAuthorizeUrl) _onAuthorizeUrl(authorizeUrl);
+    return { authorizeUrl, codeVerifier, state, redirectPort };
+  }
+
+    /**
+   * Exchange the browser's authorization code for a vault session.
+   *
+   * Required by the server for this grant (src/api/identity.rs): client_id, code,
+   * code_verifier, device_identifier, device_name, device_type. No client secret —
+   * PKCE replaces it. Unlike the API-key grant, this one returns a refresh_token
+   * (unless the server sets SSO_AUTH_ONLY_NOT_SESSION), so the session renews for
+   * 30 days instead of dying after 2h.
+   *
+   * The same response carries what key derivation needs — Key, PrivateKey,
+   * Kdf/KdfIterations and UserDecryptionOptions — so an SSO session never needs
+   * `prelogin`, which is the endpoint an SSO-only account may not be able to use.
+   */
+  async loginSso({ code, codeVerifier }) {
+    const j = await this.#request("/identity/connect/token", {
+      method: "POST",
+      auth: false,
+      form: {
+        grant_type: "authorization_code",
+        client_id: SSO_CLIENT_ID,
+        code,
+        code_verifier: codeVerifier,
+        scope: SSO_SCOPE,
+        device_type: String(DEVICE_TYPE_CLI),
+        device_identifier: DEVICE_IDENTIFIER,
+        device_name: DEVICE_NAME,
+      },
+    });
+    if (!j?.access_token) {
+      const desc = j?.error_description || j?.error || JSON.stringify(j ?? {}).slice(0, 200);
+      throw new Error(`SSO token exchange failed: ${desc}`);
+    }
+    this.#adoptTokens(j);
+    return j;
+  }
+
+  /**
+   * Derive vault keys from an SSO token response.
+   *
+   * Two genuinely different cases, and conflating them is the trap:
+   *
+   *  - HasMasterPassword true: SSO replaced *authentication only*. The vault key is
+   *    still wrapped with a key derived from the master password, so it is still
+   *    required. This is the common case, and the answer to "does SSO remove the
+   *    master password": usually no.
+   *
+   *  - HasMasterPassword false: the account was created through SSO and never had
+   *    one. There is no master password to ask for; the user key comes from the
+   *    device key pair registered at enrolment (RSA-OAEP). This is the case where
+   *    SSO really is sufficient, and it needs `devicePrivateKey` + `devicePublicKey`
+   *    obtained during enrolment — it cannot be conjured from a token alone.
+   *
+   * Throws a message that names the case, so the operator is not told to configure
+   * a master password that does not exist.
+   */
+  static async keysFromSsoToken(tokenJson, { email, masterPassword } = {}) {
+    const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};
+    const hasMaster = udo.HasMasterPassword ?? udo.hasMasterPassword ?? true;
+    const encKey = tokenJson?.Key ?? tokenJson?.key
+      ?? udo?.MasterPasswordUnlock?.MasterKeyEncryptedUserKey
+      ?? udo?.MasterPasswordUnlock?.MasterKeyWrappedUserKey ?? null;
+    // Never default this. An absent Kdf used to fall back to PBKDF2, which then derived a
+    // WRONG key and reported "MAC verification failed" — i.e. it accused the operator of
+    // typing the wrong master password when the real problem was the algorithm. Bitwarden
+    // Kdf 1 is Argon2id, which this client does not implement; it must be named, not
+    // silently reinterpreted as PBKDF2.
+    const kdfType = Number(tokenJson?.Kdf ?? tokenJson?.kdf ?? Number.NaN);
+    const iterations = Number(tokenJson?.KdfIterations ?? tokenJson?.kdfIterations ?? 0);
+
+    if (!hasMaster) {
+      throw new Error(
+        "this account has no master password: it is SSO-only, and its vault key is sealed to an\n" +
+        "  enrolled device key pair (RSA-OAEP), which this CLI has not registered.\n" +
+        "  Not implemented here — opening it needs the device-registration ceremony.\n" +
+        "  Do NOT store a master password for this account; there isn't one.",
+      );
+    }
+
+    if (!encKey) {
+      throw new Error(`SSO response had no encrypted user key (Key / MasterKeyEncryptedUserKey missing)`);
+    }
+    if (!masterPassword) {
+      throw new Error(
+        `this account still uses a master password: SSO authenticated you, but the vault\n` +
+        `  key is wrapped with a password-derived key and cannot be unwrapped without it.\n` +
+        `  f vaultwarden config --master-password`,
+      );
+    }
+    if (!Number.isInteger(kdfType)) {
+      throw new Error("the server did not report which KDF this account uses; refusing to guess");
+    }
+    if (!Number.isInteger(iterations) || iterations <= 0) {
+      throw new Error(`SSO response had no usable KdfIterations: ${tokenJson?.KdfIterations}`);
+    }
+    const accountEmail = udo?.MasterPasswordUnlock?.Salt || email;
+    if (!accountEmail) throw new Error("no email available to use as the KDF salt");
+    return deriveKeys({
+      email: accountEmail, password: masterPassword, kdfIterations: iterations, encryptedKey: encKey,
+      kdfType,
+      kdfMemory: Number(tokenJson?.KdfMemory ?? tokenJson?.kdfMemory ?? 0) || null,
+      kdfParallelism: Number(tokenJson?.KdfParallelism ?? tokenJson?.kdfParallelism ?? 0) || null,
+    });
+  }
+
   /** Full vault: profile.key + every cipher. */
   sync() { return this.#request("/api/sync"); }
 
@@ -606,3 +796,9 @@ export function decryptVault(payload, keys, opts = {}) {
 }
 
 export default { VaultwardenApi, VaultItem, deriveKeys, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };
+
+export function ssoRequiresMasterPassword(tokenJson) {
+  const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};
+  const hasMaster = udo.HasMasterPassword ?? udo.hasMasterPassword ?? true;
+  return !!hasMaster;
+}
