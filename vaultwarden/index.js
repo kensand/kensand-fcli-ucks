@@ -334,12 +334,29 @@ async function authenticate(api, { email, passwordHash }) {
     // through here let a valid API key authenticate the run, which then unwrapped the vault
     // with the wrong master key and reported a bad password as "no such item".
     if (/Username or password is incorrect/i.test(String(e.message))) {
+      // Deliberately does NOT conclude "your master password is wrong". Bitwarden returns this
+      // one string for a bad username, a bad password, and a rejected token REQUEST, and cannot
+      // tell them apart. Asserting the password was at fault sent one debugging session chasing
+      // PBKDF2 and key-unwrap bugs for hours while the master password was verifiably correct --
+      // proven offline, with no login at all, by unwrapping profile.key and checking the MAC:
+      //     deriveKeys({ email, password, kdfIterations, encryptedKey: profile.key })
+      // When this fires, run that check before suspecting the password.
       throw new Error(
-        `the server rejected the master password for ${email}\n` +
-        `  do not retry blindly (repeated attempts trigger a lockout) — retype it:\n` +
-        `  f vaultwarden config --master-password\n` +
-        `  check the account's email too: the email is the KDF salt, so a stale one in\n` +
-        `  f.config.json makes every derived key wrong no matter what you type`,
+        `the server refused to issue a token for ${email}\n` +
+        `  it answers "Username or password is incorrect" for a wrong email, a wrong password,\n` +
+        `  AND for a rejected request -- it does not distinguish them, so do not assume which.\n` +
+        `  do not retry blindly: repeated attempts can trigger a lockout.\n` +
+        (e.fieldErrors?.length ? `  rejected fields: ${e.fieldErrors.join(" | ").slice(0, 300)}\n` : "") +
+        // A raw body is never echoed: token responses contain access and refresh tokens.
+        (process.env.F_VW_DEBUG_RESPONSE
+          ? `  server message: ${String(e.body ?? "").slice(0, 300) || "(none)"}\n`
+          : "") +
+        `  to rule the password in or out WITHOUT another login attempt:\n` +
+        `    node -e 'const c=require("node:crypto"),{VaultwardenApi,makeMasterKey,stretchMasterKey}\n` +
+        `      =require(process.env.HOME+"/.f/ucks/kensand-fcli-ucks/vaultwarden/lib/vwclient.js"));\n` +
+        `      /* needs one authenticated sync to get profile.key; see test/crypto.test.mjs */'\n` +
+        `  also check the email: it is the KDF salt, so a stale one in f.config.json makes\n` +
+        `  every derived key wrong no matter what you type`,
       );
     }
     if (e.twoFactor) {

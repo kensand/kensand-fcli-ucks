@@ -491,7 +491,15 @@ injectVw();
   providers.clearMisses();
   injectVw();
   const r = await freshLookup("brand-new-name.example");
-  t("wrong master password => says so, explicitly", !!r.error && /server rejected the master password|master password is wrong/.test(r.error), JSON.stringify(r).slice(0, 220));
+  // The old assertion here demanded the phrase "the server rejected the master password", and
+  // it stayed green right up until it became the thing that misled a debugging session for
+  // hours: the master password was PROVABLY correct (profile.key unwrapped, MAC verified) while
+  // this message insisted it was wrong. Bitwarden returns the same string for a bad email, a bad
+  // password, and a rejected request, so the honest assertion is that the error REFUSES to pick
+  // a cause, and still rules out the one failure mode that would be a silent data bug.
+  t("a rejected login is reported without falsely naming a cause",
+    !!r.error && /does not distinguish/.test(r.error) && !/retype it/.test(r.error),
+    JSON.stringify(r).slice(0, 200));
   t("a bad password is NOT masked by a working api key", !/no such item|not found/i.test(String(r.error ?? "")),
     "an api key must not silently authenticate a run whose master password was rejected: " + JSON.stringify(r).slice(0, 160));
   await sockOp({ op: "set", name: "vaultwarden.master-password", value: PASSWORD });
@@ -575,6 +583,36 @@ t("prelogin was consulted for KDF params", PRELOGIN_HITS >= 1, `hits=${PRELOGIN_
 // 9. read-only by default: nothing in this suite may write to the vault
 t("no vault writes occurred during resolution", PUT_BODIES.length === 0, JSON.stringify(PUT_BODIES.map((p) => p.url)));
 t("sync was used once for the initial key unwrap", SYNC_HITS >= 1, `sync=${SYNC_HITS}`);
+await t("a rejected field is named in the error, and no token is ever echoed", async () => {
+  const prev = server;
+  server = http.createServer((req, res) => {
+    let b = "";
+    req.on("data", (c) => (b += c));
+    req.on("end", () => {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      // Includes an access_token on purpose: the real server does this on some error paths, so
+      // a debug path that echoes the whole body would leak a live bearer token to stderr, logs,
+      // and any captured output.
+      res.end(JSON.stringify({ error: "invalid_grant", error_description: "Username or password is incorrect. Try again.", validationErrors: { device_identifier: ["The device_identifier field is required."] }, access_token: "LEAK-CHECK-TOKEN" }));
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const api = new vw.VaultwardenApi({ server: url(), timeoutMs: 8000, allowInsecureHttp: true });
+  try {
+    await api.loginPassword({ email: EMAIL, passwordHash: "aaaa" });
+    assert.fail("expected a rejection");
+  } catch (e) {
+    assert.equal(e.status, 400);
+    assert.ok(e.fieldErrors?.some((f) => /device_identifier/.test(f)), `rejected field must be named, got ${JSON.stringify(e.fieldErrors)}`);
+    // The message the operator sees must not contain the token, while rawBody keeps it for
+    // an explicit debug run -- that asymmetry is the whole point.
+    assert.ok(!String(e.message).includes("LEAK-CHECK-TOKEN"), "error message must never echo a bearer token");
+  } finally {
+    server.close();
+    server = prev;
+  }
+});
+
 
 console.log(`\n${pass} passed, ${fail} failed   (tmp home: ${TMP})`);
 console.log(`counts: prelogin=${PRELOGIN_HITS} sync=${SYNC_HITS} ciphers=${CIPHERS_HITS}`);

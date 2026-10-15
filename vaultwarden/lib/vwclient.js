@@ -325,6 +325,17 @@ export class VaultwardenApi {
       const err = new Error(`${method} ${path} -> HTTP ${res.status}${detail ? `: ${detail}` : ""}${hint}`);
       err.status = res.status;
       err.body = detail;
+      // Raw text for debugging, kept separate from the parsed `detail` above.
+      err.rawBody = text;
+      // Validation failures are the ones worth echoing: this server rejected a login because a
+      // form field was duplicated, and the only trace was "device_identifier cannot be blank"
+      // buried in validationErrors. Never echo a whole body -- token responses legitimately
+      // contain access/refresh tokens -- so surface the MESSAGE text and the FIELD NAMES only.
+      try {
+        const j = JSON.parse(text);
+        const ve = j?.validationErrors && typeof j.validationErrors === "object" ? j.validationErrors : null;
+        if (ve) err.fieldErrors = Object.entries(ve).map(([k, v]) => `${k}: ${[].concat(v).join(", ")}`);
+      } catch { /* non-JSON body; nothing structured to report */ }
       throw err;
     }
     if (!text) return null;
