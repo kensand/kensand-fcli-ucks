@@ -33,9 +33,32 @@ unlock` must come from something else.
 f vaultwarden config --server https://vault.example.com --email you@example.com
 f vaultwarden config --master-password             # prompts, no echo
 f vaultwarden test                                 # login + decrypt + report
+```
 
-# only if the account has 2FA on -- the password grant cannot satisfy it from a CLI:
-f vaultwarden apikey <client-id> <client-secret>   # web vault: Settings > API Key
+If `test` reports the server refused a token, check whether the account signs in
+through an identity provider before touching the password again:
+
+```
+f vaultwarden sso status                           # unauthenticated probe, no risk
+f vaultwarden sso login                            # opens a browser, PKCE callback
+f vaultwarden sso login --manual                   # over ssh / in a container: no port
+                                                   # bound, paste the redirect URL back
+```
+
+`enabled` means the password grant **cannot** authenticate this account — not that
+the password is wrong. SSO replaces the *login*, never the *decryption*: the vault
+key is still wrapped in a key derived from the master password, so
+`config --master-password` is still required unless the account genuinely never had
+one (SSO-created accounts have no password at all, and opening those needs an
+enrolled device key pair, which this uck deliberately does not implement). In
+return, SSO yields a refresh token, so the session renews for ~30 days without a
+browser.
+
+A password grant that *does* work is still blocked by 2FA, and that is the one thing
+an API key is for (it skips 2FA; it cannot decrypt anything by itself):
+
+```
+f vaultwarden apikey <client-id> <client-secret>   # web vault: Settings > Security > Keys
 ```
 
 `f vaultwarden test` is the thing to run first: it authenticates, unwraps the
@@ -154,15 +177,49 @@ or your actual KDF. `f vaultwarden test` covers those against the live server.
 
 | message | meaning |
 |---|---|
-| `master password is wrong` | MAC check failed on the symmetric-key unwrap. Re-run `config --master-password`. Not a network problem. |
+| `the server refused to issue a token` | Bitwarden answers `Username or password is incorrect` for a wrong email, a wrong password, **and** a rejected request — it does not say which. Do not assume the password: prove it offline first (see below). `rejected fields:` in the output names the cause when the server gives one. |
+| `MAC verification failed` | the stored master password does not derive the key that opens `profile.key`. Re-run `config --master-password`. Not a network problem. |
+| `unexpected symmetric key length` | **almost always a client bug, not your vault.** The wrapped user key is 64 *raw* bytes; if this ever reappears, look for a `Buffer` → `toString("utf8")` → `base64` round trip before suspecting the account. See the note below. |
 | `no server configured` | run `config --server/--email` |
-| `Scope not supported` | server rejects the OAuth scope; current code sends `scope=api` (verified live) |
-| `device_identifier cannot be blank` | server wants snake_case device fields; current code sends both spellings |
+| `Scope (api) not supported` | correct behaviour, not a bug: this server allows `api` only on `client_credentials`. Password/SSO grants need `api offline_access`. |
+| `device_identifier cannot be blank` | server wants snake_case device fields **and only one spelling**; sending both snake and camel makes Rocket reject it as blank. |
 | `Too many login requests` (429) | rate-limited; **stop retrying**, it extends the lockout |
 | `requires 2FA` | the password grant hit a 2FA policy. Add an API key (`apikey`) — bypassing 2FA is its only purpose. |
-| `Scope ... not supported` | a bug in this uck, not in your account: scope rules differ per grant (see above). Report it. |
 | `unrecognised response shape` | your server returns something unexpected — the error lists its keys, and it deliberately refuses to read that as an empty vault |
 | `the creds store is locked` | `f creds unlock` — the vault cannot be consulted or written to while locked |
+
+### Proving a master password without logging in
+
+A rejected login is ambiguous; a MAC check is not. If a vault can be opened at all,
+the password is right, regardless of what the identity endpoint says:
+
+```js
+const C = await import("./lib/vwclient.js");
+// profile.key comes from an authenticated /api/sync (or from the browser's own
+// sync response, where it equals userDecryption.masterPasswordUnlock.masterKeyEncryptedUserKey)
+C.deriveKeys({ email, password, kdfIterations, encryptedKey: profileKey });
+```
+
+This distinction cost hours: `f vaultwarden test` insisted the password was wrong
+while the very same password decrypted the account's own `profile.key`. The real
+cause was the client, and afterwards the account still could not log in — because
+it is **SSO-provisioned** and has no server-side password hash. Check that next:
+
+```
+f vaultwarden sso status     # enabled = the password grant cannot authenticate this account
+```
+
+### The one bug worth remembering
+
+`unwrapSymmetricKey` must verify the MAC **before** decrypting, and must keep the
+plaintext **binary**. Decrypting first hides a wrong key behind a PKCS#7 padding
+failure, which surfaces as a key *length* error. And the plaintext is 64 raw bytes,
+not base64 — pushing it through `toString("utf8")` turns every byte ≥ 0x80 into
+U+FFFD, which decodes back to **13 bytes**. Three different wrong diagnoses ("weird
+vault", "double base64", "wrong password") all came from that one number, and the
+test suite did not catch it because the fixtures base64-wrapped the key exactly like
+the buggy code did. A fixture that agrees with the code it tests proves nothing;
+these ones are pinned to bytes read off a real server.
 
 If `f providers` does not list `vaultwarden`, the uck failed to load: run
 `f vaultwarden status` and read the error.
