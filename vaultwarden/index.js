@@ -61,6 +61,7 @@ const C_TOKEN = "vaultwarden.access-token";
 const C_REFRESH = "vaultwarden.refresh-token";
 const C_KEY_CACHE = "vaultwarden.key-cache";
 const C_EXPIRES = "vaultwarden.access-expires-at";
+const C_FOLDER = "vaultwarden.folder";
 
 /** How long a mirrored value may sit before `f creds` re-asks the vault. */
 const MIRROR_TTL_SEC = 3600;
@@ -98,6 +99,10 @@ function vwConfig() {
     timeoutMs: Number(v.timeoutMs ?? 20000),
     map: v.map ?? {},          // cred name -> "Item Name::password"
     extraNames: v.extraNames ?? {}, // vault item name -> [extra cred names]
+    // Folder NAME (not id) that `put` creates items in. Resolved to an id on
+    // each write and created if missing — a name survives an export/import, a
+    // uuid does not.
+    folder: v.folder ?? null,
   };
 }
 
@@ -221,6 +226,17 @@ function credsStatus() {
 /* -------------------------------------------------------- secret prompt */
 
 /** Read a secret from the TTY without echoing. */
+/** Read all of piped stdin. Used by `put` so a secret never appears in argv. */
+function readAllStdin() {
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (c) => (buf += c));
+    process.stdin.on("end", () => resolve(buf));
+    process.stdin.on("error", reject);
+  });
+}
+
 async function promptSecret(label) {
   if (!process.stdin.isTTY) {
     const rl = readline.createInterface({ input: process.stdin });
@@ -799,7 +815,7 @@ function safeHasCache() {
 
 const USAGE =
   "usage: f vaultwarden <cmd>\n" +
-  "  config [--server <url>] [--email <addr>] [--master-password] [--print]\n" +
+  "  config [--server <url>] [--email <addr>] [--folder <name>] [--master-password] [--print]\n" +
   "                                    set non-secret config; prompts for the\n" +
   "                                    master password without echoing it\n" +
   "  apikey <client-id> <client-secret> store the vault API key (skips 2FA)\n" +
@@ -810,6 +826,8 @@ const USAGE =
   "  map <cred-name> '<Item::field>'   pin a cred name to an item/field\n" +
   "  unmap <cred-name>                 remove a map entry\n" +
   "  set-totp <name> <secret>          WRITE: store a TOTP secret on an item\n" +
+  "  put <name> [--force]              WRITE: create a login item holding one secret\n" +
+  "                                      value via stdin, --from-cred <cred>, or --from-env VAR\n" +
   "  cache [--clear]                   vault key cache (skips PBKDF2 per read)\n" +
   "  forget                            clear the key cache and cached tokens\n" +  "  sso status                        does the server have OIDC SSO enabled\n" +
   "                                    (unauthenticated probe)\n" +
@@ -844,6 +862,7 @@ export function register(ctx) {
 /* Flags that take a value. Kept explicit so parsing is unambiguous. */
 const VALUE_FLAGS = new Set([
   "--server", "--email", "--search", "--ttl", "--iterations", "--field", "--map",
+  "--folder", "--from-cred", "--from-env",
 ]);
 
 async function main(argv) {
@@ -894,6 +913,8 @@ async function main(argv) {
       const email = flagVal("email") ?? (has("email") ? usage("config --email needs a value") : null);
       if (server) patch.server = server.replace(/\/+$/, "");
       if (email) patch.email = email;
+      const folder = flagVal("folder") ?? (has("folder") ? usage("config --folder needs a value") : null);
+      if (folder !== null) patch.folder = folder === "" ? null : folder;
       if (Object.keys(patch).length) {
         saveVwConfig(patch);
         for (const [k, v] of Object.entries(patch)) process.stdout.write(`config\t${k}\t${v}\n`);
@@ -909,6 +930,7 @@ async function main(argv) {
         const cfg = vwConfig();
         process.stdout.write(`server\t${cfg.server ?? "(unset)"}\n`);
         process.stdout.write(`email\t${cfg.email ?? "(unset)"}\n`);
+        process.stdout.write(`folder\t${cfg.folder ?? "(unset — items are created at the vault root)"}\n`);
         process.stdout.write(`map\t${Object.keys(cfg.map ?? {}).length} entr(ies)\n`);
         for (const [k, v] of Object.entries(cfg.map ?? {})) process.stdout.write(`  ${k} -> ${v}\n`);
       }
@@ -1063,6 +1085,65 @@ async function main(argv) {
       dropKeyCache(); // server bumped revisionDates; force a clean resync
       process.stdout.write(`set-totp\t${item.name}\n`);
       process.stdout.write("note\tmirrors of this item may still hold the old value: f creds forget <name>\n");
+      break;
+    }
+    case "put": {
+      // Create a login item holding one secret. The VALUE is never an argv
+      // positional: `set-totp` takes its secret as an argument and that is a
+      // known wart (any process can read it from `ps`), so a command whose whole
+      // job is moving many secrets into the vault must not copy it.
+      //   echo SECRET | f vaultwarden put <name>
+      //   f vaultwarden put <name> --from-cred <stored-cred-name>
+      //   f vaultwarden put <name> --from-env VAR
+      const [name] = rest;
+      if (!name) return usage("put needs <item-name>; give the value on stdin, via --from-cred, or via --from-env");
+      if (rest.length > 1) {
+        return usage("put does not take the secret as an argument (it would be visible in `ps`) — use stdin, --from-cred, or --from-env");
+      }
+      let value = null, origin = "";
+      if (has("from-cred")) {
+        const src = flagVal("from-cred") ?? usage("--from-cred needs a cred name");
+        value = credsGet(src);
+        if (value == null) return usage(`no such cred locally: ${src}`);
+        origin = `cred:${src}`;
+      } else if (has("from-env")) {
+        const src = flagVal("from-env") ?? usage("--from-env needs a variable name");
+        if (!(src in process.env)) return usage(`env var ${src} is not set`);
+        value = process.env[src];
+        origin = `env:${src}`;
+      } else {
+        if (process.stdin.isTTY) {
+          value = await promptSecret(`f: secret for '${name}' (not echoed): `);
+        } else {
+          value = (await readAllStdin()).replace(/\n$/, "");
+        }
+        origin = "stdin";
+      }
+      if (!value) return usage("empty value — nothing written");
+
+      const cfg = vwConfig();
+      const { api, keys, items } = await openVault({ allowInsecureHttp: has("allow-insecure-http") });
+      const lc = name.trim().toLowerCase();
+      const dupe = items.filter((i) => i.name.trim().toLowerCase() === lc);
+      if (dupe.length && !has("force")) {
+        process.stderr.write(`f: ${dupe.length} item(s) already named '${name}' — pass --force to create another, or set-totp/update the existing one\n`);
+        process.exit(1);
+      }
+      const folder = cfg.folder ?? null;
+      const folderId = await api.ensureFolder(folder, keys);
+      const uuid = await userUuid(api);
+      const body = toWire({
+        type: CIPHER_TYPE.LOGIN, name: encryptString(name, keys), key: null,
+        notes: null, fields: null, favorite: false, reprompt: 0,
+        organizationId: null, folderId, passwordHistory: null,
+        login: { uris: [], username: null, "password": encryptString(value, keys), totp: null },
+      }, {}, uuid);
+      const made = await api.postCipher(body);
+      if (!made?.id) throw new Error("the server accepted the request but returned no item id");
+      dropKeyCache(); // revisionDates moved; do not serve a stale list
+      process.stdout.write(`created\t${name}\t${made.id}${folder ? `\tfolder\t${folder}` : ""}\n`);
+      process.stdout.write(`source\t${origin}\n`);
+      process.stdout.write(`note\tthe value stays in ${origin === "stdin" ? "stdin/prompt history" : origin}; remove the local copy with: f creds rm <name>\n`);
       break;
     }
     case "cache": {

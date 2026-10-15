@@ -646,6 +646,36 @@ export class VaultwardenApi {
   postCipher(payload) { return this.#request("/api/ciphers", { method: "POST", json: payload }); }
   putCipher(id, payload) { return this.#request(`/api/ciphers/${encodeURIComponent(id)}`, { method: "PUT", json: payload }); }
 
+  folders() { return this.#request("/api/folders"); }
+  postFolder(name) { return this.#request("/api/folders", { method: "POST", json: { name } }); }
+
+  deleteCipher(id) { return this.#request(`/api/ciphers/${encodeURIComponent(id)}`, { method: "DELETE" }); }
+
+  /**
+   * Resolve a folder NAME to its id, creating the folder when absent.
+   * Returns the folder id, or null when `name` is null/empty (no folder).
+   *
+   * Names are compared case-insensitively on the DECRYPTED name. Two folders
+   * with the same name is an error rather than a first-match coin flip, matching
+   * how item resolution behaves elsewhere in this uck.
+   */
+  async ensureFolder(name, keys) {
+    if (name === null || name === undefined || name === "") return null;
+    const list = (await this.folders())?.data ?? [];
+    const want = String(name).trim().toLowerCase();
+    const hits = [];
+    for (const f of list) {
+      let dec;
+      try { dec = decryptString(f.name, keys); } catch { continue; }
+      if (String(dec ?? "").trim().toLowerCase() === want) hits.push(f);
+    }
+    if (hits.length > 1) {
+      throw new Error(`vault has ${hits.length} folders named '${name}' — rename them or use a distinct name`);
+    }
+    if (hits.length === 1) return hits[0].id;
+    return (await this.postFolder(encryptString(String(name), keys))).id;
+  }
+
   alive() { return this.#request("/alive", { auth: false }); }
 }
 
