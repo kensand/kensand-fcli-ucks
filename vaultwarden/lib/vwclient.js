@@ -628,6 +628,22 @@ export class VaultwardenApi {
   /** Ciphers only — cheaper than sync when you already hold the keys. */
   ciphers() { return this.#request("/api/ciphers"); }
 
+  /**
+   * Create or update a cipher.
+   *
+   * BOTH verbs require `encryptedFor` set to the authenticated user's uuid.
+   * Vaultwarden's `CipherData` is `#[serde(rename_all = "camelCase")]` with no
+   * `#[serde(default)]` on `encrypted_for`, so the field is MANDATORY on create
+   * and update alike; without it serde rejects the whole body. The resulting
+   * HTTP 422 is contentless — no `validationErrors`, no field name — so this
+   * never surfaces as an actionable message. Verified against a live server:
+   * POST/PUT with `encryptedFor` -> 200; without it -> 422.
+   *
+   * Legacy (master-password) vaults need NEITHER a top-level `key` nor
+   * `encryptedByKeyId`: `sync.profile.keyId` is undefined and every cipher
+   * carries `key: null`. Send both as null and leave them alone.
+   */
+  postCipher(payload) { return this.#request("/api/ciphers", { method: "POST", json: payload }); }
   putCipher(id, payload) { return this.#request(`/api/ciphers/${encodeURIComponent(id)}`, { method: "PUT", json: payload }); }
 
   alive() { return this.#request("/alive", { auth: false }); }

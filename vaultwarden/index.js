@@ -460,7 +460,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
         const keys = await deriveKeys({ email: cfg.email, password: master, encryptedKey: encKey, ...kdfCfg });
         await writeKeyCache(cfg, keys, api);
         const items = decryptVault(payload, keys);
-        return { api, cfg, keys, items: items.length ? items : decryptVault(sync, keys), fromCache: false };
+        return { api, cfg, keys, uuid: sync?.profile?.id ?? null, items: items.length ? items : decryptVault(sync, keys), fromCache: false };
       } catch (e) {
         const m = String(e.message ?? e);
         // Distinguish "your master password is wrong" from "the token was fine but
@@ -521,7 +521,19 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     else throw new Error(`vault read failed: ${e.message} (sync carried no ciphers to fall back on)`);
   }
   const items = decryptVault(payload, keys);
-  return { api, cfg, keys, items, fromCache: false, kdf: pre };
+  return { api, cfg, keys, uuid: sync?.profile?.id ?? null, items, fromCache: false, kdf: pre };
+}
+
+/**
+ * The authenticated user's uuid, which every cipher write must send as
+ * `encryptedFor`. Deliberately fetched over the network rather than read from
+ * the key cache: the cache's stored token may have aged out, and a stale bearer
+ * turns an ordinary write into a 401 that says nothing about the token.
+ */
+async function userUuid(api) {
+  const id = (await api.sync().catch(() => null))?.profile?.id;
+  if (!id) throw new Error("could not determine the vault user uuid (sync returned no profile.id) — required for any cipher write");
+  return id;
 }
 
 /* ------------------------------------------------ key cache (in the box) */
@@ -1047,7 +1059,7 @@ async function main(argv) {
         }
       }
       login.totp = encryptString(secret, keys);
-      await api.putCipher(item.id, toWire(raw, { login }));
+      await api.putCipher(item.id, toWire(raw, { login }, await userUuid(api)));
       dropKeyCache(); // server bumped revisionDates; force a clean resync
       process.stdout.write(`set-totp\t${item.name}\n`);
       process.stdout.write("note\tmirrors of this item may still hold the old value: f creds forget <name>\n");
@@ -1229,20 +1241,43 @@ async function main(argv) {
  * omitted rather than guessed so a partial write cannot blank a field the uck
  * does not model.
  */
-function toWire(raw, patch) {
+/**
+ * Build a `CipherData` body for POST (create, id=null) or PUT (update, id set).
+ *
+ * Every field Vaultwarden's `CipherData` struct declares must appear. The struct
+ * has no `#[serde(default)]` on `encrypted_for`, so omitting it fails serde and
+ * the server answers with a contentless 422 that names no field — the worst
+ * possible failure mode, because it looks like a permissions problem. `uuid` is
+ * therefore required here, not optional; it comes from `sync.profile.id`.
+ *
+ * Ciphertext passes through untouched: `raw` is the server's own object, so
+ * name/notes/login are already encrypted under the account key. Values in `patch`
+ * must already be encrypted by the caller.
+ */
+export function toWire(raw, patch, uuid) {
+  if (!uuid) throw new Error("toWire: user uuid is required — Vaultwarden rejects a cipher body without encryptedFor");
+  const login = raw.login ?? {};
   const body = {
     type: raw.type,
+    encryptedFor: uuid,
+    encryptedByKeyId: null,
     organizationId: raw.organizationId ?? null,
     folderId: raw.folderId ?? null,
     favorite: !!raw.favorite,
+    reprompt: raw.reprompt ?? 0,
     name: raw.name,
+    notes: raw.notes ?? null,
+    fields: raw.fields ?? null,
+    key: raw.key ?? null,
+    login: { ...login, uris: login.uris ?? [], ...patch.login },
+    passwordHistory: raw.passwordHistory ?? null,
   };
-  if (raw.notes !== undefined) body.notes = raw.notes;
-  if (raw.fields !== undefined) body.fields = raw.fields;
-  if (raw.login !== undefined) body.login = {uris: raw.login?.uris ?? [], ...patch.login};
-  if (raw.passwordHistory !== undefined) body.login.passwordHistory = raw.passwordHistory;
-  if (raw.identity !== undefined) body.identity = raw.identity;
+  // On update the server also wants the type-specific sibling it stored; sending
+  // them as null would blank anything the item had.
+  if (raw.secureNote !== undefined) body.secureNote = raw.secureNote;
   if (raw.card !== undefined) body.card = raw.card;
+  if (raw.identity !== undefined) body.identity = raw.identity;
+  if (raw.sshKey !== undefined) body.sshKey = raw.sshKey;
   return body;
 }
 
