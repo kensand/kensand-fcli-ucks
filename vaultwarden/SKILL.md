@@ -5,6 +5,10 @@ description: Read credentials from a Vaultwarden/Bitwarden server with a zero-de
 
 # Vaultwarden as a credential source
 
+> **Full command reference, setup walkthrough, and defaults: [`README.md`](./README.md).**
+> This file is the failure-mode and debugging guide — start at
+> [Troubleshooting](#troubleshooting) if something already broke.
+
 `f vaultwarden` talks to a Vaultwarden (Bitwarden-compatible) server directly —
 no `bw` binary, no npm deps, just `node:crypto` and `fetch`. It is wired into
 `f creds` as a **provider**: `f creds get <name>` checks the local encrypted
@@ -105,12 +109,18 @@ the vault unreachable. Defaults: 3600s TTL, and a 300s **negative** cache so an
 unknown name does not hammer the server on every call.
 
 ```
-f creds get <name> --provider         # force a fresh vault read, ignore the mirror
-f creds get <name> --no-provider      # local store only (fails if only in the vault)
+f creds get <name> --vault            # skip the mirror, revalidate with the provider now
+f creds get <name> --local            # never consult providers
+f creds get <name> --source           # provenance to stderr, e.g. `local:<name>`,
+                                      # `vaultwarden:<name> (mirrored)`, `vault:mirror:<name>`
+f creds get <name> --no-cache         # ignore/clear the negative cache first
+f creds forget <name>                 # drop that name's mirror(s) + negative cache
 f vaultwarden cache                   # is the derived key cached? how old?
 f vaultwarden cache --clear           # drop it (forces PBKDF2 re-derivation)
 f vaultwarden forget                  # key cache + cached tokens
 ```
+
+There is **no `--provider` / `--no-provider`**; `--vault` and `--local` are the pair.
 
 Because a mirror is a copy of a secret sitting in the same encrypted box, treat
 `f creds rm mirror:<name>` as a real secret-deletion operation.
@@ -156,11 +166,51 @@ Only `set-totp` writes, and only to the item you name. It re-encrypts with the
 item's own key and PUTs the ciphertext back. Read-only is the default everywhere
 else; nothing in the resolution path can mutate the vault.
 
+## Best practices
+
+**Ordering that actually saves time**, when a vault read fails:
+
+1. `f vaultwarden status` — is it configured and unlocked at all?
+2. `f vaultwarden test` — names the failing stage, changes nothing.
+3. `f vaultwarden sso status` — before you touch the password. If SSO is `enabled`, the
+   password grant *cannot* work and no amount of retyping will change that.
+4. Only then suspect the credential.
+
+**Never retry a refused password grant.** Bitwarden returns the same `Username or
+password is incorrect` for a wrong email, a wrong password, and a *rejected request*,
+and the server rate-limits with a lockout that your retries extend. Prove the password
+offline (below) instead of asking the server.
+
+**Prove, don't infer, at every crypto boundary.** A MAC failure is the only signal that
+a key is wrong; a padding or length error means you got as far as decrypting with
+something and the shape is already broken. When a number looks impossible (a 64-byte
+key reported as 13 bytes), check your own conversion before the account.
+
+**Treat these as client bugs, not vault problems** — each has been one here:
+`unexpected symmetric key length`, `Scope … not supported`, `unrecognised response
+shape`. All three are the client mis-reading a server, and all three were.
+
+**An empty result is not a parse bug until the raw response agrees.** `test` printing
+`0 item(s)` was a genuinely empty vault; confirm against the endpoint before rewriting
+the response-shape logic.
+
+**Keep secrets out of argv.** `config --master-password` prompts; `apikey` takes
+arguments because there is no interactive path in the provider probe — accept that
+trade-off knowingly rather than adding `--password <x>` "for convenience".
+
+**When you change this uck:** mutation-test the fix. Break it on purpose and confirm a
+test goes red. Several "passing" tests here were proven worthless that way — including
+fixtures that base64-wrapped a key exactly the way the buggy code did, so they agreed
+with the bug instead of catching it. A fixture that agrees with the code it tests
+proves nothing; pin fixtures to bytes read off a real server.
+
 ## Tests
 
 ```
-node test/crypto.test.mjs    # 27: crypto vectors, envelope handling, error shapes
-node test/e2e.test.mjs       # 30: whole provider ladder vs a mock Vaultwarden
+node test/run-all.mjs               # all suites
+node test/crypto.test.mjs           # 33: crypto vectors, envelope handling, error shapes
+node test/e2e.test.mjs              # 57: whole provider ladder vs a mock Vaultwarden
+node test/bitwarden-wasm.test.mjs   #  7: byte-for-byte agreement with the official wasm
 ```
 
 `e2e.test.mjs` spins up a real `f creds` daemon in a throwaway `HOME` and a mock
