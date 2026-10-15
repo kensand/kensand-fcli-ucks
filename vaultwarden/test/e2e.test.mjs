@@ -123,6 +123,10 @@ let CIPHERS_HITS = 0;
 let PUT_BODIES = [];
 let FAIL_CIPHERS_WITH = null; // e.g. 401
 let RATE_LIMIT_NEXT = false;
+let SSO_PENDING = null;      // { challenge } set when the authorize URL is observed
+const PKCE_LOG = [];           // every exchange the mock saw, for diagnosis
+let SSO_ENABLED = true;        // served at /identity/sso/prevalidate
+let SSO_HAS_MASTER = true;   // false = an SSO-created account with no master password at all
 
 const server = http.createServer((req, res) => {
   let body = "";
@@ -153,8 +157,55 @@ const server = http.createServer((req, res) => {
       // Note the mock deliberately does NOT accept a scope the live server rejects: the
       // previous revision asserted scope === "api" for client_credentials as if probed, and
       // that was never actually tested against the real thing.
-      if (p.grant_type !== "client_credentials" && p.grant_type !== "password") {
+      if (p.grant_type !== "client_credentials" && p.grant_type !== "password" && p.grant_type !== "authorization_code") {
         return send(400, { message: "unsupported grant", validationErrors: { "": ["unsupported grant"] } });
+      }
+      if (p.grant_type === "authorization_code") {
+        // Contract for the SSO grant (src/api/identity.rs), and the failure this mock exists to
+        // catch: `cli` is the only accepted client, PKCE replaces the client secret, and the
+        // scope includes offline_access -- which is what earns the refresh_token that lets a
+        // session renew for ~30 days. A client that silently dropped it would "work" and then
+        // require a browser every two hours.
+        if (p.client_id !== "cli") return send(400, { message: "unsupported client", validationErrors: { "": ["unsupported client"] }, error_description: "" });
+        if (p.scope !== "api offline_access") return send(400, { message: `Scope (${p.scope}) not supported`, validationErrors: { "": [`Scope (${p.scope}) not supported`] }, error_description: "" });
+        if (!p.code) return send(400, { message: "code is required", validationErrors: { "": ["code is required"] }, error_description: "" });
+        if (!p.code_verifier) return send(400, { message: "code_verifier is required", validationErrors: { "": ["code_verifier is required"] }, error_description: "" });
+        // Prove the PKCE binding rather than accepting any verifier: the server checks
+        // code_challenge === BASE64URL(SHA256(code_verifier)), and an exchange that skipped it
+        // would accept a code captured from someone else's browser.
+        const expect = crypto.createHash("sha256").update(String(p.code_verifier)).digest("base64url");
+        PKCE_LOG.push({
+          pending: SSO_PENDING?.challenge ?? null,
+          expect,
+          verifierFull: String(p.code_verifier),
+          verifierLen: String(p.code_verifier).length,
+          bodyKeys: Object.keys(p).sort().join(","),
+        });
+        if (SSO_PENDING?.challenge !== expect) {
+          return send(400, { message: "invalid_grant", error_description: "PKCE verification failed", validationErrors: { "": ["PKCE verification failed"] }, error_description: "PKCE verification failed" });
+        }
+        SSO_PENDING = null; // single use, like the real thing
+        GRANTS.push("authorization_code");
+        // Logged like every other grant. TOKEN_LOG is normally appended further down the
+        // handler, but this branch sends its reply early, so recording it there would never
+        // run -- and the assertions on the posted fields silently saw only password grants.
+        TOKEN_LOG.push({ grant: "authorization_code", status: 200, fields: p, sentDevice: ["device_identifier", "device_name", "device_type"].filter((k) => k in p) });
+        return send(200, {
+          access_token: "sso." + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url"),
+          refresh_token: "sso-refresh-1",
+          expires_in: 3600,
+          token_type: "Bearer",
+          scope: "api offline_access",
+          // What key derivation needs, carried by the SSO response so the flow never needs
+          // /prelogin (an endpoint an SSO-only account may not be allowed to use).
+          Key: profileKey,
+          Kdf: 0,
+          KdfIterations: ITER,
+          UserDecryptionOptions: {
+            HasMasterPassword: SSO_HAS_MASTER,
+            MasterPasswordUnlock: { MasterKeyEncryptedUserKey: profileKey, Salt: EMAIL },
+          },
+        });
       }
       // client_credentials accepts ONLY `api`: `api.device`/`api.offline`/`api.push` all come
       // back "Scope not supported", while `api` proceeds to client-id validation. Verified
@@ -188,7 +239,7 @@ const server = http.createServer((req, res) => {
       if (p.grant_type === "client_credentials" && (p.client_id !== "user.test-id" || p.client_secret !== "test-secret")) return send(400, { message: "Invalid client_id", validationErrors: { "": ["Invalid client_id"] }, error_description: "" });
       TOKEN_SEEN = { grant: p.grant_type, clientId: p.client_id, scope: p.scope, deviceType: p.device_type ?? p.deviceType };
       GRANTS.push(p.grant_type);
-      TOKEN_LOG.push({ grant: p.grant_type, status: null, sentDevice: Object.keys(p).filter((k) => /^device/i.test(k)) });
+      TOKEN_LOG.push({ grant: p.grant_type, status: null, fields: p, sentDevice: Object.keys(p).filter((k) => /^device/i.test(k)) });
       // The "first run" is the first batch of grant attempts ending in a
       // success. Recorded when a grant succeeds so the assertion below cannot pass
       // vacuously off an empty slice.
@@ -212,6 +263,14 @@ const server = http.createServer((req, res) => {
     if (req.method === "PUT" && /^\/api\/ciphers\//.test(req.url)) {
       PUT_BODIES.push({ url: req.url, body: JSON.parse(body || "{}"), auth });
       return send(200, { object: "cipher", id: req.url.split("/").pop(), revisionDate: "2026-01-02T00:00:00.000Z" });
+    }
+    if (req.method === "GET" && req.url.startsWith("/identity/sso/prevalidate")) {
+      // The real probe is unauthenticated and returns {"token": "<jwt>"} when SSO is on;
+      // a server with SSO_ENABLED=false answers 400. Both shapes matter: an earlier client
+      // looked for a boolean `ssoEnabled` field that does not exist, and reported "not
+      // enabled" against a server whose SSO worked fine.
+      if (!SSO_ENABLED) return send(400, { message: "SSO sign-in is not available", validationErrors: { "": ["SSO sign-in is not available"] } });
+      return send(200, { token: "mock-sso-jwt." + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 600 })).toString("base64url") });
     }
     return send(404, { error: "not_found", path: req.url });
   });
@@ -597,7 +656,8 @@ await t("a rejected field is named in the error, and no token is ever echoed", a
     });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const api = new vw.VaultwardenApi({ server: url(), timeoutMs: 8000, allowInsecureHttp: true });
+  const { VaultwardenApi } = await import(pathToFileURL(path.join(UCK, "lib", "vwclient.js")).href);
+    const api = new VaultwardenApi({ server: BASE, timeoutMs: 8000, allowInsecureHttp: true });
   try {
     await api.loginPassword({ email: EMAIL, passwordHash: "aaaa" });
     assert.fail("expected a rejection");
@@ -613,6 +673,206 @@ await t("a rejected field is named in the error, and no token is ever echoed", a
   }
 });
 
+
+
+/* ------------------- SSO login, end to end through a mock IdP -------------------
+ * This path reached the operator's terminal broken ("ssoRequiresMasterPassword is not
+ * defined") because NOTHING here exercised it: every earlier test drove the provider
+ * layer, never the `sso login` command. So this drives the real CLI as a child process,
+ * the only way to catch a missing import or a wrong name in the command handler -- those
+ * are runtime errors and the module imports cleanly without them.
+ *
+ * ONE INVOCATION, START TO FINISH. `sso login` mints a fresh PKCE verifier per process and
+ * keeps it only in that process's memory, so the URL whose code_challenge the IdP (here, the
+ * mock) sees and the process that POSTs the matching code_verifier must be the same process.
+ * Scraping a URL from one run and pasting the code into another cannot work -- and an earlier
+ * version of this test did exactly that, then spent a long time on a "PKCE verification
+ * failed" that was entirely the harness's fault.
+ */
+{
+  fs.mkdirSync(path.join(TMP, ".f"), { recursive: true });
+  fs.writeFileSync(path.join(TMP, ".f", "f.config.json"), JSON.stringify({
+    vaultwarden: { server: BASE, email: EMAIL, timeoutMs: 20000, allowInsecureHttp: true },
+  }));
+  const { spawn } = await import("node:child_process");
+
+  // Start the CLI and drive its stdin as it prompts, so challenge and verifier stay in one
+  // process. The URL appears on stderr before the prompt; the code is only produced by
+  // whatever we hand back.
+  const loginOnce = (args, codeFor) => new Promise((resolve) => {
+    const c = spawn(process.execPath, [path.join(UCK, "index.js"), ...args], {
+      cwd: SAFE_CWD, env: { ...process.env, HOME: TMP, ...(process.env.VW_TRACE ? { VW_TRACE: "1" } : {}) }, stdio: ["pipe", "pipe", "pipe"],
+    });
+    c.stdin.on("error", () => { /* EPIPE once the CLI stops reading: expected */ });
+    let out = "", err = "", asked = false;
+    c.stdout.on("data", (d) => { out += d; });
+    c.stderr.on("data", (d) => {
+      err += d;
+      // React to the printed authorize URL rather than to a timer.
+      if (asked) return;
+      const m = /\/identity\/connect\/authorize\?([^\s]+)/.exec(err);
+      if (!m) return;
+      asked = true;
+      const q = new URLSearchParams(m[1]);
+      SSO_PENDING = { challenge: q.get("code_challenge") };   // as the real IdP would record it
+      const redirect = `http://localhost:8065/?code=${codeFor}&state=${q.get("state")}&scope=api+offline_access&iss=${encodeURIComponent(BASE)}`;
+      // Delay before writing. Writing synchronously from inside the stderr listener beats
+      // the CLI to its own prompt and the line is lost -- the child then exited 0 with empty
+      // stdout, which looked exactly like a product bug and was not one. The CLI prints the
+      // URL, prints its prompt, and only then starts reading stdin.
+      setTimeout(() => { try { c.stdin.write(redirect + "\n"); } catch { /* gone */ } }, 400);
+      // Deliberately no c.stdin.end(): readline reports end-of-input as `close`, and the CLI
+      // now (correctly) answers "stdin is not a tty" and quits. Ending stdin here used to make
+      // every login "succeed" with an empty stdout.
+    });
+    // Do NOT c.stdin.end(): readline treats end-of-input as `close`, and the CLI now
+    // (correctly) answers "stdin is not a tty" and quits. That is what made an earlier
+    // version of this harness resolve the login successfully-looking with empty stdout:
+    // the child exited 0 having done nothing. Keep stdin open and let the CLI close it.
+    // Resolve ONLY from `close`. `close` fires once both pipes have ended, which is what makes
+    // `out` complete: an earlier version also resolved from this timeout, and if it won the
+    // race the assertions saw `out` as an empty string and reported a successful login as a
+    // failure. The timeout must still kill a hung child, but it must not resolve early.
+    const kill = setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* gone */ } }, 60000);
+    // Resolve on `close`, which fires only after both pipes have ended -- that is what makes
+    // `out` complete. The timeout above must kill a hung child but must NOT resolve early: an
+    // earlier revision resolved from the timer too, and whenever it won the race the assertions
+    // saw an empty `out` and called a working login a failure.
+    c.on("close", (code, signal) => { clearTimeout(kill); resolve({ code, signal, out, err }); });
+    // A child that could not start at all must be visible: without this a spawn failure reads
+    // as "empty output, exit 0", which is how this suite hid bugs in itself.
+    c.on("error", (e) => { clearTimeout(kill); resolve({ code: null, out, err: err + "\n[spawn error] " + e.message, spawnError: true }); });
+  });
+
+  // 1. sso status -- unauthenticated probe; must not need a token or a password
+  {
+    const r = await new Promise((res) => {
+      const c = spawn(process.execPath, [path.join(UCK, "index.js"), "sso", "status"], { cwd: SAFE_CWD, env: { ...process.env, HOME: TMP }, stdio: ["ignore", "pipe", "pipe"] });
+      let o = ""; c.stdout.on("data", (d) => (o += d)); c.on("close", () => res({ out: o }));
+    });
+    t("sso status reports the mock's SSO as enabled", /sso\tenabled/.test(r.out), JSON.stringify(r).slice(0, 160));
+  }
+
+  // 2. a non-tty must fail loudly. `--manual` reads the pasted redirect from stdin; with no
+  //    tty it used to hang and then exit 0 with empty output, indistinguishable from success.
+  {
+    const r = await new Promise((res) => {
+      const c = spawn(process.execPath, [path.join(UCK, "index.js"), "sso", "login", "--manual"], { cwd: SAFE_CWD, env: { ...process.env, HOME: TMP }, stdio: ["ignore", "pipe", "pipe"] });
+      let o = "", e = ""; c.stdout.on("data", (d) => (o += d)); c.stderr.on("data", (d) => (e += d));
+      c.on("close", (code) => res({ code, out: o, err: e }));
+      setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* gone */ } res({ code: null, out: o, err: e, hung: true }); }, 30000);
+    });
+    t("no terminal => a real error, not a silent exit 0",
+      r.code !== 0 && (r.out + r.err).trim().length > 0 && !/is not defined/.test(r.err),
+      JSON.stringify({ code: r.code, hung: !!r.hung, tail: r.err.slice(-90) }));
+  }
+
+  // 3. the full manual login, in one process
+  {
+    const r = await loginOnce(["sso", "login", "--manual"], "fe1049e96ec149bbae03290f0c2ed220");
+    const combined = r.out + r.err;
+    t("no missing-name crash (the bug that reached the operator)",
+      !/is not defined/.test(combined), combined.split("\n").find((l) => /is not defined/.test(l)) || "clean");
+    t("token exchange succeeded with the pasted redirect", /authenticated\s+yes/.test(r.out),
+      JSON.stringify({ code: r.code, out: r.out.slice(0, 90), tail: r.err.slice(-160) }));
+    t("the offline_access scope earned a refresh token", /refresh token\s+yes/.test(r.out), JSON.stringify(r.out).slice(0, 160));
+    t("the SSO grant was the grant actually used", GRANTS.includes("authorization_code"), JSON.stringify(GRANTS.slice(-3)));
+    {
+      const ssoTok = TOKEN_LOG.filter((e) => e.grant === "authorization_code").pop();
+      t("the code_verifier was posted, not just the code",
+        Boolean(ssoTok?.fields?.code_verifier && ssoTok.fields.code),
+        JSON.stringify(ssoTok?.fields ?? "no authorization_code token request seen").slice(0, 200));
+      // The device fields are required here too; a missing one is rejected before the
+      // exchange is even considered.
+      t("the SSO grant sent the device fields", ssoTok?.sentDevice?.length === 3, JSON.stringify(ssoTok?.sentDevice));
+      t("the SSO grant asked for offline_access (this is what earns the refresh token)",
+        ssoTok?.fields?.scope === "api offline_access", ssoTok?.fields?.scope ?? "(none)");
+      t("the SSO grant used client_id=cli", ssoTok?.fields?.client_id === "cli", ssoTok?.fields?.client_id ?? "(none)");
+      t("the SSO grant sent NO client secret (PKCE replaces it)",
+        !ssoTok?.fields?.client_secret, "a secret was sent; PKCE should make it unnecessary");
+    }
+    // The child process writes to the REAL creds store in TMP, not to the in-process `box`
+    // that the provider tests use -- asserting on `box` here could only ever fail. What this
+    // can assert without a second store is that a refresh token came back at all (next
+    // assertion), which is the thing that makes a later run work without a browser.
+    t("the CLI reported the session as usable later", /sessions renew without a browser/.test(r.out), JSON.stringify(r.out).slice(0, 200));
+
+    // THE POINT OF THE AWAIT. persistSsoTokens writes through a daemon socket, so an
+    // un-awaited call turns a failed write into an unhandled rejection: nothing is printed,
+    // the process exits 0, and `authenticated  yes` still prints above it -- a login that
+    // looks flawless and whose session was never saved, so the next run says "not logged in".
+    // Asserting only on the success text CANNOT see that (proven: removing both awaits kept
+    // this suite green), so read the tokens back from the store the CLI wrote to.
+    // Read the session back through the daemon, the same socket the CLI wrote through.
+    // Using the CLI to read it would re-enter discovery and a vault open; the daemon is the
+    // thing whose agreement actually matters here.
+    const readBack = (name) => new Promise((res) => {
+      const sock = (() => { try { return JSON.parse(fs.readFileSync(path.join(TMP, ".f", ".creds-daemon"), "utf8")).socket; } catch { return null; } })();
+      if (!sock) return res({ error: "no daemon socket in the temp home" });
+      const c = net.connect(sock, () => c.write(JSON.stringify({ op: "get", name })));
+      let buf = "";
+      c.on("data", (d) => (buf += d));
+      c.on("end", () => { try { res(JSON.parse(buf)); } catch (e) { res({ error: String(e.message) }); } });
+      c.on("error", (e) => res({ error: e.code }));
+      setTimeout(() => res({ error: "timeout" }), 15000);
+    });
+    const tokR = await readBack("vaultwarden.access-token");
+    const refR = await readBack("vaultwarden.refresh-token");
+    t("the SSO session was actually persisted (not a floating promise)",
+      tokR.ok === true && refR.ok === true,
+      JSON.stringify({ access: tokR.ok ? "stored" : tokR.error ?? tokR, refresh: refR.ok ? "stored" : refR.error ?? refR }).slice(0, 200));
+  }
+
+  // 4. PKCE is enforced by the server, so a captured code + wrong verifier must fail
+  {
+    SSO_PENDING = { challenge: "Z".repeat(43) };
+    const { VaultwardenApi } = await import(pathToFileURL(path.join(UCK, "lib", "vwclient.js")).href);
+    const api = new VaultwardenApi({ server: BASE, timeoutMs: 8000, allowInsecureHttp: true });
+    let msg = "";
+    try { await api.loginSso({ code: "stolen-code-1234567890", codeVerifier: crypto.randomBytes(32).toString("base64url") }); msg = "ACCEPTED"; }
+    catch (e) { msg = String(e.message); }
+    t("a code with a non-matching verifier is refused", /PKCE verification failed/.test(msg), msg.slice(0, 90));
+  }
+
+  // 5. paste handling -- the shapes an operator actually produces
+  t("a bare code pasted alone works", VW.extractSsoCode("fe1049e96ec149bbae03290f0c2ed220") === "fe1049e96ec149bbae03290f0c2ed220");
+  t("a code wrapped in quotes works", VW.extractSsoCode('"fe1049e96ec149bbae03290f0c2ed220"') === "fe1049e96ec149bbae03290f0c2ed220");
+  t("the full address bar works", /fe1049e9/.test(VW.extractSsoCode("http://localhost:8065/?code=fe1049e96ec149bbae03290f0c2ed220&state=abc")));
+  t("a CRLF paste works (Windows terminals and some browsers)", /fe1049e9/.test(VW.extractSsoCode("http://localhost:8065/?code=fe1049e96ec149bbae03290f0c2ed220\r\n")));
+  t("a binding-mismatch body is explained, not 'no code found'",
+    /binding mismatch/i.test(VW.extractSsoServerError('{"error":"SSO session binding mismatch"}') || ""), "");
+}
+
+
+
+/* ------------------------------------- a missing master password, honestly */
+// The failure that cost the most time in this whole piece of work. `f creds get` exits 1 for
+// BOTH "never stored" and "cannot read", credsGet re-threw that child's stderr verbatim
+// (already prefixed with "f: "), and the operator saw:
+//     f: f: Unsupported state or unable to authenticate data
+// which sounds exactly like an AES-GCM tag check, so hours went into crypto while the actual
+// state was: no master password had ever been stored. A message that misattributes the
+// subsystem is not a cosmetic defect -- it moves the investigation to the wrong file.
+{
+  const store = fs.mkdtempSync(path.join(os.tmpdir(), "vw-nomaster-"));
+  const cfg = { vaultwarden: { server: BASE, email: "kensand@kensand.net", timeoutMs: 20000, allowInsecureHttp: true } };
+  fs.mkdirSync(path.join(store, ".f"), { recursive: true });
+  fs.writeFileSync(path.join(store, ".f", "f.config.json"), JSON.stringify(cfg));
+  // Point the uck at a daemon socket that does not exist, so any `f creds` read from this
+  // store fails the same way an unreadable store fails for a real user.
+  fs.writeFileSync(path.join(store, ".f", ".creds-daemon"), JSON.stringify({ socket: "/nonexistent/vw-e2e.sock" }));
+  const { spawn } = await import("node:child_process");
+  const out = await new Promise((res) => {
+    const c = spawn(process.execPath, [path.join(UCK, "index.js"), "list"], { cwd: SAFE_CWD, env: { ...process.env, HOME: store }, stdio: ["ignore", "pipe", "pipe"] });
+    let o = ""; c.stdout.on("data", (d) => (o += d)); c.stderr.on("data", (d) => (o += d));
+    c.on("close", () => res(o));
+    setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* gone */ } res(o); }, 30000);
+  });
+  t("a credential-read failure is never reported as a crypto failure",
+    !/unable to authenticate|unsupported state|MAC verification|bad decrypt/i.test(out) && /f creds/i.test(out),
+    JSON.stringify(out).slice(0, 200));
+  fs.rmSync(store, { recursive: true, force: true });
+}
 
 console.log(`\n${pass} passed, ${fail} failed   (tmp home: ${TMP})`);
 console.log(`counts: prelogin=${PRELOGIN_HITS} sync=${SYNC_HITS} ciphers=${CIPHERS_HITS}`);

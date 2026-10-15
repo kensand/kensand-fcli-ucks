@@ -737,13 +737,31 @@ export class VaultItem {
 }
 
 /** Derive the working key set from an email + master password + a sync payload. */
-export function deriveKeys({ email, password, kdfIterations, encryptedKey }) {
+export function deriveKeys({ email, password, kdfIterations, encryptedKey, kdfType = 0, kdfMemory = null, kdfParallelism = null }) {
+  // kdfType MUST be honoured. It used to be absent from this signature entirely, so callers
+  // that spread a config object (…kdfCfg) had their value dropped and PBKDF2 was always used.
+  // For a PBKDF2 account that is harmless, which is exactly why the bug survived: it produces
+  // a MAC failure that reads as "wrong master password" and only bites Argon2id accounts.
+  // A wrong KDF is a *silent* wrong key -- nothing about the shape of the output differs.
+  if (kdfType === 1) {
+    throw new Error(
+      "this account uses Argon2id (KDF type 1), which this client cannot derive keys with —\n" +
+      "  only PBKDF2-SHA256 is implemented. Nothing is wrong with your master password; the\n" +
+      "  algorithm is. Web vault -> Settings -> Security -> Keys -> Encryption key type\n" +
+      "  switches the account to PBKDF2 (it re-encrypts the vault; export a backup first).",
+    );
+  }
+  if (kdfType !== 0) {
+    throw new Error(`unsupported KDF type ${kdfType} (only 0 = PBKDF2-SHA256 is implemented)`);
+  }
+  void kdfMemory; void kdfParallelism;   // accepted for signature compatibility; only Argon2id uses them
   const masterKey = makeMasterKey(password, email, kdfIterations);
   const stretched = stretchMasterKey(masterKey);
   const keys = unwrapSymmetricKey(encryptedKey, stretched);
   keys.masterKey = masterKey;
   keys.stretched = stretched;
   keys.passwordHash = masterPasswordHash(masterKey, password);
+  keys.kdfType = kdfType;
   return keys;
 }
 

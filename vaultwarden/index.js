@@ -43,6 +43,7 @@ import {
   encryptString,
   makeMasterKey,
   masterPasswordHash,
+  ssoRequiresMasterPassword,
   CIPHER_TYPE,
 } from "./lib/vwclient.js";
 
@@ -154,10 +155,21 @@ function credsGet(name) {
     });
     return out.replace(/\n$/, "");
   } catch (e) {
-    const err = (e?.stderr ?? "").toString();
-    if (/no such cred/.test(err)) return null;
-    if (/locked/.test(err)) throw new Error("creds are locked — run: f creds unlock");
-    throw new Error(err.trim() || `f creds get ${name} failed`);
+    // Report what `f creds` actually said, minus its own "f: " prefix (this process prefixes
+    // too, so passing it through printed "f: f: ..."), and never let a raw child stderr become
+    // the whole message: an operator read "f: f: Unsupported state or unable to authenticate
+    // data" and spent a long time hunting a crypto bug. There was none -- the master password
+    // had simply never been stored. Name the condition and the fix.
+    const err = (e?.stderr ?? "").toString().replace(/^f:\s*/gm, "").trim();
+    if (/no such cred/i.test(err)) return null;
+    if (/locked/i.test(err)) throw new Error(`creds are locked — run: f creds unlock`);
+    if (/not unlocked|no daemon|connection refused|enoent|econnrefused/i.test(err)) {
+      throw new Error(`cannot reach the creds store — run: f creds unlock  (${err.split("\n")[0].slice(0, 90)})`);
+    }
+    if (/timed out|etimedout/i.test(err) || e?.signal === "SIGKILL") {
+      throw new Error(`f creds get ${name} timed out (the store may be waiting on a passphrase it cannot ask for)`);
+    }
+    throw new Error(err ? `f creds get ${name} failed: ${err.split("\n")[0].slice(0, 160)}` : `f creds get ${name} failed`);
   }
 }
 
@@ -431,7 +443,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
         return false;
       });
       if (!refreshed) return null;
-      persistSsoTokens(api);
+      await persistSsoTokens(api);
       return await api.ciphers().catch(() => null);
     });
     if (payload) {
@@ -454,6 +466,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
         // Distinguish "your master password is wrong" from "the token was fine but
         // something else failed": falling through to an unrelated "no API key stored"
         // is what sent an operator off to create an API key they did not need.
+        if (process.env.VW_TRACE) process.stderr.write("[trace] " + String(e?.stack ?? e) + "\n");
         throw new Error(
           (/MAC verification failed/.test(m)
             ? `the SSO session works but the stored master password does not unlock the vault — do not retry blindly, retype it:`
@@ -854,7 +867,13 @@ async function main(argv) {
   // from inside provider discovery. Mark the process so any `f` we spawn declines
   // to rediscover providers — otherwise discovery calls status() which spawns f
   // which discovers providers which calls status(), unbounded.
-  if (cmd === "status" || cmd === "resolve" || cmd === "has" || cmd === "list") enterDiscoveryProbe();
+  // `list` deliberately does NOT self-suppress providers: a provider reading its own mirror
+  // back through `f creds` must not be forced to re-derive the whole vault, and the caller
+  // above it has already suppressed recursion at the source (creds/providers.js sets
+  // F_CREDS_NO_PROVIDER=1 for the provider's status/has/resolve children). Self-suppressing
+  // on `list` too meant a direct `f vaultwarden list` re-ran prelogin + sync + PBKDF2 on
+  // every single credential lookup -- one full vault decrypt per secret.
+  if (cmd === "status" || cmd === "resolve" || cmd === "has") enterDiscoveryProbe();
 
   switch (cmd) {
     case "config": {
@@ -1075,10 +1094,20 @@ async function main(argv) {
 
         // Confirm SSO unless told to skip the check. prevalidate is unauthenticated
         // and cheap, and failing here beats sending a human to a browser for nothing.
+        //
+        // `usage()` is the WRONG exit path here and was the original one: it writes the whole
+        // command summary and exits 1, which buried the actual reason under ~30 lines of help
+        // text when the command had been invoked correctly. It is a usage error only when the
+        // operator got the invocation wrong; a server that has SSO switched off is a state
+        // problem. Both this and the missing-server case above must print a reason and stop.
         if (!has("force")) {
           const st = await api.ssoEnabled();
           if (!st.enabled) {
-            return usage(`this server does not report SSO as enabled (${cfg.server})\n  re-run with --force if you know it is configured, or check SSO_ENABLED on the server`);
+            process.stderr.write(
+              `this server does not report SSO as enabled (${cfg.server})\n` +
+              `  re-run with --force if you know it is configured, or check SSO_ENABLED on the server\n`,
+            );
+            process.exit(1);
           }
         }
 
@@ -1107,7 +1136,9 @@ async function main(argv) {
           });
         }
 
+        process._vwTrace?.("got token");
         const tok = await api.loginSso({ code, codeVerifier });
+        process._vwTrace?.("loginSso ok");
         const hasMaster = ssoRequiresMasterPassword(tok);
         process.stdout.write(`authenticated\tyes${hasMaster ? " (master password still needed to decrypt)" : " (no master password on this account)"}\n`);
         process.stdout.write(`refresh token\t${api.refreshToken ? "yes — sessions renew without a browser for ~30 days" : "no"}\n`);
@@ -1115,12 +1146,35 @@ async function main(argv) {
 
         // Persist the session, but never the master password: that stays in `f creds`
         // where it belongs, entered through its own prompt.
-        credsSet(C_TOKEN, api.accessToken);
-        persistSsoTokens(api);
-
+        // Both calls MUST be awaited. credsSet returns a Promise (it talks to the daemon over
+        // a socket), and an unawaited one turns a failure into an unhandled rejection: nothing
+        // is printed, the process exits 0, and -- the part that actually matters -- the access
+        // and refresh tokens are never written, so the next run reports "not logged in" after
+        // a login that looked completely successful. Only the SSO path had this; every other
+        // credsSet call site in this file awaits it.
+        await persistSsoTokens(api);
         if (hasMaster) {
+          // Read the master password OUTSIDE the try below. credsGet shells out to `f creds`,
+          // and on some failures it rethrows that command's own stderr verbatim -- which already
+          // begins with "f: ", which is why a run printed "f: f: Unsupported state or unable to
+          // authenticate data". With the call inside the same try, a credential-read problem was
+          // indistinguishable from a vault-key problem, and the operator was sent to check a
+          // password that was never the thing that failed.
+          let masterForKeys = null;
           try {
-            const keys = await VaultwardenApi.keysFromSsoToken(tok, { email: cfg.email, masterPassword: credsGet(cfg.masterPasswordCred) });
+            masterForKeys = credsGet(cfg.masterPasswordCred);
+          } catch (e) {
+            const m = String(e?.message ?? e).replace(/^f:\s*/gm, "").trim();
+            process.stdout.write(
+              "note\tlogged in, but the stored master password could not be read, so the key\n" +
+              "\tcache was not primed.\n" +
+              `\tf creds says: ${m.split("\n")[0].slice(0, 140)}\n` +
+              "next\tf creds unlock          (if the store is locked)\n" +
+              "        f vaultwarden config --master-password\n",
+            );
+          }
+          try {
+            const keys = await VaultwardenApi.keysFromSsoToken(tok, { email: cfg.email, masterPassword: masterForKeys });
             await writeKeyCache(cfg, keys, api);
             process.stdout.write("key cache\tprimed — later reads skip PBKDF2\n");
           } catch (e) {
@@ -1130,6 +1184,28 @@ async function main(argv) {
               process.stdout.write("run\tf vaultwarden config --master-password\n");
             } else if (/no master password: it is SSO-only/.test(m)) {
               process.stdout.write(`blocked\t${m.split("\n")[0]}\n`);
+            } else if (/unable to authenticate|MAC verification|unsupported state|bad decrypt|unexpected symmetric key/i.test(m)) {
+              // A MAC failure HERE means one specific thing, and it must not be reported as
+              // "your password is wrong": the login SUCCEEDED, and the session/refresh token it
+              // minted is valid and already saved. Only the key cache could not be primed.
+              // "Unsupported state or unable to authenticate data" is OpenSSL's wording, arriving
+              // through createDecipheriv with nothing around it to say which key or which stage,
+              // which is how a run looks where everything works except this one optional step.
+              //
+              // Drop the cache deliberately. tryCachedSession only reads what is stored and never
+              // validates it, so a cache primed with the wrong key would make EVERY later read
+              // fail the same way forever -- the failure would outlive its own cause. Clearing it
+              // costs one PBKDF2 on the next real read and lets the normal path recompute.
+              try { credsRm(C_KEY_CACHE); } catch { /* nothing stored is fine */ }
+              process.stdout.write(
+                "note\tlogged in, but the key cache was not primed: the vault key did not verify\n" +
+                `\t${m.split("\n")[0].slice(0, 110)}\n` +
+                "next\tcheck the stored master password, then try a read directly:\n" +
+                "        f vaultwarden get <something> --secrets\n" +
+                "        f vaultwarden config --master-password    (if that also fails the MAC)\n" +
+                "note\tthe session itself is valid; a read derives the key from sync.profile.key\n" +
+                "        instead of the value this response carried, so it may still succeed.\n",
+              );
             } else {
               throw e;
             }
@@ -1228,6 +1304,36 @@ uckMain(import.meta.url, async (argv) => {
 
 export default { register, credentialProvider };
 
+/**
+ * The account's own KDF parameters, as reported by prelogin.
+ *
+ * The KDF is per-account: the client cannot choose it, and using the wrong one derives a
+ * wrong key whose MAC failure reads as "wrong master password" -- which is what discarding
+ * prelogin's kdf type did to a real user. It must be validated, never defaulted.
+ */
+function kdfConfigFor(pre, email) {
+  const kdfType = Number(pre?.kdf ?? 0);
+  const iterations = Number(pre?.kdfIterations ?? 0);
+  if (!Number.isInteger(iterations) || iterations <= 0) throw new Error(`prelogin gave no usable kdfIterations (${pre?.kdfIterations}) for ${email}`);
+  // Name the property explicitly. This was `{ kdfType, kdfIterations }` -- shorthand for a
+  // variable declared as `iterations` two lines up -- so the PBKDF2 path, the ONLY path this
+  // account can take, threw ReferenceError and no vault could ever be opened. node --check
+  // passes it (it is valid syntax) and no test caught it, because every mock prelogin in the
+  // suite returned a kdf type that skipped this line.
+  if (kdfType === 0) return { kdfType, kdfIterations: iterations };
+  if (kdfType === 1) {
+    const memory = Number(pre?.kdfMemory ?? 0);
+    const parallelism = Number(pre?.kdfParallelism ?? 0);
+    if (!Number.isInteger(memory) || memory <= 0 || !Number.isInteger(parallelism) || parallelism <= 0) {
+      throw new Error(`prelogin reported Argon2id without usable memory/parallelism (memory=${pre?.kdfMemory}, parallelism=${pre?.kdfParallelism})`);
+    }
+    return { kdfType, kdfIterations: iterations, kdfMemory: memory, kdfParallelism: parallelism };
+  }
+  throw new Error(
+    `this account uses an unsupported KDF type ${kdfType}; only PBKDF2-SHA256 (0) and Argon2id (1) are implemented`,
+  );
+}
+
 /* ------------------------------------------------------- SSO plumbing */
 
 export function extractSsoServerError(input) {
@@ -1299,10 +1405,13 @@ function spawnDetached(cmd, args) {
   return ok ? c : null;
 }
 
-function persistSsoTokens(api) {
-  if (api.accessToken) credsSet(C_TOKEN, api.accessToken);
-  if (api.refreshToken) credsSet(C_REFRESH, api.refreshToken);
-  if (api.accessExpiresAt) credsSet(C_EXPIRES, String(api.accessExpiresAt));
+async function persistSsoTokens(api) {
+  // Awaited in sequence, not Promise.all: these write one logical session, and a partial
+  // write (token saved, expiry lost) leaves a session that looks valid and then refuses to
+  // refresh. Failing loudly here is also the point -- see the note at the call site.
+  if (api.accessToken) await credsSet(C_TOKEN, api.accessToken);
+  if (api.refreshToken) await credsSet(C_REFRESH, api.refreshToken);
+  if (api.accessExpiresAt) await credsSet(C_EXPIRES, String(api.accessExpiresAt));
 }
 
 async function ssoManualPrompt(authorizeUrl, port) {
@@ -1333,13 +1442,33 @@ async function ssoManualPrompt(authorizeUrl, port) {
     line = await new Promise((resolve, reject) => {
       rl.question("", resolve);
       rl.once("SIGINT", () => reject(new Error("cancelled — nothing was exchanged")));
+      // readline only calls the question callback on a line. On EOF it never does, so this
+      // promise used to stay pending forever: with stdin closed or piped (`</dev/null`, a
+      // script, an editor task) the command hung, and the process then exited 0 with empty
+      // stdout and no message — indistinguishable from success. `close` is readline's real
+      // end-of-input signal, and resolving null lets the branch below explain the situation
+      // instead of silently vanishing.
+      rl.once("close", () => resolve(null));
     });
   } finally {
     rl.close();
   }
 
   const raw = String(line ?? "").trim();
-  if (!raw) throw new Error("nothing pasted — nothing was exchanged");
+  if (!raw) {
+    // An empty read is not the same event as a refusal to type: when stdin is not a terminal
+    // (a pipe, `</dev/null`, CI, an editor task) readline yields EOF immediately, and this
+    // command used to exit 0 with an empty stdout after printing an authorize URL. An operator
+    // driving this from a script could not tell success from "nobody was ever asked".
+    if (!process.stdin.isTTY) {
+      throw new Error(
+        "no terminal to paste into — stdin is not a tty, so the redirect URL could not be read.\n" +
+        `  run this interactively, or feed the URL in: echo 'http://localhost:${port}/?code=…' | \\\n` +
+        `  ${"f vaultwarden sso login --manual"}`,
+      );
+    }
+    throw new Error("nothing pasted — nothing was exchanged");
+  }
   // The browser may have been shown the server's JSON error rather than a redirect
   // with a code. That error names the real problem, so surface it instead of the
   // generic "could not find a code".
