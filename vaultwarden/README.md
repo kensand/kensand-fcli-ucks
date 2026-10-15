@@ -180,6 +180,29 @@ The refusal names whether the host is loopback before you decide.
 
 ---
 
+## As a credential provider
+
+This uck is also a **provider** for `f creds`: on a local miss, `f creds get <name>`
+asks it and mirrors a hit as `mirror:<name>`.
+
+The provider interface (`resolve` / `has` / `status` / `mirrorTtlSec` /
+`hasExternalApi`) is specified in
+[`fcli-ucks/creds/README.md`](../../fcli-ucks/creds/README.md) — that file is the
+contract, this one is one implementation of it. The parts that bite, in short:
+
+- `resolve()` returns a value, or **`null` only when the name is genuinely not yours**.
+  Returning `null` for a *failure* silently becomes "no such credential" — throw instead,
+  with an actionable message. That is why `resolve` throws on a locked store, an
+  unreachable server, and a bad master password rather than reporting an empty vault.
+- `has()` is omitted deliberately: it is a pre-filter consulted *before* `resolve`, and a
+  "not mine" from a network timeout would suppress `resolve` and make the vault look
+  empty instead of broken.
+- `mirrorTtlSec: 3600` is a floor, clamped to the daemon's remaining unlocked lifetime.
+- Provider module scope must be side-effect free — `f providers --dump` evaluates it in
+  every `f` process, including unrelated ones.
+- If `f providers` does not list `vaultwarden`, the uck failed to load. Run
+  `f vaultwarden status` and read the error.
+
 ## How it works
 
 1. `PBKDF2-HMAC-SHA256(masterPassword, email, iterations)` → master key.
