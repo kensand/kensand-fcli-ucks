@@ -200,6 +200,31 @@ const C = await import("./lib/vwclient.js");
 C.deriveKeys({ email, password, kdfIterations, encryptedKey: profileKey });
 ```
 
+> **Before believing a crypto error here, prove it is crypto.** This snippet only
+> prints an error if you feed it a real `profile.key` and a real password, and it can
+> fail for reasons that have nothing to do with either. The worst version of this
+> printed `f: f: Unsupported state or unable to authenticate data` — OpenSSL's wording
+> for an AES-GCM tag mismatch — and it sent hours into key derivation, Argon2id, and
+> base64 handling. **None of it was real.** The credential had simply never been
+> stored, and `credsGet` was forwarding the child `f creds` process's stderr verbatim;
+> the doubled `f: ` was the tell, because *this* process prefixes too, so the text was
+> someone else's. A MAC failure from this client's own code says
+> `MAC verification failed (wrong key, or tampered ciphertext)`. If the message does
+> not say that, it is not a MAC failure — read the stack (`VW_TRACE=1`) before
+> suspecting the maths. A message that names the wrong subsystem is a defect, not
+> decoration: it relocates the entire investigation.
+>
+> Two related traps from the same session, both invisible to `node --check`:
+> an SSO restore that brought call sites without the functions they called, and
+> `return { kdfType, kdfIterations }` shorthand for a variable declared as
+> `iterations` — valid syntax, `ReferenceError` at runtime, sitting on the only
+> KDF path the account could take, so *no* vault could ever open. Shorthand property
+> names are not checked; when a variable name and its value's name differ, name the
+> property.
+>
+> Separately: `f vaultwarden test` reporting `0 item(s)` can be a genuinely empty
+> vault. Confirm against the raw endpoint before reading a parse bug into it.
+
 This distinction cost hours: `f vaultwarden test` insisted the password was wrong
 while the very same password decrypted the account's own `profile.key`. The real
 cause was the client, and afterwards the account still could not log in — because
