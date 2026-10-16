@@ -69,8 +69,16 @@ start over.
 
 ### If 2FA is on
 
-A working password grant is still blocked by a 2FA policy. That is the *only* thing an
-API key is for:
+A working password grant is still blocked by a 2FA policy. Try SSO first — it signs
+in through the identity provider, 2FA included, and returns a refresh token good for
+about 30 days:
+
+```bash
+f vaultwarden sso login
+```
+
+An API key is the fallback (no SSO on the server, or the refresh token has lapsed).
+It skips 2FA by design and cannot decrypt anything by itself:
 
 ```bash
 f vaultwarden apikey <client-id> <client-secret>   # web vault: Settings > Security > Keys

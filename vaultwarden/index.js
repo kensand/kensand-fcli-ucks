@@ -394,7 +394,9 @@ async function authenticate(api, { email, passwordHash }) {
       throw new Error(
         `this account requires 2FA, which the password grant cannot satisfy from a CLI\n` +
         `  types offered: ${Object.keys(e.twoFactor).join(", ")}\n` +
-        `  use an API key — bypassing 2FA is exactly what it is for:\n` +
+        `  two ways around it, either is enough:\n` +
+        `    f vaultwarden sso login      sign in through the identity provider, 2FA and all\n` +
+        `  or an API key, which skips 2FA by design:\n` +
         `  web vault -> Settings -> Security -> Keys -> API key\n` +
         `    f creds set ${C_CLIENT_ID} 'user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'\n` +
         `    f creds set ${C_CLIENT_SECRET} '<client secret>'`,

@@ -58,12 +58,17 @@ enrolled device key pair, which this uck deliberately does not implement). In
 return, SSO yields a refresh token, so the session renews for ~30 days without a
 browser.
 
-A password grant that *does* work is still blocked by 2FA, and that is the one thing
-an API key is for (it skips 2FA; it cannot decrypt anything by itself):
+A password grant that *does* work is still blocked by 2FA. Two ways around it, and
+SSO is the one to try first:
 
 ```
-f vaultwarden apikey <client-id> <client-secret>   # web vault: Settings > Security > Keys
+f vaultwarden sso login                              # sign in via the identity provider,
+                                                     # 2FA included; earns a ~30-day refresh token
+f vaultwarden apikey <client-id> <client-secret>     # web vault: Settings > Security > Keys
 ```
+
+An API key skips 2FA by design and decrypts nothing on its own; it is the fallback
+for when there is no SSO, or once the refresh token has lapsed.
 
 `f vaultwarden test` is the thing to run first: it authenticates, unwraps the
 symmetric key, decrypts a sample item, and prints counts. It changes nothing. If
@@ -234,7 +239,7 @@ or your actual KDF. `f vaultwarden test` covers those against the live server.
 | `Scope (api) not supported` | correct behaviour, not a bug: this server allows `api` only on `client_credentials`. Password/SSO grants need `api offline_access`. |
 | `device_identifier cannot be blank` | server wants snake_case device fields **and only one spelling**; sending both snake and camel makes Rocket reject it as blank. |
 | `Too many login requests` (429) | rate-limited; **stop retrying**, it extends the lockout |
-| `requires 2FA` | the password grant hit a 2FA policy. Add an API key (`apikey`) — bypassing 2FA is its only purpose. |
+| `requires 2FA` | the password grant hit a 2FA policy. Use `f vaultwarden sso login` — the identity provider handles 2FA. An API key (`apikey`) also skips it, but only as a fallback where there is no SSO. |
 | `unrecognised response shape` | your server returns something unexpected — the error lists its keys, and it deliberately refuses to read that as an empty vault |
 | `the creds store is locked` | `f creds unlock` — the vault cannot be consulted or written to while locked |
 
