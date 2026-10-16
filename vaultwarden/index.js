@@ -793,12 +793,26 @@ function providerStatus(cfg) {
   if (inDiscovery()) return { ready: true, note: `${cfg.server} as ${cfg.email} (configured; store/credentials not checked)` };
   const st = credsStatus();
   if (!st.unlocked) return { ready: false, note: "creds locked", hint: "f creds unlock" };
-  let master = null, clientId = null;
-  try { master = credsGet(cfg.masterPasswordCred); clientId = credsGet(C_CLIENT_ID); } catch { return { ready: false, note: "creds locked", hint: "f creds unlock" }; }
-  if (!master) return { ready: false, note: `no master password (${cfg.masterPasswordCred})`, hint: "f vaultwarden config --master-password" };
-  if (!clientId) return { ready: false, note: `no API key (${C_CLIENT_ID})`, hint: "f creds set " + C_CLIENT_ID + " 'user.<uuid>' && f creds set " + C_CLIENT_SECRET + " '<secret>'" };
+  let master = null, clientId = null, clientSecret = null, sso = false;
+  try {
+    master = credsGet(cfg.masterPasswordCred);
+    clientId = credsGet(C_CLIENT_ID);
+    clientSecret = credsGet(C_CLIENT_SECRET);
+    sso = !!credsGet(C_REFRESH);
+  } catch { return { ready: false, note: "creds locked", hint: "f creds unlock" }; }
+  if (!master) return { ready: false, note: `no master password (${cfg.masterPasswordCred})`, hint: `f vaultwarden config --master-password (or: f vaultwarden sso login)` };
+  // Three ways to authenticate, any one of which is enough. This check was
+  // written when an API key was the only route and still called its absence
+  // `not ready` after SSO made it optional -- so a fully working provider
+  // reported "not ready: no API key" while resolving every cred correctly,
+  // and the suggested fix was a web-vault key nobody needed. `login()` tries
+  // password, then api-key, then SSO; readiness has to ask the same question.
+  if (!clientId && !sso) {
+    return { ready: false, note: `no way to sign in (no API key, no SSO session)`, hint: `f vaultwarden sso login   (or: f creds set ${C_CLIENT_ID} 'user.<uuid>' && f creds set ${C_CLIENT_SECRET} '<secret>'${clientSecret ? " — secret set, id missing" : ""})` };
+  }
+  const how = sso ? "SSO session" : "API key";
   const cached = !!safeHasCache();
-  return { ready: true, note: `${cfg.server} as ${cfg.email}${cached ? " (keys cached)" : ""}` };
+  return { ready: true, note: `${cfg.server} as ${cfg.email} via ${how}${cached ? " (keys cached)" : ""}` };
 }
 
 function safeHasCache() {

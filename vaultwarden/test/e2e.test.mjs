@@ -429,6 +429,35 @@ function sockOp(req) {
     c.on("error", reject);
   });
 }
+// 1b. the readiness gate. This is the check that shipped wrong: it demanded an
+// API key after SSO made one optional, so a provider that resolved every cred
+// correctly reported `not ready: no API key` and pushed the operator toward a
+// web-vault key they did not need. Readiness must accept any ONE of the three
+// routes login() will actually try.
+{
+  const seed = async (want) => {
+    for (const n of ["vaultwarden.client-id", "vaultwarden.client-secret", "vaultwarden.refresh-token"]) {
+      await sockOp({ op: "rm", name: n }).catch(() => {});
+    }
+    for (const n of want) await sockOp({ op: "set", name: n, value: "seed-" + n.split(".").pop() });
+  };
+  // SSO alone is enough.
+  await seed(["vaultwarden.master-password", "vaultwarden.refresh-token"]);
+  let st = await VW.credentialProvider.status();
+  t("ready via SSO session with no API key", st.ready === true && /SSO session/.test(st.note), JSON.stringify(st));
+  // API key alone is enough.
+  await seed(["vaultwarden.master-password", "vaultwarden.client-id", "vaultwarden.client-secret"]);
+  st = await VW.credentialProvider.status();
+  t("ready via API key with no SSO session", st.ready === true && /API key/.test(st.note), JSON.stringify(st));
+  // Neither: say which is missing and offer BOTH fixes. The old hint named only
+  // the API key, so an SSO-only operator was told to go mint a key.
+  await seed(["vaultwarden.master-password"]);
+  st = await VW.credentialProvider.status();
+  t("no sign-in route at all: not ready, hint mentions SSO", st.ready === false && /sso login/.test(st.hint), JSON.stringify(st));
+  // Restore what the rest of the suite assumes.
+  await seed(["vaultwarden.master-password", "vaultwarden.client-id", "vaultwarden.client-secret"]);
+}
+
 await sockOp({ op: "set", name: "vaultwarden.client-id", value: "user.test-id" });
 await sockOp({ op: "set", name: "vaultwarden.client-secret", value: "test-secret" });
 await sockOp({ op: "set", name: "vaultwarden.master-password", value: PASSWORD });
