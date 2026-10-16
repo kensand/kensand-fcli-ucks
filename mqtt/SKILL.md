@@ -64,10 +64,11 @@ empty string. Those print as `<empty payload: value unknown or cleared>` so "doc
 ## Retained counts are timed, not signalled
 
 MQTT 5 has a Retain-Available flag that tells a subscriber the retained snapshot is
-complete. This broker returns **no** server properties at all (verified:
-`client.options.serverProperties` is empty), so that signal is unavailable and retained
-scans fall back to a time window. Output says which mode it used — `snapshot complete` or
-`timed window 12000ms (count may be partial)`. Trust the footer before acting on a count.
+complete. This broker returns **no** server properties at all — verified empty on both
+protocolVersion 5 and 4 — so that signal is unavailable and retained scans fall back to a
+timed window. Output says which mode it used instead of implying a precision it does not
+have. A time window cannot make a partial snapshot look complete, but it cannot guarantee
+completeness either: if a count matters, re-run and compare before acting on it.
 
 ## Debugging gotchas
 

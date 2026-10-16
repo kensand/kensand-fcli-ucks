@@ -80,11 +80,11 @@ async function connect(args, ctx) {
     throw new Error(`mqtt auth needs a password.\n  ${why}`);
   }
   const lib = await mqttLib();
-  // MQTT5 handshake so the broker's retained-message capability is visible.
-  // Mosquitto drops the MQTT5 property that signals "retained delivery done"
-  // if we negotiate 3.1.1, which is what made retained scans return a random
-  // subset (8 / 13 / 20 / 22 for one topic tree). Publisher-side commands do not
-  // rely on this and stay unaffected.
+  // MQTT5 handshake so any retained-message capability the broker advertises is
+  // visible. This broker advertises none (serverProperties is empty on v5 AND v4,
+  // verified), so scanRetained falls back to its timed window. Negotiating 5 is
+  // what makes that absence knowable rather than assumed. Publisher-side commands
+  // do not depend on it.
   const client = await new Promise((resolve, reject) => {
     const c = lib.connect({
       protocolVersion: 5,
