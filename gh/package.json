@@ -1,8 +1,7 @@
 {
-  "name": "@fcli/uck-gh",
-  "version": "0.1.0",
-  "description": "f gh: GitHub REST API via @octokit/rest",
+  "name": "kensand-fcli-ucks-gh",
   "type": "module",
+  "description": "f gh: GitHub REST API via @octokit/rest",
   "main": "index.js",
   "dependencies": {
     "@octokit/rest": "^22.0.0"

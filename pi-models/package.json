@@ -1,5 +1,4 @@
 {
-  "name": "pi-models",
-  "type": "module",
-  "private": true
+  "name": "kensand-fcli-ucks-pi-models",
+  "type": "module"
 }

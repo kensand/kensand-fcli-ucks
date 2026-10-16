@@ -38,6 +38,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath as _f2p } from "node:url";
 const _here = path.dirname(_f2p(import.meta.url));
 
@@ -151,12 +152,23 @@ async function resolveHa(flagUrl, flagToken, credsApi, opts = {}) {
   const hostNames = host && host.includes(":") ? [host, host.split(":")[0]] : host ? [host] : [];
 
   const state = credsUnlocked();
+  // Structural first (CredsError.kind), message fallback for older creds.
+  const classify = (e) => {
+    const k = e && e.kind;
+    if (k === "locked") return "locked";
+    if (k === "missing") return "missing";
+    if (k === "provider" || k === "other") return "error";
+    const m = (e && e.message) || String(e);
+    if (/locked/i.test(m)) return "locked";
+    if (/no such cred/i.test(m)) return "missing";
+    return "error";
+  };
   const read = async (name) => {
     if (credsApi && typeof credsApi.get === "function") {
       try {
         return await credsApi.get(name);
       } catch (e) {
-        if (e && /locked/i.test(e.message)) return { locked: true };
+        if (classify(e) === "locked") return { locked: true };
         return null;
       }
     }
@@ -509,6 +521,104 @@ async function cmdInfo(base, token) {
   });
 }
 
+// ---- config CRUD (automations/scripts/scenes) ----
+// HA's `config` component registers ONLY
+//   /api/config/<component>/<config_type>/{config_key}
+// (homeassistant/components/config/view.py). There is no collection route, so
+// GET/POST on the bare path is a 404 and creation must name an id. This is the
+// REST equivalent of what the HA frontend does over WebSocket — no WS needed.
+const CONF_TYPES = new Set(["automation", "script", "scene"]);
+
+function genConfigId() {
+  return randomBytes(16).toString("hex");
+}
+
+function confPath(type, id) {
+  return `/api/config/${type}/config/${encodeURIComponent(id)}`;
+}
+
+async function cmdConf(base, token, rest) {
+  const [sub, ...a] = rest;
+  const needType = (t) => {
+    if (!t || !CONF_TYPES.has(t)) err(`config type must be one of: ${[...CONF_TYPES].join(", ")} (got: ${t || "none"})`);
+    return t;
+  };
+
+  if (!sub || sub === "ls") {
+    const want = a[0] ? needType(a[0]) : null;
+    const states = await allStates(base, token);
+    const rows = [];
+    for (const s of states) {
+      const dom = s.entity_id.split(".")[0];
+      if (!CONF_TYPES.has(dom)) continue;
+      if (want && dom !== want) continue;
+      const id = s.attributes?.id;
+      // An id means it lives in .storage (UI/API-created) and IS editable via
+      // conf get/set/rm. YAML-defined entries have no id and are not.
+      rows.push(`${id ? "editable" : "yaml-only"}  ${s.entity_id}  ${id || "-"}  ${s.state}  ${friendly(s)}`);
+    }
+    outLines(rows);
+    return;
+  }
+
+  if (sub === "get") {
+    const type = needType(a[0]);
+    const id = a[1];
+    if (!id) err("conf get needs an id (see: conf ls)");
+    return out(await api(base, token, confPath(type, id)));
+  }
+
+  if (sub === "set" || sub === "new") {
+    const type = needType(a[0]);
+    let id, bodyTok;
+    if (sub === "set") {
+      id = a[1];
+      if (!id) err("conf set needs an id; for a fresh one use conf new");
+      bodyTok = a.slice(2);
+    } else {
+      id = genConfigId();
+      bodyTok = a.slice(1);
+    }
+    if (!bodyTok.length) err(`conf ${sub} needs a config body (JSON)`);
+    let cfg;
+    try {
+      cfg = JSON.parse(bodyTok.join(" "));
+    } catch (e) {
+      err(`config must be JSON: ${e.message}`);
+    }
+    // HA's _write_value injects {id} itself and preserves key order, so the
+    // body should NOT carry id. Strip it to avoid confusing duplicates.
+    delete cfg.id;
+    if (cfg.alias === undefined) err("config needs an \"alias\"");
+    // Newer HA wants triggers/actions; older accepts trigger/action. Pass through.
+    const res = await api(base, token, confPath(type, id), { method: "POST", body: cfg });
+    // Confirm it actually loaded as an entity rather than silently rejecting.
+    const states = await allStates(base, token);
+    const made = states.find((s) => s.attributes?.id === id);
+    outLines([
+      `${res?.result || "ok"}  ${type}  id=${id}`,
+      made ? `entity ${made.entity_id}  state=${made.state}` : `WARNING: saved but no entity with id=${id} yet`,
+    ]);
+    return;
+  }
+
+  if (sub === "rm") {
+    const type = needType(a[0]);
+    const id = a[1];
+    if (!id) err("conf rm needs an id");
+    const res = await api(base, token, confPath(type, id), { method: "DELETE" });
+    out(`${res?.result || "ok"}  deleted ${type} ${id}`);
+    return;
+  }
+
+  if (sub === "validate") {
+    // Validates configuration.yaml as a whole (Admin). Cheap sanity check.
+    return out(await api(base, token, "/api/config/core/check_config", { method: "POST", body: {} }));
+  }
+
+  err(`unknown conf subcommand: ${sub} (ls|get|set|new|rm|validate)`);
+}
+
 // ---- entry ----
 function usage() {
   err(
@@ -521,6 +631,13 @@ function usage() {
     "  scene [name]               list scenes, or turn one on (name or id)\n" +
     "  auto [ls|on <name>|off <name>|<name>]\n" +
     "                             list automations / toggle enabled / trigger\n" +
+    "  conf ls [type]             config entries: automation|script|scene (UI-created)\n" +
+    "  conf get <type> <id>       read one config, e.g. conf get automation <id>\n" +
+    "  conf set <type> <id> <json>\n" +
+    "                             create or update; <id> is your own 32-hex string\n" +
+    "  conf new <type> <json>     create with a generated id; prints it\n" +
+    "  conf rm <type> <id>        delete\n" +
+    "  conf validate <json>       check a config without saving (Admin)\n" +
     "  history <entity...> [-s start] [-e end] [--minimal]\n" +
     "                             state changes (times: ISO or 30m/2h/1d/1w ago)\n" +
     "  weather [entity]           current weather\n" +
@@ -614,6 +731,8 @@ export function register(_ctx) {
         return trigger(sub);
       }
 
+      if (cmd === "conf") return cmdConf(base, token, rest);
+
       if (cmd === "history") {
         let start = null, end = null, minimal = false;
         const entities = [];
@@ -669,7 +788,21 @@ export function register(_ctx) {
         const rawPath = rest[0];
         if (!rawPath) err(`${method} requires a path, e.g. ${method} /api/states`);
         let body;
-        if (rest[1] && rest[1].trim().startsWith("{")) body = JSON.parse(rest[1]);
+        // Rejoin the body: unquoted JSON with spaces arrives as several argv
+        // tokens, so rest[1] alone would be just "{". Take from the first
+        // token that opens a body, and preserve key=value shorthand too.
+        const bodyTok = rest.findIndex((t, i) => i > 0 && /^[{[]/.test(t.trim()));
+        if (bodyTok > 0) {
+          const joined = rest.slice(bodyTok).join(" ");
+          try {
+            body = JSON.parse(joined);
+          } catch (e) {
+            err(`body is not valid JSON: ${e.message} — got: ${joined.slice(0, 80)}`);
+          }
+        } else if (rest.length > 1) {
+          // key=value shorthand, same as `call`
+          body = parseParams(rest.slice(1));
+        }
         const p = rawPath.startsWith("/") ? rawPath : "/" + rawPath;
         return out(await api(base, token, p, { method, body }));
       }

@@ -100,9 +100,21 @@ function credsUnlocked() {
 }
 async function resolveCreds(flagToken, flagUrl, credsApi, opts = {}) {
   const state = credsUnlocked();
+  // Structural first (CredsError.kind from credsApi.version >= 1), message
+  // fallback for older creds builds. Contract: never match message wording.
+  const classify = (e) => {
+    const k = e && e.kind;
+    if (k === "locked") return "locked";
+    if (k === "missing") return "missing";
+    if (k === "provider" || k === "other") return "error";
+    const m = (e && e.message) || String(e);
+    if (/locked/i.test(m)) return "locked";
+    if (/no such cred/i.test(m)) return "missing";
+    return "error";
+  };
   const read = async (name) => {
     if (credsApi && typeof credsApi.get === "function") {
-      try { return await credsApi.get(name); } catch (e) { if (e && /locked/i.test(e.message)) return { locked: true }; return null; }
+      try { return await credsApi.get(name); } catch (e) { if (classify(e) === "locked") return { locked: true }; return null; }
     }
     try { const r = await daemonCall({ op: "get", name }, state.socket || CRED_SOCKET); if (r && r.ok) return r.value; return null; } catch { return null; }
   };

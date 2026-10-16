@@ -212,6 +212,12 @@ async function readCred(name, credsApi) {
       const v = await credsApi.get(name);
       return v == null || v === "" ? { missing: true } : { value: v, src: `creds:${name}` };
     } catch (e) {
+      // Structural first (CredsError.kind from credsApi.version >= 1), message
+      // fallback for older creds builds. Contract: never match message wording.
+      const k = e && e.kind;
+      if (k === "locked") return { locked: true };
+      if (k === "missing") return { missing: true };
+      if (k === "provider" || k === "other") return { error: e?.message ?? String(e) };
       const m = e?.message ?? String(e);
       if (/locked/i.test(m)) return { locked: true };
       if (/no such cred/i.test(m)) return { missing: true };

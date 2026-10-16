@@ -1,0 +1,6 @@
+{
+  "name": "kensand-fcli-ucks-ha-ws",
+  "type": "module",
+  "description": "f ha-ws: Home Assistant WebSocket API bridge (automation/config CRUD that REST lacks)",
+  "main": "index.js"
+}

@@ -1,8 +1,7 @@
 {
-  "name": "@fcli/uck-fj",
-  "version": "0.1.0",
-  "description": "f fj: call the Forgejo/Gitea API via @llamaduck/forgejo-ts",
+  "name": "kensand-fcli-ucks-fj",
   "type": "module",
+  "description": "f fj: call the Forgejo/Gitea API via @llamaduck/forgejo-ts",
   "main": "index.js",
   "dependencies": {
     "@llamaduck/forgejo-ts": "^15.0.9"

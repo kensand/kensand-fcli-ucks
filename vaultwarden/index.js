@@ -32,7 +32,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 
-import { uckMain } from "../../fcli-ucks/lib/uckmain.js";
+import { uckMain } from "../lib/uckmain.js";
 import { spawn } from "node:child_process";
 import { captureSsoCode } from "./lib/sso-callback.js";
 import {

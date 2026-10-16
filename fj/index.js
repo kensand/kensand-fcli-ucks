@@ -215,9 +215,20 @@ async function resolveToken(flagToken, base, credsApi, opts = {}) {
     return { token: null, src: null, reason: "wait-timeout", host };
   }
 
-  // One-shot reads. Note `credsApi.get` throws "creds locked" on its own, which
-  // is why the lockfile is consulted first: catching that exception would work
-  // but cannot distinguish "locked" from "that cred is not set".
+  // One-shot reads. Note `credsApi.get` throws CredsError(kind: "locked") on
+  // its own (credsApi.version >= 1), which is why the lockfile is consulted
+  // first: catching that exception would work but cannot distinguish "locked"
+  // from "that cred is not set" on the local-socket path below.
+  const classify = (e) => {
+    const k = e && e.kind;
+    if (k === "locked") return "locked";
+    if (k === "missing") return "missing";
+    if (k === "provider" || k === "other") return "error";
+    const m = (e && e.message) || String(e);
+    if (/locked/i.test(m)) return "locked";
+    if (/no such cred/i.test(m)) return "missing";
+    return "error";
+  };
   const read = async (name) => {
     if (credsApi && typeof credsApi.get === "function") {
       try {
@@ -225,7 +236,7 @@ async function resolveToken(flagToken, base, credsApi, opts = {}) {
       } catch (e) {
         // "not found" for this name is expected when the port-stripped host is
         // tried second; anything else is worth surfacing rather than swallowing.
-        if (e && /locked/i.test(e.message)) return { locked: true };
+        if (classify(e) === "locked") return { locked: true };
         return null;
       }
     }
