@@ -12,6 +12,7 @@ every uck dir here into `~/.f/ucks/kensand-fcli-ucks/<name>/`.
 | `f fj` | Forgejo/Gitea API (issues, PRs, pipelines) |
 | `f gh` | GitHub API (repos, issues, PRs, releases, search) |
 | `f ha` | Home Assistant (states, service calls, scenes, calendars) |
+| `f ssh` | ssh/scp/rsync with a private key from the creds store; loads it into ssh-agent so it never hits disk. See [`ssh/SKILL.md`](./ssh/SKILL.md). |
 
 ## Adding a uck
 
