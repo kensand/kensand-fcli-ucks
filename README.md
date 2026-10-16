@@ -11,7 +11,8 @@ every uck dir here into `~/.f/ucks/kensand-fcli-ucks/<name>/`.
 | `f vaultwarden` | read secrets from a Vaultwarden vault; a credential provider for `f creds`. Zero-dep native client. See [`vaultwarden/README.md`](./vaultwarden/README.md). |
 | `f fj` | Forgejo/Gitea API (issues, PRs, pipelines) |
 | `f gh` | GitHub API (repos, issues, PRs, releases, search) |
-| `f ha` | Home Assistant (states, service calls, scenes, calendars) |
+| `f ha` | Home Assistant (states, service calls, scenes, calendars, automations, WebSocket helpers). See [`ha/SKILL.md`](./ha/SKILL.md). |
+| `f mqtt` | MQTT broker (retained topics, live subscribe, current value, HA discovery configs). See [`mqtt/SKILL.md`](./mqtt/SKILL.md). |
 | `f ssh` | ssh/scp/rsync with a private key from the creds store; loads it into ssh-agent so it never hits disk. See [`ssh/SKILL.md`](./ssh/SKILL.md). |
 
 ## Adding a uck

@@ -38,6 +38,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
+import http from "node:http";
+import https from "node:https";
 import { randomBytes } from "node:crypto";
 import { fileURLToPath as _f2p } from "node:url";
 const _here = path.dirname(_f2p(import.meta.url));
@@ -619,6 +621,355 @@ async function cmdConf(base, token, rest) {
   err(`unknown conf subcommand: ${sub} (ls|get|set|new|rm|validate)`);
 }
 
+// ---- WebSocket client (zero deps, RFC6455 subset) ----
+// WHY: HA's REST API only registers
+//   /api/config/<component>/<config_type>/{config_key}
+// for automation|script|scene. Helpers (timer, input_*, counter, …) and
+// config subviews (entity/device registry, areas, labels) exist ONLY as
+// WebSocket messages — that's what the HA frontend itself uses. So creating a
+// helper over REST is a dead end (verified: /api/config/timer/config/<id> and
+// /api/config/helper_config/timer both 404), and this bridge is required.
+function wsUrl(base) {
+  const u = new URL(base);
+  return (u.protocol === "http:" ? "ws://" : "wss://") + u.host + "/api/websocket";
+}
+
+/** Minimal client: text frames, client->server masking, ping->pong.
+ *  MUST use req.on("upgrade"), not the response callback: Node does not invoke
+ *  the response listener for 101s, and it hands any already-received bytes in
+ *  `head` (HA's auth_required frame routinely arrives in that same TCP
+ *  segment). Ignoring head silently stalls the handshake forever. */
+function wsConnect(url, timeoutMs = 25000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const mod = u.protocol === "wss:" ? https : http;
+    const req = mod.request(
+      {
+        hostname: u.hostname,
+        port: u.port || (u.protocol === "wss:" ? 443 : 80),
+        path: u.pathname + (u.search || ""),
+        method: "GET",
+        setHost: false,
+        headers: {
+          Connection: "Upgrade",
+          Upgrade: "websocket",
+          "Sec-WebSocket-Key": randomBytes(16).toString("base64"),
+          "Sec-WebSocket-Version": "13",
+          Host: u.host,
+        },
+      }
+    );
+    let done = false;
+    const fail = (e) => {
+      if (done) return;
+      done = true;
+      req.destroy();
+      reject(e);
+    };
+    req.setTimeout(timeoutMs, () => fail(new Error("websocket connect timeout")));
+    req.on("error", fail);
+    req.on("upgrade", (res, socket, head) => {
+      if (done) return;
+      if (res.statusCode !== 101) { fail(new Error(`websocket upgrade failed: HTTP ${res.statusCode}`)); return; }
+      done = true;
+      socket.setNoDelay(true);
+      // Hand over any bytes Node buffered while parsing the 101.
+      resolve(wsWrap(socket, head && head.length ? head : null));
+    });
+    req.end();
+  });
+}
+
+function wsWrap(sock, initial = null) {
+  let buf = initial ? Buffer.from(initial) : Buffer.alloc(0);
+  const waiters = [];
+  let closed = false;
+
+  const fail = (e) => {
+    if (closed) return;
+    closed = true;
+    while (waiters.length) waiters.shift().reject(e);
+  };
+
+  sock.on("data", (chunk) => { buf = Buffer.concat([buf, chunk]); drain(); });
+  sock.on("error", fail);
+  sock.on("close", () => fail(new Error("websocket closed")));
+  // The socket may be paused after the upgrade handoff; without this the first
+  // frame can sit unread and recv() hangs.
+  sock.resume();
+
+  function drain() {
+    for (;;) {
+      if (buf.length < 2) return;
+      const fin = (buf[0] & 0x80) !== 0;
+      const opcode = buf[0] & 0x0f;
+      const masked = (buf[1] & 0x80) !== 0;
+      let len = buf[1] & 0x7f;
+      let off = 2;
+      if (len === 126) {
+        if (buf.length < off + 2) return;
+        len = buf.readUInt16BE(off); off += 2;
+      } else if (len === 127) {
+        if (buf.length < off + 8) return;
+        len = Number(buf.readBigUInt64BE(off)); off += 8;
+      }
+      let maskKey = null;
+      if (masked) {
+        if (buf.length < off + 4) return;
+        maskKey = buf.subarray(off, off + 4); off += 4;
+      }
+      if (buf.length < off + len) return;
+      let payload = buf.subarray(off, off + len);
+      if (masked) {
+        const outB = Buffer.allocUnsafe(len);
+        for (let i = 0; i < len; i++) outB[i] = payload[i] ^ maskKey[i & 3];
+        payload = outB;
+      }
+      buf = buf.subarray(off + len);
+
+      if (opcode === 0x9) { sendFrame(0xa, payload); continue; } // ping -> pong
+      if (opcode === 0x8) { fail(new Error("websocket closed by server")); continue; }
+      const w = waiters.shift();
+      if (!w) continue; // unsolicited event frame
+      // Reassemble continuation frames so large results aren't truncated.
+      if (!fin && opcode === 0x1) { w.fragments = [payload.toString("utf8")]; waiters.unshift(w); continue; }
+      if (opcode === 0x0 && w.fragments) {
+        w.fragments.push(payload.toString("utf8"));
+        if (fin) { const t = w.fragments.join(""); w.fragments = null; w.resolve(t); }
+        else waiters.unshift(w);
+        continue;
+      }
+      w.resolve(payload.toString("utf8"));
+    }
+  }
+
+  function sendFrame(opcode, payload) {
+    const mask = randomBytes(4);
+    const len = payload.length;
+    let header;
+    if (len < 126) { header = Buffer.alloc(2); header[1] = 0x80 | len; }
+    else if (len < 65536) { header = Buffer.alloc(4); header[1] = 0x80 | 126; header.writeUInt16BE(len, 2); }
+    else { header = Buffer.alloc(10); header[1] = 0x80 | 127; header.writeBigUInt64BE(BigInt(len), 2); }
+    header[0] = 0x80 | opcode;
+    const maskedPayload = Buffer.allocUnsafe(len);
+    for (let i = 0; i < len; i++) maskedPayload[i] = payload[i] ^ mask[i & 3];
+    sock.write(Buffer.concat([header, mask, maskedPayload]));
+  }
+
+  return {
+    send(text) { sendFrame(0x1, Buffer.from(text, "utf8")); },
+    recv(timeoutMs = 45000) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`websocket recv timeout (${timeoutMs}ms)`)), timeoutMs);
+        waiters.push({
+          resolve: (v) => { clearTimeout(timer); resolve(v); },
+          reject: (e) => { clearTimeout(timer); reject(e); },
+        });
+      });
+    },
+    close() { try { sendFrame(0x8, Buffer.alloc(0)); } catch { /* ignore */ } sock.destroy(); },
+  };
+}
+
+/** Authenticate and hand a `call(type, extra)` fn to `fn`. */
+async function withHaWs(base, token, fn) {
+  const ws = await wsConnect(wsUrl(base));
+  try {
+    const hello = JSON.parse(await ws.recv());
+    if (hello.type !== "auth_required") throw new Error(`unexpected first frame: ${hello.type}`);
+    ws.send(JSON.stringify({ type: "auth", access_token: token }));
+    const auth = JSON.parse(await ws.recv());
+    if (auth.type !== "auth_ok") throw new Error(`auth rejected: ${auth.message || auth.type}`);
+    let id = 0;
+    const call = async (type, extra = {}) => {
+      const mid = ++id;
+      ws.send(JSON.stringify({ id: mid, type, ...extra }));
+      for (;;) {
+        const frame = JSON.parse(await ws.recv());
+        if (frame.id === mid) return frame;
+      }
+    };
+    // Await INSIDE the try: a `finally` that starts before `return fn(call)`
+    // settles would destroy the socket and reject the in-flight call.
+    const result = await fn(call);
+    return result;
+  } finally {
+    ws.close();
+  }
+}
+
+// Helpers are NOT under `helper/<type>/…` and there is no `create_update`.
+// Each helper domain registers a DictStorageCollectionWebsocket whose commands
+// are literally "<domain>/list|create|update|delete" (see
+// homeassistant/helpers/collection.py async_setup). `name` is required and is
+// also the entity slug. Verified against HA 2026.9.3.
+const HELPER_TYPES = new Set([
+  "input_button", "input_boolean", "input_number", "input_select", "input_text",
+  "input_datetime", "counter", "timer", "schedule",
+]);
+
+function wsErr(frame) {
+  const e = frame?.error;
+  if (!e) return "unknown websocket error";
+  return `${e.code || "error"}: ${e.message || JSON.stringify(e)}`;
+}
+
+async function cmdWs(base, token, rest) {
+  const [sub, ...a] = rest;
+  if (!sub || sub === "help") {
+    // usage() calls err() which process.exit()s — call it directly, never
+    // inside string.concat, or nothing prints.
+    out("f ha ws — Home Assistant WebSocket API (things REST cannot do)");
+    out(wsUsage());
+    return usage();
+  }
+
+  return withHaWs(base, token, async (call) => {
+    if (sub === "whoami") {
+      const r = await call("auth/current_user");
+      if (!r.success) return `error: ${wsErr(r)}`;
+      const u = r.result || {};
+      outLines([`user=${u.name} id=${u.id}`, `is_admin=${u.is_admin} is_owner=${u.is_owner}`]);
+      return;
+    }
+
+    if (sub === "types") {
+      // Probe which message types the running HA actually accepts.
+      const probes = [
+        "get_states", "subscribe_events", "call_service", "fire_event",
+        "auth/current_user", "config/entity_registry/list", "config/device_registry/list",
+        "timer/list", "timer/create", "input_datetime/list", "input_number/list",
+        "input_text/list", "input_boolean/list", "input_select/list", "counter/list",
+        "schedule/list", "config/automation/list", "config/area/list",
+      ];
+      const rows = [];
+      for (const t of probes) {
+        // A bare call with no required args: unknown_command means absent,
+        // any other error means the handler EXISTS (it just rejected our args).
+        const r = await call(t);
+        const code = r.error?.code;
+        const mark = r.success ? "ok           " : code === "unknown_command" ? "absent       " : "present      ";
+        rows.push(`${mark} ${t}${code && !r.success ? "  (" + code + ")" : ""}`);
+      }
+      outLines(rows);
+      return;
+    }
+
+    if (sub === "raw") {
+      if (!a.length) err('raw needs a message json, e.g. raw \'{"type":"config/area/list"}\'');
+      let msg;
+      try { msg = JSON.parse(a.join(" ")); } catch (e) { err(`json parse failed: ${e.message} — got: ${a.join(" ").slice(0, 80)}`); }
+      const type = msg.type;
+      if (!type) err("raw message needs a \"type\"");
+      delete msg.type;
+      out(await call(type, msg));
+      return;
+    }
+
+    if (sub === "sub") {
+      const evType = a[0];
+      const n = Number(a[1] || 1) || 1;
+      // subscribe then collect n matching events
+      const ws2 = await wsConnect(wsUrl(base));
+      try {
+        JSON.parse(await ws2.recv());
+        ws2.send(JSON.stringify({ type: "auth", access_token: token }));
+        const auth = JSON.parse(await ws2.recv());
+        if (auth.type !== "auth_ok") { out("error: auth rejected"); return; }
+        ws2.send(JSON.stringify({ id: 1, type: "subscribe_events", event_type: evType || null }));
+        const ack = JSON.parse(await ws2.recv());
+        if (!ack.success) { out(`subscribe failed: ${wsErr(ack)}`); return; }
+        let got = 0;
+        for (let i = 0; i < n; i++) {
+          const f = JSON.parse(await ws2.recv(20000));
+          if (f.id === 1 && f.type === "event") {
+            got++;
+            outLines([`${f.event.event_type}  ${JSON.stringify(f.event.data).slice(0, 300)}`]);
+          }
+        }
+        out(`${got} event(s) of type ${evType || "*"}`);
+      } finally { ws2.close(); }
+      return;
+    }
+
+    if (sub === "helper") {
+      const action = a[0]; // ls | ls-all | new | update | rm
+      const type = a[1];
+      if (action === "ls" || action === "ls-all") {
+        const types = action === "ls-all" ? [...HELPER_TYPES] : [type];
+        if (action === "ls" && (!type || !HELPER_TYPES.has(type)))
+          err(`helper type must be one of: ${[...HELPER_TYPES].join(", ")} (or use ls-all)`);
+        const rows = [];
+        for (const t of types) {
+          const r = await call(`${t}/list`);
+          if (!r.success) { rows.push(`${t}: error ${wsErr(r)}`); continue; }
+          const items = r.result || [];
+          if (!items.length) { rows.push(`${t}: (none)`); continue; }
+          for (const it of items) rows.push(`${t}  ${it.id || it.name}  ${JSON.stringify(it).slice(0, 160)}`);
+        }
+        outLines(rows);
+        return;
+      }
+      if (!type || !HELPER_TYPES.has(type)) err(`helper type must be one of: ${[...HELPER_TYPES].join(", ")}`);
+      const name = a[2];
+      if (!name) err("helper needs a name (it becomes the entity slug)");
+      if (action === "rm") {
+        const r = await call(`${type}/delete`, { [`${type}_id`]: name });
+        out(r.success ? `ok  deleted ${type} ${name}` : `error: ${wsErr(r)}`);
+        return;
+      }
+      if (action === "new") {
+        const bodyTok = a.slice(3).join(" ");
+        let cfg = {};
+        if (bodyTok.trim()) {
+          try { cfg = JSON.parse(bodyTok); } catch (e) { err(`config json parse failed: ${e.message} — got: ${bodyTok.slice(0, 80)}`); }
+        }
+        delete cfg.name;
+        const r = await call(`${type}/create`, { name, ...cfg });
+        if (!r.success) { out(`error: ${wsErr(r)}`); return; }
+        const id = r.result?.id || name.replace(/\W+/g, "_").toLowerCase();
+        outLines([`ok  created ${type} '${name}'`, `entity=${type}.${id}`]);
+        return;
+      }
+      if (action === "update") {
+        // Helper updates key on "<domain>_id" (collection.py: item_id_key =
+        // `${model_name}_id`) and re-validate the *full* create schema, so
+        // `name` must be resent. Fetch it first so callers don't have to.
+        let cfg = {};
+        const bodyTok = a.slice(3).join(" ");
+        if (bodyTok.trim()) {
+          try { cfg = JSON.parse(bodyTok); } catch (e) { err(`config json parse failed: ${e.message}`); }
+        }
+        if (cfg.name === undefined) {
+          const cur = await call(`${type}/list`);
+          const hit = (cur.result || []).find((x) => x.id === name);
+          if (hit?.name) cfg.name = hit.name;
+          else err(`could not resolve current name for ${type}/${name}; pass {"name":...} explicitly`);
+        }
+        const r = await call(`${type}/update`, { [`${type}_id`]: name, ...cfg });
+        out(r.success ? `ok  updated ${type} ${name}  ${JSON.stringify(r.result).slice(0, 140)}` : `error: ${wsErr(r)}`);
+        return;
+      }
+      err("helper subcommand must be ls|ls-all|new|update|rm");
+    }
+
+    out(`f ha ws: unknown subcommand: ${sub}\n\n${wsUsage()}`);
+  });
+}
+
+function wsUsage() {
+  return (
+    "  ws whoami                    who the token is (admin/owner?)\n" +
+    "  ws types                     probe which ws message types this HA accepts\n" +
+    "  ws raw <json>                arbitrary ws message (\"type\" inside the json)\n" +
+    "  ws sub <event_type> [n]      subscribe and print n events\n" +
+    "  ws helper ls [type]          list helpers\n" +
+    "  ws helper new <type> <name> <json>\n" +
+    "                               create helper (timer, input_*, counter, schedule)\n" +
+    "  ws helper rm <type> <name>   delete helper"
+  );
+}
+
 // ---- entry ----
 function usage() {
   err(
@@ -638,6 +989,8 @@ function usage() {
     "  conf new <type> <json>     create with a generated id; prints it\n" +
     "  conf rm <type> <id>        delete\n" +
     "  conf validate <json>       check a config without saving (Admin)\n" +
+    "  ws whoami|types|raw|sub      WebSocket API: helpers + registry views REST lacks\n" +
+    "  ws helper ls|new|rm          create timer/input_* helpers (ws-only in HA)\n" +
     "  history <entity...> [-s start] [-e end] [--minimal]\n" +
     "                             state changes (times: ISO or 30m/2h/1d/1w ago)\n" +
     "  weather [entity]           current weather\n" +
@@ -732,6 +1085,8 @@ export function register(_ctx) {
       }
 
       if (cmd === "conf") return cmdConf(base, token, rest);
+
+      if (cmd === "ws") return cmdWs(base, token, rest);
 
       if (cmd === "history") {
         let start = null, end = null, minimal = false;

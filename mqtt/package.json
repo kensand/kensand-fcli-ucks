@@ -1,0 +1,9 @@
+{
+  "name": "kensand-fcli-ucks-mqtt",
+  "type": "module",
+  "description": "f mqtt: MQTT broker client (sub/pub/retained/xpg/disco) via mqtt.js",
+  "main": "index.js",
+  "dependencies": {
+    "mqtt": "^5.16.1"
+  }
+}
