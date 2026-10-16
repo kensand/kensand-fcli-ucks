@@ -48,6 +48,15 @@ works; if it fails, its message names the stage that failed.
 Non-secret config goes in `f.config.json` under `vaultwarden`. Secrets go in the creds
 box. **Never in anything argv-visible.**
 
+**Run these three commands yourself.** `--master-password` prompts, and the prompt only
+means what it looks like when stdin is a real terminal. An agent or a script has stdin as
+a pipe, where the prompt degrades to a plain line read and a wrong value is *accepted*
+rather than refused — then fails much later as `MAC verification failed`, far from the
+keystroke that caused it. `sso login` additionally needs a browser on the machine that
+owns `localhost:<port>`, which an agent never has. Agents: run `f vaultwarden status`,
+read the missing piece off it, and hand this list to a human. Full reasoning in
+[`SKILL.md` → Who is allowed to run setup](./SKILL.md#who-is-allowed-to-run-setup).
+
 ### If the account signs in through an identity provider
 
 Check *before* retyping a password:

@@ -77,6 +77,60 @@ it passes, everything below works; if it fails, its message names the stage.
 Non-secret config goes in `f.config.json` under `vaultwarden`. Secrets go in the
 creds box. Never in argv-visible places.
 
+### Who is allowed to run setup
+
+**The human runs setup. An agent does not, and cannot do it correctly.** This is
+not a politeness rule about secrets staying out of logs — it is a hard capability
+boundary, and violating it produces a *worse* failure than refusing:
+
+| Step | Who | Why |
+| --- | --- | --- |
+| `config --server`, `--email`, `--folder` | either | non-secret, lands in `f.config.json` |
+| `status`, `sso status`, `list`, `get` | either | read-only, no new secret entrusted to it |
+| `config --master-password` | **human, at a TTY** | see below |
+| `sso login` | **human, in a browser** | the browser must be on the machine that owns `localhost:<port>` |
+| `apikey <id> <secret>` | **human** | the operator authorises which key may read the vault |
+
+An agent runs its commands with **stdin as a pipe, not a tty**. That is the whole
+problem, because `promptSecret()` falls back to plain `readline` when stdin is not
+a tty. So a piped master password does not error — it is **accepted silently**.
+
+And the failure is *deferred*, which is what makes it dangerous:
+
+```
+agent pipes a guessed/empty password  ->  "stored  vault master password"   <- looks like success
+hours later, first real decrypt        ->  MAC verification failed
+```
+
+By then the wrong password is sitting in the encrypted box, and the error you
+eventually get — *"the SSO session works but the stored master password does not
+unlock the vault — do not retry blindly, retype it"* — points at a keystroke nobody
+made interactively. An agent that *guesses* and gets that MAC error has
+authenticated nothing, learned nothing, and left a booby-trapped credential behind.
+
+The same asymmetry applies to `sso login`: no code is ever delivered on a piped
+stdin, so the attempt can only end by **waiting out the full callback timeout** —
+~180s default of a live PKCE challenge and a bound port, dead on the floor. That is
+the same shape as the IPv4-only-listener problem called out in `lib/sso-callback.js`:
+*"the sign-in dies on a timeout with nothing to show for it."* So the cost of an
+agent attempting SSO is a guaranteed 180s timeout plus a burned challenge, and the
+benefit is zero.
+
+What an agent *should* do when it hits an unconfigured provider:
+
+```
+f vaultwarden status      # read-only; names the one missing piece
+```
+
+then hand the human the exact command from that output and stop. `status` is
+deliberately built to be safe to run unprivileged — it re-checks credentials but
+never spawns itself recursively, so probing readiness cannot deadlock.
+
+The `not ready` that appears **before** any credential exists is not a bug and not
+a bug report. Note also that `ready`/`not ready` answers *"can this provider be
+asked at all"*, not *"did the answer come from the vault"* — see
+[Troubleshooting](#troubleshooting).
+
 ## Resolving a secret
 
 ```
