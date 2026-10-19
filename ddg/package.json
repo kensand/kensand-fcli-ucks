@@ -1,0 +1,6 @@
+{
+  "name": "kensand-fcli-ucks-ddg",
+  "type": "module",
+  "description": "f ddg: search DuckDuckGo from the CLI (html/lite endpoints, no deps)",
+  "main": "index.js"
+}

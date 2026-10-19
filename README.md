@@ -14,6 +14,7 @@ every uck dir here into `~/.f/ucks/kensand-fcli-ucks/<name>/`.
 | `f ha` | Home Assistant (states, service calls, scenes, calendars, automations, WebSocket helpers). See [`ha/SKILL.md`](./ha/SKILL.md). |
 | `f mqtt` | MQTT broker (retained topics, live subscribe, current value, HA discovery configs). See [`mqtt/SKILL.md`](./mqtt/SKILL.md). |
 | `f ssh` | ssh/scp/rsync with a private key from the creds store; loads it into ssh-agent so it never hits disk. See [`ssh/SKILL.md`](./ssh/SKILL.md). |
+| `f ddg` | Search DuckDuckGo from the CLI (web + image results, `--json`), zero deps, via the no-JS html/lite endpoints. See [`ddg/SKILL.md`](./ddg/SKILL.md). |
 
 ## Adding a uck
 
