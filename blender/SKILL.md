@@ -38,12 +38,12 @@ f blender render /tmp/out.png CYCLES   # Cycles
 
 ### 2020 extrusion frames (parametric)
 
-`box` builds a full frame + 6 panels from **inner cavity** dims. 20mm profile,
+`2020box` builds a full frame + 6 panels from **inner cavity** dims. 20mm profile,
 3mm panels, 13.5mm panel recess by default. All parts touch (verified).
 
 ```bash
-f blender box 200 200 200 box        # 200x200x200 inner, prefix "box"
-f blender box 200 100 300 box 13.5 3  # custom recess + panel thickness
+f blender 2020box 200 200 200 box        # 200x200x200 inner, prefix "box"
+f blender 2020box 200 100 300 box 13.5 3  # custom recess + panel thickness
 ```
 
 Gives: 4 posts + 8 rails + 6 panels (18 objects), all named `<prefix>.*`.
@@ -51,7 +51,7 @@ Rebuilding with the same prefix replaces the old parts.
 
 Export the unique parts for printing:
 ```bash
-f blender box 200 200 200 box
+f blender 2020box 200 200 200 box
 # then export post/rail/panel STLs
 ```
 
