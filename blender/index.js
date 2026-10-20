@@ -7,11 +7,63 @@
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SERVER = path.join(here, "blender_server.py");
 const HOST = "127.0.0.1";
 const PORT = 9876;
+const PID_FILE = path.join(os.tmpdir(), "f_blender_server.pid");
+const LOG_FILE = path.join(os.tmpdir(), "f_blender_server.log");
+
+function isUp() {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: HOST, port: PORT, timeout: 1500 });
+    s.on("connect", () => { s.end(); resolve(true); });
+    s.on("error", () => resolve(false));
+    s.on("timeout", () => { s.destroy(); resolve(false); });
+  });
+}
+
+async function cmdStart() {
+  if (await isUp()) return { ok: true, data: "already running on " + HOST + ":" + PORT };
+  const r = spawnSync("which", ["blender"], { encoding: "utf8" });
+  const bin = r.stdout.trim();
+  if (!bin) return { ok: false, error: "blender binary not found in PATH" };
+  const log = fs.openSync(LOG_FILE, "a");
+  const child = spawn(bin, ["--background", "--python", SERVER, "serve"], {
+    stdio: ["ignore", log, log],
+    detached: true,
+  });
+  child.unref();
+  fs.writeFileSync(PID_FILE, String(child.pid));
+  for (let i = 0; i < 30; i++) {
+    await new Promise((res) => setTimeout(res, 1000));
+    if (await isUp()) return { ok: true, data: `started (pid ${child.pid}), log: ${LOG_FILE}` };
+  }
+  return { ok: false, error: `server did not come up in 30s — check ${LOG_FILE}` };
+}
+
+async function cmdStop() {
+  const pids = [];
+  if (fs.existsSync(PID_FILE)) pids.push(fs.readFileSync(PID_FILE, "utf8").trim());
+  try {
+    const p = spawnSync("pgrep", ["-f", "blender_server.py"], { encoding: "utf8" });
+    p.stdout.split("\n").forEach((x) => x && !pids.includes(x) && pids.push(x));
+  } catch {}
+  if (!pids.length) return { ok: true, data: "not running" };
+  pids.forEach((p) => { try { process.kill(+p, "SIGKILL"); } catch {} });
+  try { fs.unlinkSync(PID_FILE); } catch {}
+  return { ok: true, data: `stopped (${pids.join(", ")})` };
+}
+
+async function cmdStatus() {
+  const up = await isUp();
+  const pid = fs.existsSync(PID_FILE) ? fs.readFileSync(PID_FILE, "utf8").trim() : null;
+  return { ok: true, data: up ? `running (pid ${pid || "?"}) on ${HOST}:${PORT}` : `stopped (log: ${LOG_FILE})` };
+}
 
 // One JSON request/response over a fresh TCP connection. Blender is single-threaded
 // per command, so a short-lived connection per call is correct and simple.
@@ -71,7 +123,7 @@ commands:
   version
   scene <prop> [val]             units|frame_start|frame_end|fps|resolution|engine
 
-start server: blender --background --python ${SERVER} serve
+start server: f blender start
 `;
 
 export function register(_ctx) {
@@ -86,7 +138,11 @@ export function register(_ctx) {
       }
       const [cmd, ...cmdArgs] = rest;
       try {
-        const r = await request(cmd, cmdArgs);
+        let r;
+        if (cmd === "start") r = await cmdStart();
+        else if (cmd === "stop") r = await cmdStop();
+        else if (cmd === "status") r = await cmdStatus();
+        else r = await request(cmd, cmdArgs);
         process.stdout.write(JSON.stringify(r, null, 2) + "\n");
         if (r.ok === false) process.exitCode = 1;
       } catch (e) {
