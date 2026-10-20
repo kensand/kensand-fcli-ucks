@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""fuck — a CLI controller for Blender.
+"""blender_server — a TCP controller for a headless Blender instance.
 
 Usage:
-  blender --background --python fuck.py serve    # in Blender (headless)
-  ./fuck <command> [args...]
+  blender --background --python blender_server.py serve    # in Blender (headless)
+  f blender <command> [args...]                             # from the shell
 """
 import json
 import math
@@ -475,7 +475,7 @@ def cmd_play(args):
     scene.frame_start = start
     scene.frame_end = end
     # render animation
-    scene.render.filepath = args[3] if len(args) > 3 else "/tmp/fuck_anim_"
+    scene.render.filepath = args[3] if len(args) > 3 else "/tmp/blender_anim_"
     scene.render.image_settings.file_format = "PNG"
     bpy.ops.render.render(animation=True)
     return f"frames {start}-{end}"
@@ -732,7 +732,7 @@ def main():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(16)
-    print(f"[fuck] listening on {HOST}:{PORT}", flush=True)
+    print(f"[blender_server] listening on {HOST}:{PORT}", flush=True)
 
     while True:
         conn, addr = server.accept()
