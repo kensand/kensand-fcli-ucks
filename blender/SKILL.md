@@ -10,7 +10,7 @@ Control a headless Blender instance over TCP.
 ## Start the server
 
 ```bash
-blender --background --python ~/fuck-blender/fuck.py serve
+blender --background --python <uck-dir>/blender_server.py serve
 ```
 
 ## Common workflows
