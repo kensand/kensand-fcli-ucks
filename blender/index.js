@@ -43,8 +43,10 @@ commands:
   save <file.blend>
   open <file.blend>
   export <obj> <fmt> [path]     glb|gltf|fbx|obj|stl
+  box <W> <D> <H> [prefix] [recess] [pt]  parametric 2020 frame + 6 panels (inner dims mm)
   info
   version
+  scene <prop> [val]             units|frame_start|frame_end|fps|resolution|engine
 
 server: blender --background --python ~/fuck-blender/fuck.py serve
 `);

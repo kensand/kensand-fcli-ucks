@@ -36,16 +36,23 @@ f blender render /tmp/out.png          # EEVEE
 f blender render /tmp/out.png CYCLES   # Cycles
 ```
 
-### 2020 extrusion frames
+### 2020 extrusion frames (parametric)
 
-Each 2020 profile is a 20x20mm cross-section. Use `add cube` + `set scale` to
-create extrusions of the right length, position at the edge midpoint.
+`box` builds a full frame + 6 panels from **inner cavity** dims. 20mm profile,
+3mm panels, 13.5mm panel recess by default. All parts touch (verified).
 
 ```bash
-# 100x80x60 box, 20mm profiles
-# Posts (20x20x60) at 4 corners
-f blender add cube v1 && f blender set v1 scale "[1,1,3]" && f blender set v1 loc "[-40,-30,30]"
-# ... etc for v2-v4, then edges between posts
+f blender box 200 200 200 box        # 200x200x200 inner, prefix "box"
+f blender box 200 100 300 box 13.5 3  # custom recess + panel thickness
+```
+
+Gives: 4 posts + 8 rails + 6 panels (18 objects), all named `<prefix>.*`.
+Rebuilding with the same prefix replaces the old parts.
+
+Export the unique parts for printing:
+```bash
+f blender box 200 200 200 box
+# then export post/rail/panel STLs
 ```
 
 ### Export
