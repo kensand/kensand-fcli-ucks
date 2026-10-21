@@ -210,6 +210,19 @@ Crypto chain, implemented against `node:crypto` (verified with RFC 5869 / RFC
    endpoint receives for the password grant. The password itself never leaves.
 4. Every field is `type.iv|ciphertext|mac`: AES-256-CBC, verified with
    HMAC-SHA256 over `iv||ciphertext` **before** returning a value.
+5. **Per-cipher keys.** Which key opens a cipher, in order of specificity:
+   (a) `cipher.key` — a fresh per-item key RSA-OAEP-wrapped under the account's RSA
+   private key (type 3 = SHA-256, type 4 = SHA-1; honour the reported type);
+   (b) the **organization** key — vaultwarden puts nearly everything in an org, and
+   `profile.organizations[].key` is the org's 64-byte key wrapped the same way; ciphers
+   with `organizationId` are NOT encrypted with the account key at all;
+   (c) the account key from step 2. The decrypted 64 bytes are used RAW (enc||mac) —
+   no HKDF stretching on item/org keys; stretching is only the master-key chain.
+   `profile.privateKey` decrypts to **binary PKCS#8 DER** on real servers: use the
+   binary-safe path or utf8 silently corrupts it (same U+FFFD defect as the 64-byte
+   user key once hit). Writes (set-totp) re-encrypt under the SAME key the fields
+   already carry — using the account key on an org/item cipher stores ciphertext no
+   client can ever read back.
 
 MAC failure is an error, never empty-string-or-garbage. Type-0 (unencrypted)
 envelopes are returned as plaintext; type-1 (no MAC) is refused by default.
@@ -287,7 +300,8 @@ or your actual KDF. `f vaultwarden test` covers those against the live server.
 | message | meaning |
 |---|---|
 | `the server refused to issue a token` | Bitwarden answers `Username or password is incorrect` for a wrong email, a wrong password, **and** a rejected request — it does not say which. Do not assume the password: prove it offline first (see below). `rejected fields:` in the output names the cause when the server gives one. |
-| `MAC verification failed` | the stored master password does not derive the key that opens `profile.key`. Re-run `config --master-password`. Not a network problem. |
+| `MAC verification failed` | the key that opens `profile.key` is not derived from what you think. TWO causes: (1) the stored master password is wrong — re-run `config --master-password`; (2) **the session belongs to a different account than `cfg.email`** — the salt is the *configured* email but `profile.key` comes from whoever the token authenticates, so an SSO session captured in a browser logged in as another user (a bot account!) yields a permanent MAC failure no matter how often the right password is retyped. Before retyping anything, decode the stored token's claims: `f creds get vaultwarden.access-token --secrets | node -e 'let t="";process.stdin.on("data",d=>t+=d).on("end",()=>{const p=JSON.parse(Buffer.from(t.trim().split(".")[1],"base64"));console.log(p.email)})'` — if that email ≠ configured email, the fix is `f vaultwarden forget` + a fresh `sso login` done in a browser signed in as the RIGHT user. Not a network problem. |
+| many items named `(undecryptable)` while `test` logs in fine | the vault's contents live behind org keys or per-item keys, not the account key. Since 2026-10-21 the client unwraps both (plus binary-DER private keys); an older key cache lacks the material — `f vaultwarden cache --clear` and retry. If items STILL fail on a current client, dump the shapes (cipher.key prefix, organizationId, profile.organizations[].key) before theorizing — the last real hunt assumed per-item keys and the answer was organization keys. |
 | `unexpected symmetric key length` | **almost always a client bug, not your vault.** The wrapped user key is 64 *raw* bytes; if this ever reappears, look for a `Buffer` → `toString("utf8")` → `base64` round trip before suspecting the account. See the note below. |
 | `no server configured` | run `config --server/--email` |
 | `Scope (api) not supported` | correct behaviour, not a bug: this server allows `api` only on `client_credentials`. Password/SSO grants need `api offline_access`. |

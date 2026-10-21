@@ -44,6 +44,8 @@ import {
   makeMasterKey,
   masterPasswordHash,
   ssoRequiresMasterPassword,
+  unwrapPrivateKey,
+  unwrapOrgKeys,
   CIPHER_TYPE,
 } from "./lib/vwclient.js";
 
@@ -436,7 +438,13 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
   // Fast path: cached derived keys + token, so reads do not redo PBKDF2 (~1s).
   if (!forceUnlock) {
     const hit = await tryCachedSession(api);
-    if (hit) return { api, cfg, keys: hit.keys, items: decryptVault(hit.payload, hit.keys), fromCache: true };
+    if (hit) {
+      // A cache written before per-item-key support has no private key; per-item ciphers
+      // would then all report keyError. Fetch it once from sync and re-prime the cache.
+      if (!hit.keys.privateKeyPem) await attachPrivateKey(api, hit.keys, cfg);
+      if (!hit.keys.orgKeys) hit.keys.orgKeys = {};
+      return { api, cfg, keys: hit.keys, items: decryptVault(hit.payload, hit.keys), fromCache: true };
+    }
   }
 
   const master = credsGet(cfg.masterPasswordCred);
@@ -476,6 +484,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
         const encKey = sync?.profile?.key;
         if (!encKey) throw new Error("sync returned no profile.key");
         const keys = await deriveKeys({ email: cfg.email, password: master, encryptedKey: encKey, ...kdfCfg });
+        await attachPrivateKey(api, keys, cfg, sync);
         await writeKeyCache(cfg, keys, api);
         const items = decryptVault(payload, keys);
         return { api, cfg, keys, uuid: sync?.profile?.id ?? null, items: items.length ? items : decryptVault(sync, keys), fromCache: false };
@@ -526,6 +535,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     }
     throw e;
   }
+  await attachPrivateKey(api, keys, cfg, sync);
   await writeKeyCache(cfg, keys, api);
   // Re-read via /api/ciphers. If that fails we fall back to the sync we already
   // hold — but only when it actually carries ciphers; treating a cipher-less
@@ -556,6 +566,36 @@ async function userUuid(api) {
 
 /* ------------------------------------------------ key cache (in the box) */
 
+/**
+ * Attach the account's RSA private key to a derived key set — required to open
+ * per-item-key ciphers, which every current Bitwarden client writes. If a sync is
+ * already in hand pass it; otherwise one extra round-trip happens (cache hits from
+ * before this release, and the SSO-login priming path, land here).
+ * A missing key pair is a NORMAL state (legacy-only accounts): privateKeyPem = null.
+ * `undefined` (never attempted) is what makes a later read go look for it.
+ */
+async function attachPrivateKey(api, keys, cfg, syncAlready) {
+  if (keys.privateKeyPem !== undefined) return keys;
+  let profile = syncAlready?.profile ?? null;
+  if (!profile) {
+    try { profile = (await api.sync().catch(() => null))?.profile ?? null; } catch { profile = null; }
+  }
+  try {
+    keys.privateKeyPem = profile ? unwrapPrivateKey(profile, keys) : null;
+    // Org ciphers (vaults shared via an organization — the shape vaultwarden pushes
+    // by default) need the org key set derived from the same private key.
+    keys.orgKeys = profile && keys.privateKeyPem ? unwrapOrgKeys(profile, keys.privateKeyPem) : {};
+  } catch {
+    // A private key that will not open with keys that DID open profile.key is an oddity
+    // of this account, not a reason to fail the whole read: legacy items stay readable
+    // and per-item ones report their keyError with the real cause.
+    keys.privateKeyPem = null;
+    keys.orgKeys = {};
+  }
+  if ((keys.privateKeyPem || Object.keys(keys.orgKeys ?? {}).length) && cfg) await writeKeyCache(cfg, keys, api).catch(() => {});
+  return keys;
+}
+
 async function readKeyCache() {
   let blob;
   try {
@@ -569,12 +609,16 @@ async function readKeyCache() {
     if (!j?.exp || Date.now() > j.exp) { credsRm(C_KEY_CACHE); return null; }
     if (!j.accessToken || !j.encKey || !j.macKey) return null;
     const b64 = (s) => Buffer.from(s, "base64");
-    return {
-      accessToken: j.accessToken,
-      refreshToken: j.refreshToken ?? null,
-      keyExp: j.exp,
-      keys: { encKey: b64(j.encKey), macKey: b64(j.macKey), symmetricKey: b64(j.encKey) },
-    };
+    const keys = { encKey: b64(j.encKey), macKey: b64(j.macKey), symmetricKey: b64(j.encKey) };
+    // Caches written before per-item-key support lack this field entirely; absent means
+    // "not yet attempted" (the caller fetches it once), explicit null means "checked,
+    // none exists" — do not collapse the two or every legacy account re-syncs per read.
+    if ("privateKeyPem" in j) keys.privateKeyPem = j.privateKeyPem ?? null;
+    if (j.orgKeys) {
+      keys.orgKeys = {};
+      for (const [orgId, k] of Object.entries(j.orgKeys)) keys.orgKeys[orgId] = { encKey: b64(k.e), macKey: b64(k.m) };
+    }
+    return { accessToken: j.accessToken, refreshToken: j.refreshToken ?? null, keyExp: j.exp, keys };
   } catch {
     return null;
   }
@@ -597,14 +641,22 @@ function accessExpiry(accessExpiresAt, keyExp) {
 }
 
 function cacheBlob({ keys, accessToken, refreshToken, accessExp, keyExp }) {
-  return JSON.stringify({
+  const o = {
     exp: keyExp,
     accessExp,
     accessToken,
     refreshToken: refreshToken ?? null,
     encKey: keys.encKey.toString("base64"),
     macKey: keys.macKey.toString("base64"),
-  });
+  };
+  // Only record the private key once it has actually been attempted; the field's
+  // ABSENCE is the "go fetch it" signal for the cache reader.
+  if (keys.privateKeyPem !== undefined) o.privateKeyPem = keys.privateKeyPem;
+  if (keys.orgKeys) {
+    o.orgKeys = {};
+    for (const [orgId, k] of Object.entries(keys.orgKeys)) o.orgKeys[orgId] = { e: k.encKey.toString("base64"), m: k.macKey.toString("base64") };
+  }
+  return JSON.stringify(o);
 }
 
 async function writeKeyCache(cfg, keys, api) {
@@ -1087,16 +1139,24 @@ async function main(argv) {
       })();
       if (!item) { process.stderr.write(`f: cannot resolve '${name}' to exactly one item\n`); process.exit(1); }
       const raw = item.raw;
+      // Re-encrypt with the key the item's other fields actually carry: per-item-key
+      // ciphers written with the ACCOUNT key would be stored as ciphertext no client
+      // can open — a silent corruption, not an error.
+      const ikeys = item.itemKeys ?? keys;
+      if (raw.key && !item.itemKeys) {
+        process.stderr.write(`f: cannot rewrite '${item.name}': its per-item key could not be unwrapped (${item.errors?.key ?? "unknown cause"})\n`);
+        process.exit(1);
+      }
       const login = { ...(raw.login ?? {}) };
       if (login.totp) {
         let current = null;
-        try { current = decryptString(login.totp, keys); } catch {}
+        try { current = decryptString(login.totp, ikeys); } catch {}
         if (current && !has("force")) {
           process.stderr.write(`f: item '${item.name}' already has a totp field — pass --force to replace it\n`);
           process.exit(1);
         }
       }
-      login.totp = encryptString(secret, keys);
+      login.totp = encryptString(secret, ikeys);
       await api.putCipher(item.id, toWire(raw, { login }, await userUuid(api)));
       dropKeyCache(); // server bumped revisionDates; force a clean resync
       process.stdout.write(`set-totp\t${item.name}\n`);

@@ -88,7 +88,7 @@ const SSO_SCOPE = "api offline_access";
 const UA = "f-cli/vaultwarden-provider";
 
 /** Cipher type codes (Bitwarden `EncryptionType`). */
-export const ENC = { AES_256_CBC_PLAIN: 0, AES_128_CBC: 1, AES_256_CBC_HMAC: 2, RSA_2048_OAEP: 3 };
+export const ENC = { AES_256_CBC_PLAIN: 0, AES_128_CBC: 1, AES_256_CBC_HMAC: 2, RSA_2048_OAEP_SHA256: 3, RSA_2048_OAEP_SHA1: 4 };
 
 /** Cipher `type` values we surface. */
 export const CIPHER_TYPE = { LOGIN: 1, SECURE_NOTE: 2, CARD: 3, IDENTITY: 4 };
@@ -142,6 +142,12 @@ export function parseEnvelope(s) {
   const type = Number(s.slice(0, dot));
   const rest = s.slice(dot + 1);
   if (!Number.isInteger(type)) return null;
+  // RSA envelopes carry a single base64 payload with no iv/mac parts — the pipe-split
+  // below would reject them as malformed, which is how per-item-key ciphers started
+  // showing up as "(undecryptable)" instead of "unsupported type".
+  if (type === ENC.RSA_2048_OAEP_SHA256 || type === ENC.RSA_2048_OAEP_SHA1) {
+    return { type, data: Buffer.from(rest, "base64") };
+  }
   if (type === ENC.AES_256_CBC_PLAIN) return { type, data: Buffer.from(rest, "base64") };
   const parts = rest.split("|");
   if (parts.length < 2) return null;
@@ -260,6 +266,78 @@ export function unwrapSymmetricKey(encryptedKey, stretched) {
   }
   const encKey = buf.subarray(0, 32);
   return { encKey, macKey: buf.subarray(32, 64), symmetricKey: encKey };
+}
+
+/**
+ * The account's RSA private key. `profile.privateKey` (older servers) or
+ * `profile.keys.private` (newer shapes) is an AES envelope under the ACCOUNT symmetric
+ * key — the same pair every legacy field uses — whose plaintext is a PEM.
+ * Returns null when the account carries no key pair at all: that is a normal state for
+ * accounts whose ciphers are all legacy, NOT an error. Throws on a MAC failure, which
+ * is a wrong key like anywhere else.
+ */
+export function unwrapPrivateKey(profile, keys) {
+  const enc = profile?.privateKey ?? profile?.keys?.private
+    ?? profile?.keys?.privateKey ?? profile?.keys?.encryptedPrivateKey;
+  if (!enc) return null;
+  // BINARY-safe read. Real servers store the private key as raw PKCS#8 DER, not PEM text;
+  // decryptString would run it through utf8 and turn every byte >= 0x80 into U+FFFD — the
+  // same defect that once turned a 64-byte key into 13. PEM text passes through untouched.
+  const buf = decryptBytes(enc, keys);
+  if (buf.subarray(0, 5).toString("latin1") === "-----") return buf.toString("utf8");
+  return crypto.createPrivateKey({ key: buf, format: "der", type: "pkcs8" })
+    .export({ type: "pkcs8", format: "pem" }).toString();
+}
+
+/**
+ * Organization keys. Each organization the account belongs to carries `key`: an
+ * RSA-OAEP-SHA1 envelope (same unwrap as a per-item key) holding the org's 64-byte
+ * symmetric key, used RAW for every cipher of that org. This is why vaults shared
+ * through an organization — which is how most people's vaults are shaped now, and
+ * what vaultwarden does with "default collection" setups — report one name after
+ * another as "(undecryptable)": they were never encrypted with the account key.
+ * Returns { orgId: { encKey, macKey } }; an org whose unwrap fails is skipped and
+ * reported via the console, not fatal — other orgs and personal items still open.
+ */
+export function unwrapOrgKeys(profile, privateKeyPem) {
+  const out = {};
+  if (!privateKeyPem) return out;
+  for (const org of profile?.organizations ?? []) {
+    if (typeof org?.key !== "string" || !org.id) continue;
+    try {
+      out[org.id] = decryptItemKey(org.key, privateKeyPem);
+    } catch (e) {
+      process.stderr.write(`f vaultwarden: org ${JSON.stringify(org.name ?? org.id)}: ${e.message.split("\n")[0]}\n`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Bitwarden's per-item key format (every current client writes it): the cipher carries
+ * `key`, an RSA-OAEP envelope wrapping a fresh 64-byte item key, and EVERY field of that
+ * cipher is encrypted with the item key, not the account key. The item key is used raw
+ * (enc = bytes 0..32, mac = bytes 32..64) — no HKDF stretching; stretching is only for
+ * the master-derived chain. Type 3 = RSA-OAEP-SHA256, type 4 = RSA-OAEP-SHA1, and which
+ * one appears depends on the client that created the cipher, so honour the reported type
+ * rather than assuming one.
+ */
+export function decryptItemKey(encryptedKey, privateKeyPem) {
+  const env = parseEnvelope(encryptedKey);
+  if (!env) throw new Error(`unrecognised item-key envelope: ${String(encryptedKey).slice(0, 24)}…`);
+  if (env.type !== ENC.RSA_2048_OAEP_SHA256 && env.type !== ENC.RSA_2048_OAEP_SHA1) {
+    throw new Error(`item key uses unsupported envelope type ${env.type} (want 3 = RSA-OAEP-SHA256 or 4 = RSA-OAEP-SHA1)`);
+  }
+  const oaepHash = env.type === ENC.RSA_2048_OAEP_SHA1 ? "sha1" : "sha256";
+  let raw;
+  try {
+    raw = crypto.privateDecrypt({ key: privateKeyPem, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash }, env.data);
+  } catch (e) {
+    // RSA has no MAC; a failed unwrap IS the integrity signal, say so plainly.
+    throw new Error(`item key will not unwrap with this account's private key (${e.message})`);
+  }
+  if (raw.length !== 64) throw new Error(`unexpected item key length ${raw.length} (want 64)`);
+  return { encKey: raw.subarray(0, 32), macKey: raw.subarray(32, 64) };
 }
 
 /* -------------------------------------------------------------- api client */
@@ -692,6 +770,10 @@ export class VaultItem {
     this.type = raw.type;
     this.folderId = raw.folderId ?? null;
     this.errors = {};
+    // A cipher whose per-item key could not be unwrapped decrypts to nothing with any
+    // field key; record WHY (missing account private key, failed RSA unwrap) so the
+    // operator sees a cause instead of a wall of MAC failures.
+    if (opts.keyError) this.errors.key = opts.keyError;
     // A field that will not decrypt is recorded in `errors` and left undefined
     // rather than thrown: one legacy (unauthenticated) or otherwise odd item must
     // not stop the rest of the vault from yielding credentials.
@@ -856,10 +938,36 @@ export function ciphersFrom(payload, { source = "vault payload" } = {}) {
 
 /** Decrypt every cipher in a sync/ciphers payload. */
 export function decryptVault(payload, keys, opts = {}) {
-  return ciphersFrom(payload).map((c) => new VaultItem(c, keys, opts));
+  return ciphersFrom(payload).map((c) => {
+    // Which key opens a cipher, in order of specificity:
+    //   1. a per-item key (cipher.key), 2. its organization's key, 3. the account key.
+    const orgKey = c.organizationId ? keys.orgKeys?.[c.organizationId] : undefined;
+    const base = orgKey ?? keys;
+    if (!c.key) {
+      const item = new VaultItem(c, base, opts);
+      if (orgKey) item.itemKeys = orgKey; // writes must use the key the fields carry
+      return item;
+    }
+    if (!keys.privateKeyPem) {
+      return new VaultItem(c, base, {
+        ...opts,
+        keyError: "cipher uses a per-item key but no account private key is available (no key pair on the account, or a key cache from before this release — f vaultwarden cache --clear)",
+      });
+    }
+    try {
+      const itemKeys = decryptItemKey(c.key, keys.privateKeyPem);
+      const item = new VaultItem(c, itemKeys, opts);
+      // Writes (set-totp) MUST re-encrypt with the same key the fields carry; handing
+      // them the account key would store ciphertext no client can read back.
+      item.itemKeys = itemKeys;
+      return item;
+    } catch (e) {
+      return new VaultItem(c, base, { ...opts, keyError: e.message });
+    }
+  });
 }
 
-export default { VaultwardenApi, VaultItem, deriveKeys, decryptVault, ciphersFrom, decryptString, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, ENC, CIPHER_TYPE };
+export default { VaultwardenApi, VaultItem, deriveKeys, decryptVault, ciphersFrom, decryptString, decryptBytes, encryptString, makeMasterKey, stretchMasterKey, hkdfExpand, masterPasswordHash, parseEnvelope, unwrapSymmetricKey, unwrapPrivateKey, unwrapOrgKeys, decryptItemKey, ENC, CIPHER_TYPE };
 
 export function ssoRequiresMasterPassword(tokenJson) {
   const udo = tokenJson?.UserDecryptionOptions ?? tokenJson?.userDecryptionOptions ?? {};

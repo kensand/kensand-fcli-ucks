@@ -24,7 +24,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const UCK = path.join(here, "..");
-const CREDS_UCK = path.join(process.env.HOME, ".f/ucks/fcli-ucks/creds");
+// The creds provider ladder lives in the fcli core, which is checked out under different
+// names on different machines. Search the plausible locations (env override first) and
+// fail with a named fix — not with a module-not-found stack that hides the real issue.
+const CREDS_CANDIDATES = [
+  process.env.FCLI_CREDS_UCK,
+  path.join(process.env.HOME, ".f/ucks/fcli-ucks/creds"),
+  path.join(process.env.HOME, ".f/ucks/official-ucks-src/creds"),
+  path.join(here, "..", "..", "official-ucks-src", "creds"),
+].filter(Boolean);
+const CREDS_UCK = CREDS_CANDIDATES.find((p) => fs.existsSync(path.join(p, "providers.js")));
+if (!CREDS_UCK) {
+  console.error("e2e: cannot locate creds/providers.js — set FCLI_CREDS_UCK to the fcli core uck dir");
+  process.exit(1);
+}
 
 const EMAIL = "kenny@example.com";
 const PASSWORD = "master-pass-123";
@@ -87,6 +100,29 @@ const login = (id, name, { user, pass, totp, uris = [], fields = [] }) => ({
   fields: fields.map((f) => ({ name: enc(f.name), value: enc(f.value), type: 0 })),
 });
 
+// A per-item-key cipher, the format every 2024+ Bitwarden client writes: `cipher.key`
+// wraps a fresh 64-byte item key under the ACCOUNT RSA public key (OAEP-SHA256 = type 3),
+// and every field of that cipher is encrypted with the item key. The matching private
+// key lives in profile.privateKey, encrypted under the account symmetric key — shapes
+// pinned from a real server, not from this client's own expectations.
+const RSA = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+const RSA_PEM = RSA.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+const ITEMKEY = crypto.randomBytes(64);
+const ienc = (p) => encWith(ITEMKEY.subarray(0, 32), ITEMKEY.subarray(32, 64), p);
+const WRAPPED_ITEMKEY = "3." + b64(crypto.publicEncrypt(
+  { key: RSA.publicKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha256" }, ITEMKEY));
+const PRIVATE_KEY_ENVELOPE = encWith(sym, symMac, RSA.privateKey.export({ type: "pkcs8", format: "der" }));
+// Real vaultwarden puts the vault behind an ORGANIZATION (the "kensand.net" org is how
+// this very account's five secrets are stored). Org ciphers use the org's own raw 64-byte
+// key, RSA-OAEP-SHA1-wrapped under the account public key — the shape that made the live
+// vault read as five consecutive "(undecryptable)"s.
+const ORG_KEY = crypto.randomBytes(64);
+const oenc = (p) => encWith(ORG_KEY.subarray(0, 32), ORG_KEY.subarray(32, 64), p);
+const ORG = {
+  id: "org-1", name: "kensand.net", key: "4." + b64(crypto.publicEncrypt(
+    { key: RSA.publicKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha1" }, ORG_KEY)),
+};
+
 const CIPHERS = [
   login("aaaaaaaa-0001", "github.com", { user: "kensand", pass: "ghp_real_1", totp: "JBSWY3DP", uris: ["https://github.com"] }),
   // deliberately duplicate name + duplicate host, to exercise ambiguity errors
@@ -96,6 +132,14 @@ const CIPHERS = [
   login("aaaaaaaa-0005", "no-pass", { user: "only-user", uris: ["https://nopass.example"] }),
   login("aaaaaaaa-0006", "wild", { user: "u", pass: "p", uris: ["https://*.gitlab.example"] }),
   { id: "aaaaaaaa-0007", type: 2, name: enc("plain note"), login: { username: enc("note body") }, fields: [] },
+  { id: "aaaaaaaa-0008", type: 1, key: WRAPPED_ITEMKEY, organizationId: null, folderId: null, favorite: false,
+    name: ienc("per-item.example"), notes: null,
+    login: { username: ienc("ik-user"), password: ienc("ik_secret_8"), totp: null, uris: [{ uri: ienc("https://per-item.example"), match: null }] },
+    fields: [] },
+  { id: "aaaaaaaa-0009", type: 1, key: null, organizationId: "org-1", folderId: null, favorite: false,
+    name: oenc("org.example"), notes: null,
+    login: { username: oenc("org-user"), password: oenc("org_secret_9"), totp: null, uris: [{ uri: oenc("https://org.example"), match: null }] },
+    fields: [] },
 ];
 
 let TOKEN_SEEN = null;
@@ -252,7 +296,7 @@ const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url === "/api/sync") {
       SYNC_HITS++;
       if (!bearerOk) return send(401, { error: "invalid_token" });
-      return send(200, { profile: { id: "u1", key: profileKey, privateKey: null }, ciphers: CIPHERS, folders: [], collections: [] });
+      return send(200, { profile: { id: "u1", key: profileKey, privateKey: PRIVATE_KEY_ENVELOPE, organizations: [ORG] }, ciphers: CIPHERS, folders: [], collections: [] });
     }
     if (req.method === "GET" && req.url === "/api/ciphers") {
       CIPHERS_HITS++;
@@ -495,6 +539,25 @@ injectVw();
   t("host match via uri => correct password", r.value === "fj_token_3" && r.provider === "vaultwarden", JSON.stringify(r).slice(0, 200));
   t("hit was mirrored", box.get("mirror:forgejo.kensand.net") === "fj_token_3");
   t("mirror records its source", providers.mirrorSource("mirror:forgejo.kensand.net") === "vaultwarden");
+}
+{
+  // The per-item-key cipher must resolve through the SAME production path — item keys
+  // are a decrypt detail, not a lookup detail.
+  const r = await freshLookup("per-item.example");
+  t("per-item-key cipher resolves through the provider ladder", r.value === "ik_secret_8" && r.provider === "vaultwarden", JSON.stringify(r).slice(0, 200));
+  // Second read: served from the KEY CACHE now (mirror cleared by freshLookup but the
+  // cache persists) — the cached keys must carry the private key, or this silently
+  // degrades to (undecryptable) on the second call.
+  const r2 = await freshLookup("per-item.example");
+  t("per-item-key cipher still resolves from the cached key set", r2.value === "ik_secret_8", JSON.stringify(r2).slice(0, 200));
+}
+{
+  // Org ciphers through the production ladder — the failure that started this whole
+  // release: five real secrets behind an organization key read as "(undecryptable)".
+  const r = await freshLookup("org.example");
+  t("org cipher resolves through the provider ladder", r.value === "org_secret_9" && r.provider === "vaultwarden", JSON.stringify(r).slice(0, 200));
+  const r2 = await freshLookup("org.example");
+  t("org cipher still resolves from the cached key set (org keys are cached too)", r2.value === "org_secret_9", JSON.stringify(r2).slice(0, 200));
 }
 {
   const before = CIPHERS_HITS;

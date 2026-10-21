@@ -500,5 +500,169 @@ await t("duplicate names are detectable by the resolver", () => {
   assert.equal(named.length, 2, "fixture must contain a name collision to be useful");
 });
 
+/* ------------------- per-item-key ciphers (the 2024+ client format) ------- */
+
+// The RSA side is built here with node primitives straight from the spec — the client's
+// decryptItemKey is NOT consulted to produce any fixture byte. An account key pair, an
+// item key wrapped under it, and a cipher whose every field uses the ITEM key, exactly
+// as current Bitwarden clients write them.
+const rsa = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+const rsaPem = rsa.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+const rsaPemOther = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 })
+  .privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+const acctKeys = { encKey: symmetricKey, macKey };
+
+function wrapItemKey(itemKey, hash = "sha256", type = 3, key = rsa.publicKey) {
+  const ct = crypto.publicEncrypt(
+    { key, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: hash },
+    itemKey,
+  );
+  return `${type}.${b64(ct)}`;
+}
+const itemKeyBytes = crypto.randomBytes(64);
+const ikeys = { encKey: itemKeyBytes.subarray(0, 32), macKey: itemKeyBytes.subarray(32, 64) };
+const itemCipher = {
+  id: "cipher-itemkey", type: 1, folderId: null, favorite: false,
+  key: wrapItemKey(itemKeyBytes),
+  name: refEncrypt("per-item secret", ikeys.encKey, ikeys.macKey),
+  notes: null,
+  login: {
+    username: refEncrypt("ik-user", ikeys.encKey, ikeys.macKey),
+    password: refEncrypt("ik-pass", ikeys.encKey, ikeys.macKey),
+    totp: null,
+    uris: [{ uri: refEncrypt("https://itemkey.example", ikeys.encKey, ikeys.macKey), match: null }],
+  },
+  fields: [],
+};
+
+await t("decryptItemKey unwraps type 3 (RSA-OAEP-SHA256) to the exact 64 bytes", () => {
+  const k = C.decryptItemKey(itemCipher.key, rsaPem);
+  assert.deepEqual([...k.encKey], [...itemKeyBytes.subarray(0, 32)]);
+  assert.deepEqual([...k.macKey], [...itemKeyBytes.subarray(32)]);
+});
+
+await t("decryptItemKey honours the envelope type: 4 means SHA-1", () => {
+  const env4 = wrapItemKey(itemKeyBytes, "sha1", 4);
+  const k = C.decryptItemKey(env4, rsaPem);
+  assert.deepEqual([...k.encKey], [...itemKeyBytes.subarray(0, 32)]);
+  // And the reverse mapping must NOT work: a sha256 ciphertext labelled type 4 is
+  // garbage under SHA-1 OAEP. If this ever passes, the type is being ignored.
+  const mismatch = wrapItemKey(itemKeyBytes, "sha256", 4);
+  assert.throws(() => C.decryptItemKey(mismatch, rsaPem), /will not unwrap/);
+});
+
+await t("decryptItemKey refuses another key pair, wrong lengths, and unknown types", () => {
+  assert.throws(() => C.decryptItemKey(itemCipher.key, rsaPemOther), /will not unwrap/);
+  const short = wrapItemKey(crypto.randomBytes(32));
+  assert.throws(() => C.decryptItemKey(short, rsaPem), /length 32 \(want 64\)/);
+  assert.throws(() => C.decryptItemKey("9." + b64(crypto.randomBytes(256)), rsaPem), /unrecognised item-key envelope/);
+});
+
+await t("decryptItemKey tamper detection: one flipped byte fails the RSA unwrap", () => {
+  const [ty, payload] = itemCipher.key.split(".");
+  const bytes = Buffer.from(payload, "base64");
+  bytes[100] ^= 0x01;
+  assert.throws(() => C.decryptItemKey(`${ty}.${b64(bytes)}`, rsaPem), /will not unwrap/);
+});
+
+await t("unwrapPrivateKey reads profile.privateKey under the account key (both shapes)", () => {
+  const enc = refEncrypt(rsaPem, acctKeys.encKey, acctKeys.macKey);
+  assert.equal(C.unwrapPrivateKey({ privateKey: enc }, acctKeys), rsaPem);
+  assert.equal(C.unwrapPrivateKey({ keys: { private: enc } }, acctKeys), rsaPem);
+  assert.equal(C.unwrapPrivateKey({}, acctKeys), null, "no key pair is a normal null, not an error");
+  assert.throws(() => C.unwrapPrivateKey({ privateKey: enc }, { encKey: crypto.randomBytes(32), macKey: crypto.randomBytes(32) }), /MAC verification failed/);
+});
+
+await t("decryptVault opens per-item ciphers with the private key and reports the cause without one", () => {
+  const payload = { profile: {}, ciphers: [itemCipher] };
+  const good = C.decryptVault(payload, { ...acctKeys, privateKeyPem: rsaPem })[0];
+  assert.equal(good.name, "per-item secret");
+  assert.equal(good.login.password, "ik-pass");
+  assert.deepEqual(good.uriList(), ["https://itemkey.example"]);
+  assert.ok(good.itemKeys, "writes must know which key the fields carry");
+
+  const noPem = C.decryptVault(payload, { ...acctKeys, privateKeyPem: null })[0];
+  assert.equal(noPem.name, "(undecryptable)");
+  assert.match(noPem.errors.key, /per-item key but no account private key/);
+
+  const wrongPem = C.decryptVault(payload, { ...acctKeys, privateKeyPem: rsaPemOther })[0];
+  assert.match(wrongPem.errors.key, /will not unwrap/);
+
+  // A legacy cipher in the same payload still decrypts with the account keys — the
+  // per-item path must not hijack it.
+  const mixed = C.decryptVault({ ciphers: [vault.ciphers[0], itemCipher] }, { ...acctKeys, privateKeyPem: rsaPem });
+  assert.equal(mixed.find((i) => i.id === vault.ciphers[0].id).name, "github.com");
+});
+
+await t("mutation guard: item-key ciphertext under the ACCOUNT key is NOT accepted", () => {
+  // If the client ever decrypted fields with the account key for a cipher that carries
+  // a `key`, this fixture (fields under account keys but key present) would decrypt —
+  // and wrongly so, because real clients would see garbage. It must report keyError.
+  const forged = { ...itemCipher, name: refEncrypt("wrong-key name", acctKeys.encKey, acctKeys.macKey) };
+  const it = C.decryptVault({ ciphers: [forged] }, { ...acctKeys, privateKeyPem: rsaPem })[0];
+  assert.notEqual(it.name, "wrong-key name", "per-item ciphers must only decrypt with their item key");
+});
+
+/* ------------------------- organization keys (the real-vault blocker) ----- */
+
+// The shape a live vaultwarden was pinned to show: ciphers belong to an organization,
+// org.key is RSA-OAEP-SHA1-wrapped under the account public key, and the decrypted
+// 64 bytes are used RAW for every cipher of that org. The account's own key MAC-checks
+// FALSE on them — which is exactly how "(undecryptable)" reached production.
+const orgKeyBytes = crypto.randomBytes(64);
+const okeys = { encKey: orgKeyBytes.subarray(0, 32), macKey: orgKeyBytes.subarray(32, 64) };
+const orgEnvelope = "4." + b64(crypto.publicEncrypt(
+  { key: rsa.publicKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: "sha1" }, orgKeyBytes));
+const orgCipher = {
+  id: "cipher-org", type: 1, folderId: null, favorite: false,
+  organizationId: "org-1", key: null,
+  name: refEncrypt("org secret", okeys.encKey, okeys.macKey),
+  notes: null,
+  login: {
+    username: refEncrypt("org-user", okeys.encKey, okeys.macKey),
+    password: refEncrypt("org-pass", okeys.encKey, okeys.macKey),
+    totp: null,
+    uris: [{ uri: refEncrypt("https://org.example", okeys.encKey, okeys.macKey), match: null }],
+  },
+  fields: [],
+};
+
+await t("unwrapPrivateKey normalizes binary DER (how real servers store it) to PEM", () => {
+  // Live-pinned: profile.privateKey decrypts to raw PKCS#8 DER, NOT PEM text. Running it
+  // through decryptString corrupts every byte >= 0x80, so privateDecrypt gets garbage.
+  const der = rsa.privateKey.export({ type: "pkcs8", format: "der" });
+  const encDer = refEncrypt(der, acctKeys.encKey, acctKeys.macKey);
+  const pem = C.unwrapPrivateKey({ privateKey: encDer }, acctKeys);
+  assert.match(pem, /^-----BEGIN PRIVATE KEY-----/);
+  const roundtrip = crypto.createPrivateKey(pem).export({ type: "pkcs8", format: "der" });
+  assert.deepEqual([...roundtrip], [...der]);
+});
+
+await t("unwrapOrgKeys maps org id -> raw 64-byte split key (type 4 = OAEP-SHA1)", () => {
+  const map = C.unwrapOrgKeys({ organizations: [{ id: "org-1", name: "kensand.net", key: orgEnvelope }] }, rsaPem);
+  assert.ok(map["org-1"], "org key present");
+  assert.deepEqual([...map["org-1"].encKey], [...orgKeyBytes.subarray(0, 32)]);
+  assert.deepEqual([...map["org-1"].macKey], [...orgKeyBytes.subarray(32)]);
+  const bad = C.unwrapOrgKeys({ organizations: [{ id: "org-x", name: "x", key: "4." + b64(crypto.randomBytes(256)) }] }, rsaPem);
+  assert.deepEqual(bad, {}, "an org that will not unwrap is skipped, not fatal");
+});
+
+await t("org ciphers decrypt with the org key; writes remember it", () => {
+  const keysWithOrg = { ...acctKeys, privateKeyPem: rsaPem, orgKeys: { "org-1": okeys } };
+  const item = C.decryptVault({ ciphers: [orgCipher] }, keysWithOrg)[0];
+  assert.equal(item.name, "org secret");
+  assert.equal(item.login.password, "org-pass");
+  assert.deepEqual(item.uriList(), ["https://org.example"]);
+  assert.ok(item.itemKeys, "set-totp must re-encrypt under the ORG key, not the account key");
+  assert.deepEqual([...item.itemKeys.encKey], [...okeys.encKey]);
+});
+
+await t("mutation guard: an org cipher is NOT openable with the account key, and a missing org key degrades loudly", () => {
+  // Same cipher, account key only (no orgKeys): must fail MAC cleanly, not throw.
+  const item = C.decryptVault({ ciphers: [orgCipher] }, { ...acctKeys, privateKeyPem: rsaPem })[0];
+  assert.equal(item.name, "(undecryptable)");
+  assert.match(item.errors.name, /MAC verification failed/, "a wrong key must read as a wrong key");
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
