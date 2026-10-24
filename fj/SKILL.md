@@ -27,6 +27,7 @@ f fj runs [newest|<id>]          list/show action runs
 f fj joblogs <id> [grep]         download + grep a run's job logs
 f fj pr check [number]           PR + CI status (default: PR of head branch)
 f fj pr merge [number] [-m s]    merge a PR (squash|merge|rebase, default squash)
+f fj pr review [number] <approve|request-changes|comment> [-b text]
 f fj pr status <sha|ref>         commit CI status (e.g. HEAD, origin/main)
 f fj pr open                     list open PRs of the current repo
 ```
@@ -41,6 +42,7 @@ f fj pr open                     list open PRs of the current repo
 | --- | --- |
 | did this PR's CI pass? | `f fj pr check` (no number = PR of your branch) |
 | merge a PR | `f fj pr merge <n>` |
+| approve a PR | `f fj pr review <n> approve` |
 | CI status of a commit | `f fj pr status HEAD` |
 | list open PRs on origin | `f fj pr open` (or `f fj call repoListPullRequests …`) |
 | get a PR | `f fj call repoGetPullRequest {owner,repo,number}` |
@@ -51,6 +53,30 @@ Find the exact endpoint name with `f fj ls <word>` when unsure (e.g. `f fj ls pi
 
 ## Gotchas
 
+- **Reviews: `event=APPROVED`, never `APPROVE`.** Approve and request-changes are
+  the *same* endpoint — `POST /repos/{owner}/{repo}/pulls/{index}/reviews` (plus
+  `.../reviews/{id}` for the two-step submit); there is no approve-only route, and
+  the only difference between the two operations is the enum string. This instance
+  speaks the Forgejo-native enum (`APPROVED | REQUEST_CHANGES | COMMENT`), not
+  GitHub's `APPROVE`; `APPROVE` is rejected. Because the SDK throws the HTTP status
+  away, a wrong enum looks like a silent no-op rather than a 422 — `pr review`
+  confirms by reading back the stored `state`. Raw call, if you bypass the helper:
+  `f fj POST /repos/<o>/<r>/pulls/<n>/reviews '{body:{event:"APPROVED"}}'`.
 - No token: `f fj` fails immediately and says whether creds are locked or unset. Fix with `f creds unlock` / `f creds set <host> <token>`, or pass `--token <tok>`.
+- **All creds access goes through `credsApi.resolveCred` — there is one
+  interface, and it is not this uck's to reimplement.** `f fj` reads no
+  `~/.f/.creds-daemon`, opens no `~/.f/.creds.sock`, and matches no creds error
+  text; `resolveToken()` is a few lines that call creds and pass its
+  `reason`/`credHint` through. That is the fix for a real split-brain: six ucks
+  each kept a copy of creds' lockfile check, `f creds unlock --permanent` stores
+  `ttl: null, permanent: true`, every copy tested `!lf.ttl` and declared a
+  permanent session "expired at t=0" — so `f fj whoami` said `creds are locked`
+  while `f creds status` beside it said `unlocked (permanent)`. If those two
+  commands ever disagree again, the bug is that something reads the lockfile
+  again; grep for `.creds-daemon` and delete it, do not add a second reader.
+  Interface + rules: `creds/CONTRACT.md` §6.1 (C0).
+- A permanently unlocked store **restarts its own daemon** after a reboot or OOM
+  kill. `f fj` triggers that the same way `f creds ls` does, so a fresh boot needs
+  no human. It never prompts: a store with no permanent unlock reports `locked`.
 - `--url <base>` overrides the git-origin base (e.g. for a repo not on the instance you're standing in).
 - `--wait [sec]` blocks until a cred appears (default 300s) — useful in jobs that start before a human unlocks creds.

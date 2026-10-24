@@ -31,12 +31,9 @@
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import net from "node:net";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const F = path.join(process.env.HOME ?? "", ".f");
-const CRED_SOCKET = path.join(F, ".creds.sock");
 
 // ---- SDK (lazy; only imported when we actually make a call) ----
 let _sdk = null;
@@ -127,168 +124,98 @@ function apiUrl(base) {
   return base ? base.replace(/\/$/, "") + "/api/v1" : null;
 }
 
-/** Read a cred from the creds daemon (same protocol as the creds uck uses). */
-function daemonCall(req, socketPath) {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    const client = net.connect(socketPath, () => {
-      client.write(JSON.stringify(req));
-    });
-    client.on("data", (d) => (buf += d));
-    client.on("end", () => {
-      try { resolve(JSON.parse(buf)); } catch { reject(new Error("bad daemon response: " + buf)); }
-    });
-    client.on("error", (e) => reject(e));
-  });
-}
-
-/** True when the creds daemon is up with time left on its ttl.
- *
- * Reads the lockfile the creds uck writes (~/.f/.creds-daemon: {pid, start,
- * ttl, socket}) rather than asking the daemon, so this is a file read plus a
- * liveness check and never blocks. Same three conditions the creds uck itself
- * applies in unlockedState(): a live pid, and a ttl that has not elapsed. */
-function credsUnlocked() {
-  let lf;
-  try {
-    lf = JSON.parse(fs.readFileSync(path.join(F, ".creds-daemon"), "utf8"));
-  } catch {
-    return null;
-  }
-  if (!lf || !lf.pid || !lf.start || !lf.ttl) return null;
-  try {
-    process.kill(lf.pid, 0); // liveness only; throws if dead or not ours
-  } catch {
-    return null;
-  }
-  const remainingMs = lf.start + lf.ttl * 1000 - Date.now();
-  return remainingMs > 0 ? { remainingMs, socket: lf.socket } : null;
-}
-
 /**
- * Resolve a token: --token > FORGEJO_TOKEN > creds (host-keyed). The cred name
- * is the base-URL host as-is (e.g. `forgejo.kensand.net`), with a port-stripped
- * fallback when the host includes a port.
+ * The one way fj obtains a credential: ask the creds uck. There is
+ * deliberately no lockfile read, no socket client and no error-message matching
+ * here — those were six lines of fj's own copy of creds' internal state machine,
+ * and they drifted (see resolveCred in the creds uck: a permanent unlock writes
+ * ttl:null, which every copy read as "expired at t=0", so `f fj whoami` said
+ * `creds are locked` while `f creds status` said `unlocked (permanent)`).
  *
- * NEVER BLOCKS. It used to call credsApi.wait() for up to `timeout` (default
- * 300s) so the user could supply a token in another terminal while the command
- * sat there. That turned every credential problem into a five-minute hang, and
- * a hang is strictly worse than an error: nothing is printed, so "waiting for
- * you" is indistinguishable from "working", "found nothing" and "network stuck".
- * It fired on the most common failure of all -- the creds ttl is 10 minutes --
- * and `f fj version` answering instantly beside it made the token look rejected
- * rather than absent. `--wait` opts back in for the one case it helped: a
- * long-running job that wants to park until a human sets a cred.
+ * `reason` is creds' own §7.2 vocabulary (locked | missing | provider |
+ * no-store | timeout), and the remediation text is creds' `credHint`, so fj
+ * cannot disagree with `f creds status` about what is wrong or what to do.
  *
- * The three ways to get here are distinguished, because they need different
- * fixes and all three previously reported the same nothing:
- *   locked        store is not unlocked        -> `f creds unlock`
- *   unset         unlocked, cred absent        -> `f creds set <host> <token>`
- *   no creds uck  daemon unreachable outright  -> raw socket get also failed
+ * Order is creds' order: --token, FORGEJO_TOKEN, then the store (local box,
+ * provider ladder, mirrors). fj's only real job here is the base URL, which is
+ * what selects the cred name.
+ *
+ * It never blocks unless --wait was given, because a hang is strictly worse
+ * than an error: nothing prints, so "waiting for you" is indistinguishable from
+ * "working", "found nothing" and "network stuck".
  */
 async function resolveToken(flagToken, base, credsApi, opts = {}) {
-  if (flagToken) return { token: flagToken, src: "--token" };
-  if (process.env.FORGEJO_TOKEN) return { token: process.env.FORGEJO_TOKEN, src: "FORGEJO_TOKEN" };
   if (!base) return { token: null, src: null, reason: "no-base" };
   const host = hostFromUrl(base);
-  const names = host.includes(":") ? [host, host.split(":")[0]] : [host];
+  // --token / FORGEJO_TOKEN are answered here rather than passed down, because
+  // resolveCred reports a flag token with src "--token" and no reason: this uck
+  // owns its own flag names, so it labels its own escape hatches.
+  if (flagToken) return { token: flagToken, src: "--token" };
+  if (process.env.FORGEJO_TOKEN) return { token: process.env.FORGEJO_TOKEN, src: "FORGEJO_TOKEN" };
 
-  const state = credsUnlocked();
-  if (!state && !opts.waitMs) {
-    return { token: null, src: null, reason: "locked", host };
+  if (credsApi && typeof credsApi.resolveCred === "function") {
+    // creds derives the candidate names from the base URL (host:port, then bare
+    // host) — host parsing for cred naming is creds' rule, not fj's. One call
+    // answers found / locked / missing / provider / no-store / timeout.
+    return credsApi.resolveCred({ host: base, waitMs: opts.waitMs || 0 });
   }
-
-  // Opt-in blocking, and only via the creds uck: it owns the waiter registry
-  // that `f creds waiters` / `f creds fill` read, so a hand-rolled poll loop
-  // here would block invisibly with nothing for the other terminal to see.
-  // With --wait and no creds uck we fall through to the one-shot reads below,
-  // which is the old non-blocking behavior, not a silent lie about waiting.
-  if (!state && opts.waitMs && credsApi && typeof credsApi.wait === "function") {
-    try {
-      for (const name of names) {
-        const v = await credsApi.wait(name, { timeout: opts.waitMs });
-        if (v != null && v !== "") return { token: v, src: `creds:${name} (waited)` };
-      }
-    } catch {
-      /* timed out -- report the reason below rather than a stack */
-    }
-    return { token: null, src: null, reason: "wait-timeout", host };
+  // No creds uck in this process. creds still owns the raw read (CONTRACT.md C3)
+  // so this cannot re-derive locked/unlocked from the lockfile or mistake an
+  // unreachable daemon for "not configured".
+  if (credsApi && typeof credsApi.rawCredRead === "function") {
+    return credsApi.rawCredRead(credsApi.credNamesFor ? credsApi.credNamesFor(base) : [host]);
   }
-
-  // One-shot reads. Note `credsApi.get` throws CredsError(kind: "locked") on
-  // its own (credsApi.version >= 1), which is why the lockfile is consulted
-  // first: catching that exception would work but cannot distinguish "locked"
-  // from "that cred is not set" on the local-socket path below.
-  const classify = (e) => {
-    const k = e && e.kind;
-    if (k === "locked") return "locked";
-    if (k === "missing") return "missing";
-    if (k === "provider" || k === "other") return "error";
-    const m = (e && e.message) || String(e);
-    if (/locked/i.test(m)) return "locked";
-    if (/no such cred/i.test(m)) return "missing";
-    return "error";
-  };
-  const read = async (name) => {
-    if (credsApi && typeof credsApi.get === "function") {
-      try {
-        return await credsApi.get(name);
-      } catch (e) {
-        // "not found" for this name is expected when the port-stripped host is
-        // tried second; anything else is worth surfacing rather than swallowing.
-        if (classify(e) === "locked") return { locked: true };
-        return null;
-      }
-    }
-    try {
-      const r = await daemonCall({ op: "get", name }, state.socket || CRED_SOCKET);
-      if (r && r.ok) return r.value;
-      return null;
-    } catch {
-      return null;
-    }
-  };
-
-  for (const name of names) {
-    const v = await read(name);
-    if (v && v.locked) return { token: null, src: null, reason: "locked", host };
-    if (v != null && v !== "") return { token: v, src: `creds:${name}` };
-  }
-  return { token: null, src: null, reason: "unset", host };
+  // No creds uck at all: there is no interface to the store, so say that. Never
+  // guess from the filesystem — a guess is what made six ucks disagree with
+  // `f creds status`.
+  return { token: null, src: null, reason: "no-store", host };
 }
 
 /**
- * A dead store or an absent cred must stop the command, not degrade it. The
- * check lives here rather than at each call site because a uck that calls the
- * API anonymously returns whatever the instance exposes publicly and looks
- * fine: `f fj whoami` reported `user does not exist [uid: 0]` for the whole
- * session that the token was never being sent. `urls` is the exception -- it
- * REPORTS the token state, so an empty one is its answer, not an error.
+ * A dead store or an absent cred must stop the command, not degrade it: a uck
+ * that calls the API anonymously returns whatever the instance exposes publicly
+ * and looks fine — `f fj whoami` reported `user does not exist [uid: 0]` for a
+ * whole session in which the token was never being sent. `urls` is the
+ * exception: it REPORTS token state, so an empty one is its answer, not an
+ * error.
+ *
+ * The wording comes from creds' credHint so it cannot drift from
+ * `f creds status`; fj only adds its own --token/--wait escape hatches.
  */
 function needToken(tok) {
   if (tok.token) return tok.token;
-  if (tok.reason === "locked")
-    err(
-      `creds are locked (no token for ${tok.host})\n` +
-        `  unlock it: f creds unlock\n` +
-        `  or send one now: f fj --token <pat> ... / FORGEJO_TOKEN=...\n` +
-        `  or wait for one to be set: f fj --wait ...`,
-    );
-  if (tok.reason === "unset" || tok.reason === "wait-timeout")
-    err(
-      tok.reason === "wait-timeout"
-        ? `no credential for ${tok.host} appeared while waiting\n` +
-            `  store it: f creds set ${tok.host} <pat>\n` +
-            `  names already stored: f creds ls`
-        : `no credential stored for ${tok.host}\n` +
-            `  store it: f creds set ${tok.host} <pat>\n` +
-            `  or send one now: f fj --token <pat> ... / FORGEJO_TOKEN=...\n` +
-            `  names already stored: f creds ls`,
-    );
   if (tok.reason === "no-base")
     err("no base url (not in a git clone; pass --url https://host or set fj.defaultHost)");
-  err(`no token available (${tok.reason ?? "unknown"})`);
+  const hint = credsHintFor(tok, tok.host);
+  const extra =
+    tok.reason === "locked" || tok.reason === "missing"
+      ? `\n  or send one now: f fj --token <pat> ... / FORGEJO_TOKEN=...` +
+        (tok.reason === "locked" ? `\n  or wait for one to be set: f fj --wait ...` : "")
+      : "";
+  err(`no token for ${tok.host ?? "<host>"}\n  ${hint}${extra}`);
 }
+
+/** creds' own remediation text, with a local fallback for a process that has no
+ *  creds uck (the message must still name the real kind, never "other"). */
+function credsHintFor(res, name) {
+  if (_credsApiRef && typeof _credsApiRef.credHint === "function") return _credsApiRef.credHint(res, { credName: name });
+  if (res.token != null && res.token !== "") {
+    return res.localOnly ? `${res.src} (read without the creds uck; a vault value would be invisible)` : res.src;
+  }
+  switch (res.reason) {
+    case "locked":   return `creds are locked — unlock them: f creds unlock`;
+    case "missing":  return `no credential named '${name}' — store it: f creds set ${name} <pat>`;
+    case "provider": return `a credential provider failed for '${name}': ${res.detail}`;
+    case "no-store": return `the credential store could not be reached (no creds uck in this process) — check: f creds status`;
+    case "timeout":  return `timed out waiting for '${name}' — set it elsewhere: f creds fill ${name}`;
+    default:         return `credential '${name}' unavailable (${res.reason ?? "unknown"})`;
+  }
+}
+
+// Set once per process by run(), so needToken() (called deep in a command) can
+// ask creds for the remediation text without threading credsApi through every
+// signature. Only used for wording; the resolution itself took credsApi.
+let _credsApiRef = null;
 
 async function makeClient(url, token) {
   await sdk();
@@ -424,6 +351,12 @@ function err(msg) {
 }
 
 // ---- commands ----
+
+// Review event enum as accepted by THIS instance (Forgejo-native, not GitHub's
+// APPROVE/REQUEST_CHANGES/COMMENT). POST /repos/{owner}/{repo}/pulls/{index}/reviews
+// and POST .../reviews/{id} take the same body; there is no approve-only route.
+const REVIEW_EVENT = { approve: "APPROVED", request_changes: "REQUEST_CHANGES", comment: "COMMENT" };
+
 const PR_ICONS = { success: "+", failure: "x", pending: "o", error: "x", cancelled: "-" };
 
 function prStatusLines(s) {
@@ -499,12 +432,21 @@ async function cmdPr(sub, rest, flagUrl, flagToken, credsApi, opts) {
 
   if (sub === "merge" || sub === "m") {
     if (!number) return err("pr merge needs a PR number");
-    const res = await client.put({ url: `/repos/${owner}/${repo}/pulls/${number}/merge`, body: { merge_style: style, run_status_checks: false }, throwOnError: false });
+    // Forgejo merge endpoint: POST with body {Do: "merge"|"squash"|"rebase"}.
+    // (The old PUT + merge_style/run_status_checks body is dead: the server
+    // ignores unknown fields and the call silently did nothing while this
+    // wrapper still printed "merged".)
+    const res = await client.post({ url: `/repos/${owner}/${repo}/pulls/${number}/merge`, body: { Do: style, merge_when_checks_succeed: false }, throwOnError: false });
+    // The SDK discards HTTP status: on error, data/message may be empty
+    // (e.g. 405 already-merged, 403 no-permission). Use the merged-marker
+    // endpoint as the source of truth in every case.
+    const chk = await client.get({ url: `/repos/${owner}/${repo}/pulls/${number}/merge`, throwOnError: false });
+    if (!chk?.error) return process.stdout.write(`merged #${number} (${style})\n`);
     if (res?.error) {
-      const msg = res.data?.message || res.data?.error || res.error?.message || "merge failed";
-      return err(`merge #${number} failed: ${msg}`);
+      const msg = res.data?.message || res.data?.error || res.error?.message || (typeof res.error === "string" ? res.error : "");
+      return err(`merge #${number} failed: ${msg || "server rejected the merge (already merged, blocked by protections, or lacking approvals)"}`);
     }
-    return process.stdout.write(`merged #${number} (${style})\n`);
+    return err(`merge #${number} NOT confirmed: server accepted the call but the PR is not marked merged (approvals/protections?)`);
   }
 
   if (sub === "open" || sub === "ls") {
@@ -514,7 +456,42 @@ async function cmdPr(sub, rest, flagUrl, flagToken, credsApi, opts) {
     return process.stdout.write(r.map((p) => `#${p.number} ${p.title} [${(p.head && p.head.label) || (p.head && p.head.ref)}]`).join("\n") + "\n");
   }
 
-  err("usage: f fj pr <check [number]|merge [number] [-m style]|status <sha|ref>|open>");
+  if (sub === "review") {
+    // One endpoint for approve AND request-changes: POST /reviews (two-step:
+    // POST /reviews then POST /reviews/{id}). There is no separate approve
+    // endpoint; the ONLY difference is the enum string in `event`.
+    //
+    // On this instance the enum is the Forgejo-native one, NOT the GitHub one:
+    //   APPROVED | REQUEST_CHANGES | COMMENT
+    // Sending GitHub's "APPROVE" is rejected — and the SDK throws HTTP status
+    // away, so a wrong enum used to look like a mysterious failure. See
+    // REVIEW_EVENT in this block.
+    let event = null;
+    if (rest.includes("approve") || rest.includes("--approve")) event = REVIEW_EVENT.approve;
+    if (rest.includes("request-changes") || rest.includes("--request-changes")) event = REVIEW_EVENT.request_changes;
+    if (rest.includes("comment") || rest.includes("--comment")) event = REVIEW_EVENT.comment;
+    if (!event) return err("pr review needs approve | request-changes | comment");
+    if (!number) return err("pr review needs a PR number");
+    const bi = rest.indexOf("-b");
+    const body = bi !== -1 ? rest[bi + 1] : undefined;
+    const res = await client.post({
+      url: `/repos/${owner}/${repo}/pulls/${number}/reviews`,
+      body: body === undefined ? { event } : { event, body },
+      throwOnError: false,
+    });
+    // The SDK strips HTTP status, so the response body is the only evidence.
+    // A rejected enum returns {errors:{event:[...]}} or {message:...} with no
+    // status to read, so verify the state the server actually stored.
+    const state = res?.data?.state;
+    if (state === event) return process.stdout.write(`review #${number}: ${state}\n`);
+    const msg = res?.data?.message
+      || (res?.data?.errors && JSON.stringify(res.data.errors))
+      || (typeof res?.data === "string" ? res.data : "")
+      || "server rejected the review";
+    return err(`review #${number} failed: ${msg} (event must be one of ${Object.values(REVIEW_EVENT).join("|")})`);
+  }
+
+  err("usage: f fj pr <check [number]|merge [number] [-m style]|review [number] <approve|request-changes|comment> [-b text]|status <sha|ref>|open>");
 }
 
 function usage() {
@@ -537,6 +514,7 @@ function usage() {
     "  joblogs <run_id> ...     same as `runs <run_id> --joblogs`\n" +
     "  pr check [number]        PR + CI status (default: PR of head branch)\n" +
     "  pr merge [number] [-m squash|merge|rebase]   merge a PR (default squash)\n" +
+    "  pr review [number] <approve|request-changes|comment> [-b text]   (event=APPROVED, not APPROVE)\n" +
     "  pr status <sha|ref>      commit CI status (e.g. HEAD, origin/main)\n" +
     "  pr open                  list open PRs of the current repo\n" +
     "  --repo <owner>/<repo>    (runs/joblogs/pr) target repo; default: git origin\n" +
@@ -995,8 +973,11 @@ export function register(_ctx) {
       }
       const [cmd, ...rest] = pos;
       const opts = { waitMs: waitSec * 1000 };
-      // creds uck (for the opt-in blocking wait), if available
+      // The single interface into the credential store. Everything below goes
+      // through it; fj holds no lockfile reader, no socket client and no copy of
+      // creds' locked/missing wording.
       const credsApi = (ctx && ctx.registry && ctx.registry.creds && ctx.registry.creds.credsApi) || null;
+      _credsApiRef = credsApi;
 
       if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") return usage();
 
@@ -1007,13 +988,23 @@ export function register(_ctx) {
       if (cmd === "urls") {
         const base = resolveBaseUrl(flagUrl);
         // Diagnostic: an absent token IS this command's answer, so it must not
-        // error the way an API call would. It also never waits, even under
-        // --wait, because its whole job is to report the current state.
-        const tok = await resolveToken(flagToken, base, null, { waitMs: 0 });
+        // error the way an API call would. It still goes through the same token
+        // resolution as every other command — including the creds-uck fallback
+        // that revives a configured permanent unlock — because the whole point
+        // of `urls` is to report the state truthfully. It used to pass credsApi
+        // = null "because it never waits", which made it print `(none: locked)`
+        // for a permanently unlocked box while `f fj whoami` worked fine two
+        // commands later. Waiting is governed by opts.waitMs, not by withholding
+        // the api; --wait is explicitly ignored here.
+        const tok = await resolveToken(flagToken, base, credsApi, { waitMs: 0 });
         out({
           base: base ?? "(none)",
           api: apiUrl(base),
-          token: tok.token ? (tok.src + " (len " + String(tok.token).length + ")") : `(none: ${tok.reason})`,
+          // Same helper that produced the token describes it, so this line cannot
+          // disagree with `f creds status` about the store's state.
+          token: tok.token
+            ? `${credsHintFor(tok, tok.host)} (len ${String(tok.token).length})`
+            : `(none: ${tok.reason ?? "unknown"} \u2014 ${credsHintFor(tok, tok.host).split("\n")[0]})`,
         });
         return;
       }
