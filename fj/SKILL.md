@@ -26,6 +26,10 @@ f fj urls                        show resolved base url + token source
 f fj runs [newest|<id>]          list/show action runs
 f fj joblogs <id> [grep]         download + grep a run's job logs
 f fj pr check [number]           PR + CI status (default: PR of head branch)
+f fj pr create [--head b] [--base b] [--title t] [--body text|-|--body-file p]
+                                 open a PR. head = current branch, title = its last
+                                 commit subject, base = origin/HEAD (else main).
+                                 Fails if a PR is already open for the branch.
 f fj pr merge [number] [-m s]    merge a PR (squash|merge|rebase, default squash)
 f fj pr review [number] <approve|request-changes|comment> [-b text]
 f fj pr status <sha|ref>         commit CI status (e.g. HEAD, origin/main)
@@ -41,6 +45,7 @@ f fj pr open                     list open PRs of the current repo
 | Raw | f fj |
 | --- | --- |
 | did this PR's CI pass? | `f fj pr check` (no number = PR of your branch) |
+| open a PR for the current branch | `f fj pr create` (add `--body-file` for a long description) |
 | merge a PR | `f fj pr merge <n>` |
 | approve a PR | `f fj pr review <n> approve` |
 | CI status of a commit | `f fj pr status HEAD` |

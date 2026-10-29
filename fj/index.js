@@ -491,7 +491,86 @@ async function cmdPr(sub, rest, flagUrl, flagToken, credsApi, opts) {
     return err(`review #${number} failed: ${msg} (event must be one of ${Object.values(REVIEW_EVENT).join("|")})`);
   }
 
-  err("usage: f fj pr <check [number]|merge [number] [-m style]|review [number] <approve|request-changes|comment> [-b text]|status <sha|ref>|open>");
+  if (sub === "create" || sub === "new") {
+    // POST /repos/{owner}/{repo}/pulls needs {head, base, title}; body is optional.
+    // Everything except the title is inferable, because the point of this command
+    // is to open a PR for the branch you are standing on without re-typing what
+    // git already knows. `git remote get-url origin` is already how repoPathArg()
+    // finds the repo, so head/base come from the same source.
+    const gitAt = (args) => {
+      try {
+        return execSync(`git ${args}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+      } catch { return ""; }
+    };
+
+    // head: --head, else the current branch. A detached HEAD has no branch to
+    // open a PR from, so say that rather than POSTing an empty head and getting
+    // an opaque 400 back.
+    const headIdx = rest.indexOf("--head");
+    const head = headIdx !== -1 ? rest[headIdx + 1] : gitAt("rev-parse --abbrev-ref HEAD");
+    if (!head || head === "HEAD") {
+      return err("pr create needs a head branch: not on a branch (detached HEAD). Pass --head <branch>.");
+    }
+    // base: --base, else the remote's HEAD symbolic ref, else "main". Resolved
+    // once and reused for the same-branch guard below, so the guard and the POST
+    // can never disagree about what the base is.
+    const baseIdx = rest.indexOf("--base");
+    const base = baseIdx !== -1 ? rest[baseIdx + 1]
+      : (gitAt("symbolic-ref --short refs/remotes/origin/HEAD").replace(/^origin\//, "") || "main");
+
+    // Opening a PR from the base into itself is always wrong and Forgejo answers
+    // it with an unhelpful 4xx, so catch it locally.
+    if (head === base) {
+      return err(`pr create: head and base are both '${base}'. Switch to a feature branch or pass --head <branch>.`);
+    }
+
+    // title: --title, else the head branch's last commit subject. Commit subjects
+    // make decent PR titles and it means `git push && f fj pr create` works bare.
+    const titleIdx = rest.indexOf("--title");
+    const title = titleIdx !== -1 ? rest[titleIdx + 1] : gitAt(`log -1 --format=%s ${head}`);
+    if (!title) return err("pr create needs a title: --title <text>, or a commit on the head branch to infer one from.");
+
+    // body: --body <text>, --body-file <path>, or "-" to read stdin. Deliberately
+    // NOT a bare positional: `pr create "some title"` would be ambiguous against
+    // the [number] argument the other pr subcommands take.
+    let body = null;
+    const bfIdx = rest.indexOf("--body-file");
+    const bIdx = rest.indexOf("--body");
+    if (bfIdx !== -1) {
+      const file = rest[bfIdx + 1];
+      if (!file) return err("--body-file needs a path");
+      try { body = fs.readFileSync(file, "utf8"); }
+      catch (e) { return err(`cannot read --body-file ${file}: ${e.message}`); }
+    } else if (bIdx !== -1) {
+      const v = rest[bIdx + 1];
+      if (v === "-") body = fs.readFileSync(0, "utf8");
+      else if (v && !v.startsWith("--")) body = v;
+      else return err("--body needs text, or - to read stdin");
+    }
+
+    // A PR already open for this branch is the common accident: pushing, opening
+    // a PR, pushing again, re-running the command. Forgejo refuses the second
+    // create with a bare message, so detect it and hand back the number instead.
+    const existing = (await getJson(`/repos/${owner}/${repo}/pulls`, { state: "open", limit: 50 })).data;
+    const dupe = Array.isArray(existing)
+      ? existing.find((p) => p.head && (p.head.ref === head || p.head.label === head)) : null;
+    if (dupe) return err(`#${dupe.number} is already open for '${head}' (${dupe.html_url})`);
+
+    const res = await client.post({
+      url: `/repos/${owner}/${repo}/pulls`,
+      body: { head, base, title, ...(body != null ? { body } : {}) },
+      throwOnError: false,
+    });
+    if (res?.error) {
+      const msg = res.data?.message || res.data?.errors?.[0] || res.data?.error || res.error?.message || "create failed";
+      return err(`pr create failed: ${msg}`);
+    }
+    const pr = res.data ?? {};
+    if (!pr.number) return err(`pr create: unexpected response (${JSON.stringify(pr).slice(0, 160)})`);
+    return process.stdout.write(`#${pr.number} ${pr.title}\n${pr.html_url}\n  ${head} -> ${base}\n`);
+  }
+
+  err("usage: f fj pr <check [number]|create [--head b] [--base b] [--title t] [--body text|-|--body-file p]|merge [number] [-m style]|review [number] <approve|request-changes|comment> [-b text]|status <sha|ref>|open>");
 }
 
 function usage() {
@@ -513,6 +592,9 @@ function usage() {
     "  runs <run_id> --joblogs [grep] [--job <n>] [--out dir]  download+grep a run's job logs\n" +
     "  joblogs <run_id> ...     same as `runs <run_id> --joblogs`\n" +
     "  pr check [number]        PR + CI status (default: PR of head branch)\n" +
+    "  pr create [--head b] [--base b] [--title t] [--body text|-|--body-file p]\n" +
+    "                           open a PR; head/title inferred from the current\n" +
+    "                           branch, base from origin/HEAD (default main)\n" +
     "  pr merge [number] [-m squash|merge|rebase]   merge a PR (default squash)\n" +
     "  pr review [number] <approve|request-changes|comment> [-b text]   (event=APPROVED, not APPROVE)\n" +
     "  pr status <sha|ref>      commit CI status (e.g. HEAD, origin/main)\n" +
