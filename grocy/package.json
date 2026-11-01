@@ -1,0 +1,6 @@
+{
+  "name": "kensand-fcli-ucks-grocy",
+  "type": "module",
+  "description": "f grocy: grocy household API (stock, shopping list, recipes, chores, tasks, batteries, calendar)",
+  "main": "index.js"
+}

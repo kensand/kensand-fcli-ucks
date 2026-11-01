@@ -1,0 +1,6 @@
+{
+  "name": "kensand-fcli-ucks-kuma",
+  "type": "module",
+  "description": "f kuma: uptime-kuma service health via the public status page (watch, down, raw)",
+  "main": "index.js"
+}

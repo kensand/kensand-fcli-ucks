@@ -1,0 +1,6 @@
+{
+  "name": "kensand-fcli-ucks-slop",
+  "type": "module",
+  "description": "f slop: catch and repair LLM slop in prose (scan, --fix)",
+  "main": "index.js"
+}
