@@ -953,6 +953,65 @@ async function cmdWs(base, token, rest) {
       err("helper subcommand must be ls|ls-all|new|update|rm");
     }
 
+    // ---- automation config CRUD (merged from the old f ha-ws uck) ----
+    // HA's REST config view registers ONLY
+    // /api/config/<component>/<config_type>/{config_key}: there is no
+    // collection route, so create/update/delete of UI automations is
+    // WebSocket-only. `f ha conf` covers what REST can read; this is the
+    // ws-only half. Kept distinct from top-level `f ha auto` (which triggers
+    // and toggles via REST services) so neither silently shadows the other.
+    if (sub === "automation") {
+      const act = a[0];
+      const id = a[1];
+      if (!act || act === "ls") {
+        const r = await call("config/automation/list");
+        if (r.success) {
+          const items = r.result?.automations ?? r.result ?? [];
+          if (!items.length) { out("no automations"); return; }
+          outLines(items.map((x) => `${x.id}  ${x.alias ?? ""}`));
+          return;
+        }
+        // Older HA has no config/automation/list: enumerate through the state
+        // machine instead of failing (states carry the .storage id).
+        const st = await call("get_states");
+        if (!st.success) { out(`error: ${wsErr(r)} / ${wsErr(st)}`); return; }
+        const autos = (st.result || []).filter((s) => s.entity_id.startsWith("automation."));
+        out(`${autos.length} automations (config/automation/list unsupported: ${r.error?.message || "?"})`);
+        outLines(autos.map((s) => `${s.attributes?.id ?? "?"}  ${s.entity_id}  ${s.state}`));
+        return;
+      }
+      if (act === "get") {
+        if (!id) err("ws automation get needs an id (see: ws automation ls)");
+        const r = await call("config/automation/get", { automation_id: id });
+        out(JSON.stringify(r.success ? r.result : r.error, null, 2));
+        return;
+      }
+      if (act === "new" || act === "set") {
+        // `new` mints an id like `f ha conf new`; `set` requires one.
+        let autoId = id;
+        let bodyTok;
+        if (act === "new") { bodyTok = a.slice(1); if (!autoId) autoId = genConfigId(); }
+        else {
+          if (!autoId) err("ws automation set needs an id; for a fresh one use: ws automation new");
+          bodyTok = a.slice(2);
+        }
+        if (!bodyTok.length) err(`ws automation ${act} needs a config body (JSON)`);
+        let cfg;
+        try { cfg = JSON.parse(bodyTok.join(" ")); }
+        catch (e) { err(`config json parse failed: ${e.message}`); }
+        delete cfg.id; // create_update injects automation_id itself
+        const r = await call("config/automation/create_update", { automation_id: autoId, ...cfg });
+        out(r.success ? `ok  saved automation ${autoId}` : `error: ${wsErr(r)}`);
+        return;
+      }
+      if (act === "rm") {
+        if (!id) err("ws automation rm needs an id");
+        const r = await call("config/automation/delete", { automation_id: id });
+        out(r.success ? `ok  deleted automation ${id}` : `error: ${wsErr(r)}`);
+        return;
+      }
+      err("ws automation subcommand must be ls|get|new|set|rm");
+    }
     out(`f ha ws: unknown subcommand: ${sub}\n\n${wsUsage()}`);
   });
 }
@@ -966,7 +1025,14 @@ function wsUsage() {
     "  ws helper ls [type]          list helpers\n" +
     "  ws helper new <type> <name> <json>\n" +
     "                               create helper (timer, input_*, counter, schedule)\n" +
-    "  ws helper rm <type> <name>   delete helper"
+    "  ws helper rm <type> <name>   delete helper\n" +
+    "  ws automation ls             UI automations (id + alias)\n" +
+    "  ws automation get <id>       one automation's config\n" +
+    "  ws automation new [id] <json>\n" +
+    "                               create (mints an id if omitted)\n" +
+    "  ws automation set <id> <json>\n" +
+    "                               update \xe2\x80\x94 ws-only: REST has no collection route\n" +
+    "  ws automation rm <id>        delete"
   );
 }
 
@@ -991,6 +1057,8 @@ function usage() {
     "  conf validate <json>       check a config without saving (Admin)\n" +
     "  ws whoami|types|raw|sub      WebSocket API: helpers + registry views REST lacks\n" +
     "  ws helper ls|new|rm          create timer/input_* helpers (ws-only in HA)\n" +
+    "  ws automation ls|get|new|set|rm\n" +
+    "                             automation config CRUD (ws-only in HA)\n" +
     "  history <entity...> [-s start] [-e end] [--minimal]\n" +
     "                             state changes (times: ISO or 30m/2h/1d/1w ago)\n" +
     "  weather [entity]           current weather\n" +
