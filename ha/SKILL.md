@@ -98,6 +98,20 @@ it down, it is the only handle for later `get/set/rm`.
 Always `conf get` before `conf set`. `set` replaces the whole config, so editing blind
 drops every field you did not resend (mode, variables, triggers you did not quote).
 
+### ws automation — the same CRUD over the WebSocket API
+
+`f ha ws automation ls|get|new|set|rm <id>` is the WebSocket path to the same
+UI automations `conf` touches over REST (it replaces the separate `f ha-ws` uck).
+`ws automation new` mints an id like `conf new` does; `set` requires one.
+
+Use either. `conf` is plain REST and reports the resulting entity (it warns if
+the id has no entity yet); `ws automation` speaks the message set the HA
+frontend itself uses (`config/automation/create_update` / `get` / `delete`) and
+is the only route for servers where the REST config view is disabled or
+read-only. `ws automation ls` also survives older builds with no
+`config/automation/list`, falling back to enumerating `automation.*` states —
+those rows carry the `.storage` id in the first column.
+
 `template` is not a loaded integration on this instance, so `conf` accepts only
 `automation`, `script`, `scene`. The `POST /api/template` endpoint still works for
 rendering, and its field is named `template`, not `source` — the wrong key returns a bare
