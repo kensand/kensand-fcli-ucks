@@ -281,13 +281,24 @@ function ensureJsonObject(obj, src) {
  *  leaking template-only keys into the query string is why `?ownerName=...` used
  *  to ride along on every call.
  */
-function splitParams(obj, urlTemplate) {
+function splitParams(obj, urlTemplate, rawMethod) {
   const path = {};
   const query = {};
   let body = obj.body;
   const wants = urlTemplate
     ? new Set([...urlTemplate.matchAll(/\{([^{}/]+?)(?:\*)?\}/g)].map((m) => m[1]))
     : null;
+  // Raw <METHOD> <path> calls have no template to split against, so a flat
+  // payload has nowhere to go but the query string -- and a POST whose fields
+  // all landed in the query goes out with an EMPTY body. That is the whole of
+  // `f fj POST /repos/<owner>/<repo>/pulls {"head":...,"base":...,"title":...}`
+  // failing with `[Head]: Required`: the head was on the URL, never in the
+  // JSON body Forgejo binds. For a write method, treat the flat object as the
+  // request body (explicit `body` still wins). GET/HEAD keep the old
+  // everything-is-a-query-param behavior, which is correct for them.
+  const isWrite = rawMethod === undefined || ["post", "put", "patch", "delete"].includes(String(rawMethod).toLowerCase());
+  if (body === undefined && !urlTemplate && isWrite) body = { ...obj };
+
   for (const [k, v] of Object.entries(obj)) {
     if (k === "body") {
       // A body that arrived as a JSON string (quoted inline arg or -f file)
@@ -298,9 +309,11 @@ function splitParams(obj, urlTemplate) {
       continue;
     }
     if (!wants) {
-      // No template (raw <METHOD> <path> calls): nothing to substitute, so
-      // everything except body is a query param and `path` stays empty.
-      query[k] = v;
+      // No template (raw <METHOD> <path> calls): nothing to substitute. A read
+      // method sends everything as query params; for a write method the flat
+      // keys already went out as the body above, so do not duplicate them onto
+      // the query string.
+      if (!isWrite) query[k] = v;
       continue;
     }
     if (wants.has(k)) path[k] = v;
@@ -980,7 +993,7 @@ async function cmdCall(name, params, rawUrl, rawMethod, credsApi, opts = {}) {
   if (rawMethod) {
     // raw passthrough: client.<method>({ url: path, query/body, throwOnError:false })
     // A caller-supplied path is already resolved, so there is no template here.
-    const { path: _ignore, query, body } = splitParams(params, null);
+    const { path: _ignore, query, body } = splitParams(params, null, rawMethod);
     const method = rawMethod.toLowerCase();
     const res = await client[method]({ url: rawUrl, query, body, throwOnError: false });
     return finish(res);
@@ -1184,7 +1197,22 @@ export function register(_ctx) {
         if (!rawUrl) err(`${method} requires a path, e.g. ${method} /repos/kensand.net/fcli-ucks`);
         let params = {};
         const maybeJson = rest[1];
-        if (maybeJson && maybeJson.trim().startsWith("{")) params = parseJsonArg(maybeJson);
+        if (maybeJson && maybeJson.trim().startsWith("{")) {
+          params = parseJsonArg(maybeJson);
+        } else {
+          // Same key=value fallback the named-endpoint path uses, so a raw call
+          // does not silently drop its arguments when they are not one JSON arg.
+          for (const tok of rest.slice(1)) {
+            const eq = tok.indexOf("=");
+            if (eq <= 0) continue;
+            const raw = tok.slice(eq + 1);
+            let v = raw;
+            if (raw !== "" && /^[[{\d-]|^(true|false|null)$/.test(raw)) {
+              try { v = JSON.parse(raw); } catch { /* keep as string */ }
+            }
+            params[tok.slice(0, eq)] = v;
+          }
+        }
         return cmdCall(null, params, rawUrl.startsWith("/") ? rawUrl : "/" + rawUrl, method, credsApi, opts);
       }
 
