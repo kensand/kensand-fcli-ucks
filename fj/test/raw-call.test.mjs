@@ -22,6 +22,18 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+// The uck resolves @llamaduck/forgejo-ts from its own directory, so this test
+// needs `fj/node_modules` present (npm install --prefix fj, or a symlink to the
+// installed uck's copy). Say so rather than reporting six opaque failures.
+try {
+  await import(pathToFileURL(path.join(here, "..", "node_modules", "@llamaduck", "forgejo-ts", "dist", "index.mjs")).href);
+} catch {
+  console.error("fj/test/raw-call.test.mjs: cannot resolve fj/node_modules/@llamaduck/forgejo-ts.\n" +
+    "Install the uck's dependencies first:  npm install --prefix fj --no-audit --no-fund");
+  process.exit(2);
+}
+
 const uck = await import(pathToFileURL(path.join(here, "..", "index.js")).href);
 
 let pass = 0, fail = 0;
