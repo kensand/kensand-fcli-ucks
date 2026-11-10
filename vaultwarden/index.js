@@ -150,9 +150,119 @@ function enterDiscoveryProbe() {
   process.env.F_CREDS_NO_PROVIDER = "1";
 }
 
+/**
+ * The credential store could not be read at all.
+ *
+ * Distinct from "locked" and from "this name is not in the vault". It exists so
+ * a readiness probe can degrade to a named state instead of propagating: one bad
+ * store read used to throw a bare Error out of openVault() and take the whole
+ * readiness line with it, and `f creds status` renders every provider's status,
+ * so a single throw made the fleet look broken rather than one provider
+ * unavailable.
+ */
+export class StoreUnavailableError extends Error {
+  constructor(message, detail = null) {
+    super(message);
+    this.name = "StoreUnavailableError";
+    this.reason = "store-error";
+    this.detail = detail;
+  }
+}
+
+/* ------------------------------------------------ in-process creds handle */
+
+/**
+ * The creds API handed to us by a caller that is already inside `f creds`.
+ *
+ * `f creds get <name>` misses locally, walks the provider ladder, and calls our
+ * `resolve()` in-process. Until now that path still paid for a full
+ * `execFileSync("f", ["creds","get",…])` on every single store read — a second
+ * `f` process per secret, per call site. When the caller IS creds, that spawn is
+ * pure overhead: it re-boots the CLI, re-reads the config and re-resolves the
+ * daemon socket, all to ask the process that is already standing there.
+ *
+ * So: if the caller hands us its API, use it; otherwise behave exactly as before
+ * and spawn. The handle is OPTIONAL — the child-process probe protocol (P4) runs
+ * `node index.js resolve <name>` with no way to pass one, and a direct
+ * `f vaultwarden …` command has none either.
+ */
+let credsApiRef = null;
+
+/** How many store reads we are currently inside, via the in-process handle. */
+let inProcessDepth = 0;
+
+/** Test seam: read the live depth, so a leak is observable rather than silent. */
+export function inProcessProbeDepth() {
+  return inProcessDepth;
+}
+
+/** Test seam: install/clear the in-process creds handle without going through
+ *  the CLI. Returns the previous value so a suite can restore it. */
+export function setProbeCredsApi(api) {
+  const prev = credsApiRef;
+  credsApiRef = api ?? null;
+  return prev;
+}
+
+/**
+ * Run `fn` with the handle installed, guarding against an in-process cycle.
+ *
+ * The env marker above cannot do this job for the in-process path: it works by
+ * being INHERITED BY A CHILD, and in-process there are no children — we all
+ * share one `process.env`. And once set it stays set for the whole process, so
+ * it cannot tell "one read deep" from "the fortieth read deep".
+ *
+ * The cycle is real and short: `credsApi.resolveCred()` -> creds' provider
+ * ladder -> our `resolve()` -> `credsGet()` -> `credsApi.resolveCred()` -> …
+ * A frame past the first is handed a null handle, so the descent falls through
+ * to the spawn path (which the env marker stops) instead of recursing forever.
+ *
+ * The `finally` is load-bearing, not tidiness: if a throwing inner read leaked
+ * the depth, every LATER probe would be permanently treated as re-entrant and
+ * silently drop back to the spawn path. That failure has no symptom whatsoever —
+ * the provider would just quietly stop using the handle it was given.
+ */
+async function withProbeCredsApi(api, fn) {
+  const reentrant = inProcessDepth > 0;
+  inProcessDepth++;
+  const prev = credsApiRef;
+  credsApiRef = reentrant ? null : (api ?? null);
+  try {
+    return await fn();
+  } finally {
+    credsApiRef = prev;
+    inProcessDepth--;
+  }
+}
+
+/**
+ * Read one cred through the in-process handle, or return undefined to say
+ * "no handle / cannot answer" so the caller falls back to the spawn.
+ *
+ * Deliberately narrow: only `rawCredRead` (a pure local store read, which is
+ * exactly what `f creds get --secrets --local` means) is used. `resolveCred`
+ * would run the provider ladder — i.e. call ourselves back — from inside a
+ * store read, which is the very cycle this guard exists to stop.
+ */
+async function credsGetInProcess(name) {
+  const api = credsApiRef;
+  if (!api || typeof api.rawCredRead !== "function") return undefined;
+  const res = await api.rawCredRead([name]);
+  if (!res || typeof res !== "object") return undefined;
+  if (res.value != null) return res.value;
+  // An explicit "not in the store" is an answer; anything else is the handle
+  // declining, and we must not invent a miss out of it.
+  if (/no such cred/i.test(String(res.error ?? ""))) return null;
+  return undefined;
+}
+
 /** Ask `f creds` for a value. Returns null when locked/absent; throws on a real
  *  provider error so it is never mistaken for "not set". */
-function credsGet(name) {
+async function credsGet(name) {
+  // In-process first: the caller may already BE creds, in which case spawning a
+  // second `f` to ask it the same question is wasted work.
+  const local = await credsGetInProcess(name);
+  if (local !== undefined) return local;
   try {
     const out = execFileSync("f", ["creds", "get", name, "--secrets", "--local"], {
       encoding: "utf8",
@@ -220,8 +330,12 @@ function credsStatus() {
   try {
     const out = execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, F_CREDS_NO_PROVIDER: "1" } });
     return { unlocked: /^unlocked/m.test(out), text: out.trim().split("\n")[0] };
-  } catch {
-    return { unlocked: false, text: "locked" };
+  } catch (e) {
+    // A store that cannot be reached is NOT a locked store. Telling an operator to
+    // `f creds unlock` a daemon that is down sends them to the wrong door; the
+    // callers now report "store-error" with the real reason instead.
+    const err = (e?.stderr ?? e?.message ?? "").toString().replace(/^f:\s*/gm, "").trim();
+    return { unlocked: false, text: "locked", storeError: true, detail: err.split("\n")[0].slice(0, 90) };
   }
 }
 
@@ -406,7 +520,7 @@ async function authenticate(api, { email, passwordHash }) {
     }
     errs.push(`password grant: ${String(e.message).split("\n")[0].slice(0, 140)}`);
   }
-  const clientId = credsGet(C_CLIENT_ID), clientSecret = credsGet(C_CLIENT_SECRET);
+  const clientId = await credsGet(C_CLIENT_ID), clientSecret = await credsGet(C_CLIENT_SECRET);
   if (clientId && clientSecret) {
     try { await api.loginApiKey({ clientId, clientSecret }); return "apikey"; }
     catch (e) {
@@ -426,7 +540,16 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
   if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
   if (!cfg.email) throw new Error(`no email configured\n  f vaultwarden config --email you@example.com`);
   const status = credsStatus();
-  if (!status.unlocked) throw new Error(`creds are locked (the vault's master password lives in the store)\n  f creds unlock`);
+  if (!status.unlocked) {
+    // Degrade, do not propagate a bare Error. One unreadable store read used to
+    // throw out of openVault() indistinguishable from a vault failure; the typed
+    // error lets readiness report `store-error` instead of guessing "locked".
+    const detail = status.storeError && status.detail ? `\n\tf creds says: ${status.detail}` : "";
+    throw new StoreUnavailableError(
+      `${status.storeError ? "cannot reach the creds store" : "creds are locked"} (the vault's master password lives in the store)${detail}\n  f creds unlock`,
+      status.storeError ? status.detail : null,
+    );
+  }
 
   const api = new VaultwardenApi({
     server: cfg.server,
@@ -447,13 +570,13 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
     }
   }
 
-  const master = credsGet(cfg.masterPasswordCred);
+  const master = await credsGet(cfg.masterPasswordCred);
 
   // An SSO login left a refreshable token in the store. Use it before demanding an API
   // key: `sso login` mints one valid for ~30 days, and refusing to read it made an SSO
   // user configure credentials they did not need.
-  const ssoAccess = credsGet(C_TOKEN);
-  const ssoRefresh = credsGet(C_REFRESH);
+  const ssoAccess = await credsGet(C_TOKEN);
+  const ssoRefresh = await credsGet(C_REFRESH);
   if ((ssoAccess || ssoRefresh) && master) {
     api.setAccessToken(ssoAccess, { refreshToken: ssoRefresh });
     // Prove the token is still good before spending ~1s on PBKDF2, and refresh once if
@@ -599,7 +722,7 @@ async function attachPrivateKey(api, keys, cfg, syncAlready) {
 async function readKeyCache() {
   let blob;
   try {
-    blob = credsGet(C_KEY_CACHE);
+    blob = await credsGet(C_KEY_CACHE);
   } catch {
     return null;
   }
@@ -812,32 +935,38 @@ const describe = (i) => `${i.name} [${i.id}] ${i.fieldSummary().join(",")}`;
 export const credentialProvider = {
   name: "vaultwarden",
   mirrorTtlSec: MIRROR_TTL_SEC,
-  status: () => providerStatus(vwConfig()),
-  resolve: async (name) => {
-    const cfg = vwConfig();
-    if (!cfg.server || !cfg.email) return null; // unconfigured: not ours
-    const { items } = await openVault({ quiet: true });
-    const res = findValue(name, items, cfg);
-    if (res.value != null) return res.value;
-    if (res.ambiguous) throw new Error(`${res.reason}: ${res.ambiguous.join(" | ")}`);
-    if (res.unknown) throw new Error(res.unknown);
-    return null; // genuinely unknown to the vault
-  },
+  // `credsApi` is OPTIONAL: the child-process probe calls status() with nothing.
+  status: (credsApi = null) => withProbeCredsApi(credsApi, () => providerStatus(vwConfig())),
+  // `credsApi` is OPTIONAL and SECOND: the child-process probe protocol (P4)
+  // calls resolve(name) with no handle, and that path must behave exactly as
+  // before. With a handle, store reads go through it instead of spawning `f`.
+  resolve: async (name, credsApi = null) =>
+    withProbeCredsApi(credsApi, async () => {
+      const cfg = vwConfig();
+      if (!cfg.server || !cfg.email) return null; // unconfigured: not ours
+      const { items } = await openVault({ quiet: true });
+      const res = findValue(name, items, cfg);
+      if (res.value != null) return res.value;
+      if (res.ambiguous) throw new Error(`${res.reason}: ${res.ambiguous.join(" | ")}`);
+      if (res.unknown) throw new Error(res.unknown);
+      return null; // genuinely unknown to the vault
+    }),
   // No `has()`: knowing whether a vault answers for `github.com` requires the
   // item list (whose uris supply host names) or the password grant (2FA). A
   // pre-filter that could only consult the map would veto resolve() for every
   // name outside it — a confidently wrong "not mine". Cheaper instead to let
   // resolve() answer, with the creds uck's mirror + negative cache absorbing
   // the repeat cost.
-  list: async () => {
-    const cfg = vwConfig();
-    if (!cfg.server || !cfg.email) return [];
-    const { items } = await openVault({ quiet: true });
-    return items.flatMap((i) => namesForItem(i, cfg));
-  },
+  list: async (credsApi = null) =>
+    withProbeCredsApi(credsApi, async () => {
+      const cfg = vwConfig();
+      if (!cfg.server || !cfg.email) return [];
+      const { items } = await openVault({ quiet: true });
+      return items.flatMap((i) => namesForItem(i, cfg));
+    }),
 };
 
-function providerStatus(cfg) {
+async function providerStatus(cfg) {
   if (!cfg.server) return { ready: false, note: "no server configured", hint: "f vaultwarden config --server https://vault.example.com --email you@example.com" };
   if (!cfg.email) return { ready: false, note: `no email configured for ${cfg.server}`, hint: "f vaultwarden config --email you@example.com" };
   // Report only what is verifiable without touching the creds store. Checking the
@@ -846,14 +975,26 @@ function providerStatus(cfg) {
   // is never told to `f creds unlock` a store nobody looked at.
   if (inDiscovery()) return { ready: true, note: `${cfg.server} as ${cfg.email} (configured; store/credentials not checked)` };
   const st = credsStatus();
-  if (!st.unlocked) return { ready: false, note: "creds locked", hint: "f creds unlock" };
+  if (!st.unlocked) {
+    // "creds locked" was a guess about a store we could not actually read. A
+    // daemon that is down, a corrupt store, a timeout — all three used to be
+    // reported as a lock, with `f creds unlock` as the advice.
+    if (st.storeError) return { ready: false, reason: "store-error", note: `store-error${st.detail ? `: ${st.detail}` : ""}`, hint: "f creds status   (is the daemon running?)" };
+    return { ready: false, note: "creds locked", hint: "f creds unlock" };
+  }
   let master = null, clientId = null, clientSecret = null, sso = false;
   try {
-    master = credsGet(cfg.masterPasswordCred);
-    clientId = credsGet(C_CLIENT_ID);
-    clientSecret = credsGet(C_CLIENT_SECRET);
-    sso = !!credsGet(C_REFRESH);
-  } catch { return { ready: false, note: "creds locked", hint: "f creds unlock" }; }
+    master = await credsGet(cfg.masterPasswordCred);
+    clientId = await credsGet(C_CLIENT_ID);
+    clientSecret = await credsGet(C_CLIENT_SECRET);
+    sso = !!(await credsGet(C_REFRESH));
+  } catch (e) {
+    // A throwing store read must not escape readiness: `f creds status` /
+    // `f providers` call this for EVERY provider, so one throw here took the
+    // whole readiness line down. Degrade to a named, non-fatal state.
+    const m = String(e?.message ?? e).replace(/^f:\s*/gm, "").trim();
+    return { ready: false, reason: "store-error", note: `store-error: ${m.split("\n")[0].slice(0, 120)}`, hint: "f creds status   (is the daemon running?)" };
+  }
   if (!master) return { ready: false, note: `no master password (${cfg.masterPasswordCred})`, hint: `f vaultwarden config --master-password (or: f vaultwarden sso login)` };
   // Three ways to authenticate, any one of which is enough. This check was
   // written when an API key was the only route and still called its absence
@@ -865,13 +1006,13 @@ function providerStatus(cfg) {
     return { ready: false, note: `no way to sign in (no API key, no SSO session)`, hint: `f vaultwarden sso login   (or: f creds set ${C_CLIENT_ID} 'user.<uuid>' && f creds set ${C_CLIENT_SECRET} '<secret>'${clientSecret ? " — secret set, id missing" : ""})` };
   }
   const how = sso ? "SSO session" : "API key";
-  const cached = !!safeHasCache();
+  const cached = !!(await safeHasCache());
   return { ready: true, note: `${cfg.server} as ${cfg.email} via ${how}${cached ? " (keys cached)" : ""}` };
 }
 
-function safeHasCache() {
+async function safeHasCache() {
   try {
-    const blob = credsGet(C_KEY_CACHE);
+    const blob = await credsGet(C_KEY_CACHE);
     if (!blob) return false;
     return Date.now() < JSON.parse(blob).exp;
   } catch {
@@ -1025,7 +1166,7 @@ async function main(argv) {
       process.stdout.write(`server\t${cfg.server ?? "(unset)"}\n`);
       process.stdout.write(`email\t${cfg.email ?? "(unset)"}\n`);
       process.stdout.write(`mirror ttl\t${MIRROR_TTL_SEC}s\n`);
-      process.stdout.write(`key cache\t${safeHasCache() ? `on (<=${KEY_CACHE_TTL_SEC / 3600}h)` : "off"}\n`);
+      process.stdout.write(`key cache\t${(await safeHasCache()) ? `on (<=${KEY_CACHE_TTL_SEC / 3600}h)` : "off"}\n`);
       if (st.ready) {
         try {
           const { items } = await openVault({ quiet: true });
@@ -1179,7 +1320,7 @@ async function main(argv) {
       let value = null, origin = "";
       if (has("from-cred")) {
         const src = flagVal("from-cred") ?? usage("--from-cred needs a cred name");
-        value = credsGet(src);
+        value = await credsGet(src);
         if (value == null) return usage(`no such cred locally: ${src}`);
         origin = `cred:${src}`;
       } else if (has("from-env")) {
@@ -1224,7 +1365,7 @@ async function main(argv) {
     }
     case "cache": {
       if (has("clear")) { dropKeyCache(); process.stdout.write("cleared\tkey cache\n"); break; }
-      const cached = safeHasCache();
+      const cached = await safeHasCache();
       process.stdout.write(`key cache\t${cached ? "on" : "off"}\n`);
       process.stdout.write(`purpose\tskip PBKDF2 (${KEY_CACHE_TTL_SEC / 3600}h window)\n`);
       break;
@@ -1331,7 +1472,7 @@ async function main(argv) {
           // password that was never the thing that failed.
           let masterForKeys = null;
           try {
-            masterForKeys = credsGet(cfg.masterPasswordCred);
+            masterForKeys = await credsGet(cfg.masterPasswordCred);
           } catch (e) {
             const m = String(e?.message ?? e).replace(/^f:\s*/gm, "").trim();
             process.stdout.write(
