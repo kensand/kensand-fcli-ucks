@@ -326,7 +326,91 @@ function credsRm(name) {
   }
 }
 
-function credsStatus() {
+/**
+ * The name this uck asks the store for when it wants to know whether the store
+ * is OPEN, as opposed to whether it holds anything.
+ *
+ * Deliberately NOT one of the vaultwarden.* config creds, and not derived from
+ * `vwConfig()`. Two reasons, both measured:
+ *   * A probe that reads a name the readiness path also reads changes that
+ *     path's observable read set. The existing suite pins "the master password
+ *     is asked for EXACTLY ONCE per status pass"; a probe on the same name
+ *     breaks that pin for a reason that has nothing to do with the assertion,
+ *     and a test whose count you had to renegotiate is a test you no longer
+ *     trust.
+ *   * A probe whose name comes from config is a probe whose answer the config
+ *     can steer. A fixed, namespaced name cannot be steered.
+ * The verdict here depends only on whether the daemon can serve a read at all,
+ * so which name is asked is immaterial to the answer — which is exactly what
+ * makes a fixed name safe to use.
+ */
+const C_STORE_PROBE = "vaultwarden.probe-store-open";
+
+/**
+ * Answer "is the credential store unlocked" through the in-process handle, or
+ * return undefined to say "no handle / cannot answer" so the caller spawns.
+ *
+ * This answers ONE question and nothing else: can the store be read right now?
+ * That is all `providerStatus()` needs from `credsStatus()` — the lock gate —
+ * and it is the only question a store read is competent to answer.
+ *
+ * WHY THE HANDLE CAN ANSWER IT WITHOUT RECURSION
+ * The handle is the caller's `rawCredRead` and nothing else (CONTRACT C3): it
+ * talks to the daemon socket directly and never walks the provider ladder, so
+ * it cannot come back into this module's `status()`. The depth guard in
+ * withProbeCredsApi is still what stops a NESTED probe frame from holding a
+ * handle at all — belt and braces, because the ladder cycle is the one that
+ * fork-bombed this box for real (2,643 processes).
+ *
+ * WHY A HIT IS THE ONLY ANSWER WE TAKE FROM THE HANDLE
+ * A value through the handle is proof the daemon answered, and a daemon cannot
+ * answer with a closed store. So a hit settles "unlocked" with no child.
+ *
+ * A MISS settles nothing, and this is the subtle half. `rawCredRead` reports a
+ * closed store, a store with no such entry, and a store it could not reach at
+ * all as three different words for the same observable (no value). `f creds
+ * status` is the one thing that can tell them apart, and the difference is what
+ * the operator reads: "creds locked / f creds unlock" versus "store-error / is
+ * the daemon running?". Guessing from a miss would make a permanently unlocked
+ * box whose daemon has simply not started yet report `store-error` — sending an
+ * operator to the wrong door, the exact failure this file already goes out of
+ * its way to avoid. So a miss falls back to the spawn.
+ *
+ * WHY WE DO NOT READ THE LOCKFILE INSTEAD
+ * `~/.f/.creds-daemon` plus a pid liveness check looks cheaper, but it makes a
+ * different claim: a lockfile says a daemon started, not that the store is
+ * open, and a stale one says a daemon stopped, not that the store is closed.
+ * `f creds status` itself combines a lockfile read with a daemon ping; a uck
+ * cannot reproduce that verdict from one file, and a confidently wrong readiness
+ * line is worse than a spawn.
+ */
+async function storeStateInProcess() {
+  const api = credsApiRef;
+  if (!api || typeof api.rawCredRead !== "function") return undefined;
+  const res = await api.rawCredRead([C_STORE_PROBE]);
+  if (!res || typeof res !== "object") return undefined;
+  if (res.value != null) return { unlocked: true, text: "unlocked" };
+  // A miss, a lock, a timeout, an unknown shape: not our call to make.
+  return undefined;
+}
+
+async function credsStatus() {
+  // In-process first, exactly like credsGet(): when the caller IS creds, asking
+  // it to boot a second `f` to answer a question it can answer itself is pure
+  // overhead. The handle is OPTIONAL (CONTRACT P4), so the child-process probe
+  // protocol and every direct `f vaultwarden …` command take the spawn below
+  // byte-identically.
+  //
+  // A handle that throws is a handle that cannot answer. The spawn has its own,
+  // better-worded error path, so a probe failure must never become the status
+  // error the operator reads.
+  let local;
+  try {
+    local = await storeStateInProcess();
+  } catch {
+    local = undefined;
+  }
+  if (local !== undefined) return local;
   try {
     const out = execFileSync("f", ["creds", "status"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, F_CREDS_NO_PROVIDER: "1" } });
     return { unlocked: /^unlocked/m.test(out), text: out.trim().split("\n")[0] };
@@ -539,7 +623,7 @@ async function openVault({ quiet = false, forceUnlock = false, allowInsecureHttp
   const cfg = vwConfig();
   if (!cfg.server) throw new Error(`no server configured\n  f vaultwarden config --server https://vault.example.com --email you@example.com`);
   if (!cfg.email) throw new Error(`no email configured\n  f vaultwarden config --email you@example.com`);
-  const status = credsStatus();
+  const status = await credsStatus();
   if (!status.unlocked) {
     // Degrade, do not propagate a bare Error. One unreadable store read used to
     // throw out of openVault() indistinguishable from a vault failure; the typed
@@ -974,7 +1058,7 @@ async function providerStatus(cfg) {
   // `ready` here means "configured", and the note says exactly that, so a reader
   // is never told to `f creds unlock` a store nobody looked at.
   if (inDiscovery()) return { ready: true, note: `${cfg.server} as ${cfg.email} (configured; store/credentials not checked)` };
-  const st = credsStatus();
+  const st = await credsStatus();
   if (!st.unlocked) {
     // "creds locked" was a guess about a store we could not actually read. A
     // daemon that is down, a corrupt store, a timeout — all three used to be
