@@ -362,19 +362,18 @@ const C_STORE_PROBE = "vaultwarden.probe-store-open";
  * handle at all — belt and braces, because the ladder cycle is the one that
  * fork-bombed this box for real (2,643 processes).
  *
- * WHY A HIT IS THE ONLY ANSWER WE TAKE FROM THE HANDLE
+ * WHAT THE HANDLE CAN AND CANNOT SETTLE
  * A value through the handle is proof the daemon answered, and a daemon cannot
- * answer with a closed store. So a hit settles "unlocked" with no child.
+ * answer with a closed store — so a HIT settles "unlocked". A `missing` answer
+ * settles it too, for the same reason: it came back over the daemon socket, and
+ * a closed store cannot answer at all. Everything else falls back to the spawn.
  *
- * A MISS settles nothing, and this is the subtle half. `rawCredRead` reports a
- * closed store, a store with no such entry, and a store it could not reach at
- * all as three different words for the same observable (no value). `f creds
- * status` is the one thing that can tell them apart, and the difference is what
- * the operator reads: "creds locked / f creds unlock" versus "store-error / is
- * the daemon running?". Guessing from a miss would make a permanently unlocked
- * box whose daemon has simply not started yet report `store-error` — sending an
+ * The cases that fall back are the ones where `f creds status` knows something
+ * the handle does not: a lock, a timeout, an unreachable store. Telling those
+ * apart is what the operator reads — "creds locked / f creds unlock" versus
+ * "store-error / is the daemon running?" — and guessing between them sends an
  * operator to the wrong door, the exact failure this file already goes out of
- * its way to avoid. So a miss falls back to the spawn.
+ * its way to avoid.
  *
  * WHY WE DO NOT READ THE LOCKFILE INSTEAD
  * `~/.f/.creds-daemon` plus a pid liveness check looks cheaper, but it makes a
@@ -390,7 +389,24 @@ async function storeStateInProcess() {
   const res = await api.rawCredRead([C_STORE_PROBE]);
   if (!res || typeof res !== "object") return undefined;
   if (res.value != null) return { unlocked: true, text: "unlocked" };
-  // A miss, a lock, a timeout, an unknown shape: not our call to make.
+  // A MISS is also an answer, and this is the half that the live measurement
+  // proved. `rawCredRead` reaches the store through the daemon socket; a closed
+  // store cannot answer at all, so `reason: "missing"` is a daemon that is up
+  // and serving. On a permanently unlocked box — which is how every one of
+  // these boxes is configured — the probe name is simply not in the store, and
+  // treating that as "cannot answer" meant the handle answered every real
+  // question and the spawn survived anyway: measured 2 total / 1 nested either
+  // way. So a miss settles the gate.
+  //
+  // What still falls back is everything that is NOT a store answer: a lock, a
+  // timeout, an unreachable store, or a shape this uck does not recognise.
+  // Those are exactly the cases where `f creds status` says something the
+  // handle cannot — "locked / f creds unlock" versus "store-error / is the
+  // daemon running?" — and guessing between them would send an operator to the
+  // wrong door.
+  if (res.reason === "missing" || /no such cred/i.test(String(res.error ?? ""))) {
+    return { unlocked: true, text: "unlocked" };
+  }
   return undefined;
 }
 
