@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readdirSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 const run = promisify(execFile);
@@ -20,10 +21,23 @@ const FILES = [
   ".pi/agent/memory/MEMORY.md",
   ".pi-web/sessiond-owner.json",
 ];
-const DIRS = [".pi/agent/memory", ".pi-web", ".f/ucks"];
+// The bucket list lives in ONE place, so the `--all` audit and the per-uck check cannot
+// disagree about where a uck lives.
+const BUCKETS_ROOT = ".f/ucks";
+const BUCKET_DIRS = [
+  path.join(BUCKETS_ROOT, "kensand-fcli-ucks"),
+  path.join(BUCKETS_ROOT, "official-ucks-src"),
+  path.join(BUCKETS_ROOT, "ucks"),
+];
+
+// Every consumer of a health report must branch on `state`, never on whether a row is
+// present: `state` is the verdict. Keep the vocabulary and that rule in sync here and in
+// SKILL.md, because a report whose shape is undocumented gets misread as "no problems".
+const DIRS = [".pi/agent/memory", ".pi-web", BUCKETS_ROOT];
 
 // A degraded tool answers with plausible garbage, or says nothing at all. Both look
 // like "fine" to a caller that only checks the exit code.
+const HOME = os.homedir();
 async function probe(cmd) {
   let where;
   try {
@@ -82,7 +96,7 @@ async function bucket(dir) {
 export function register(_ctx) {
   return {
     name: "doctor",
-    desc: "is a tool/uck actually alive? probe commands, buckets, uck usage (degraded != error)",
+    desc: "is a tool/uck alive? probe commands, buckets, uck usage; --all --json for machine rows (degraded != error)",
     run: async (rawArgv, args) => {
       // THE ARGUMENT-RECEIVING TRAP (found by testing, not reading): f calls
       //   uck.run(rest, uck.argv?.(rest) ?? { _: rest }, ctx)
@@ -102,20 +116,29 @@ export function register(_ctx) {
         args?.[name] === true ||
         tokens.includes(`--${name}`) ||
         (args?._ ?? []).map(String).includes(`--${name}`);
+      // A recognised flag that does not change the OUTPUT SHAPE is still flag blindness.
+      // This uck shipped that bug: `--all` was stripped from the target list but `--json`
+      // was not, so `f doctor --json` resolved "--json" as a uck name and printed a
+      // fabricated `MISSING --json  no index.js in any bucket` row, while
+      // `f doctor --all --json` mixed free text with JSON. Honour every flag you accept.
+      const CONSUMED = ["--help", "-h", "--all", "--json"];
       const rest = [...new Set([...tokens, ...(args?._ ?? []).map(String)])].filter(
-        (s) => s !== "--help" && s !== "-h" && s !== "--all",
+        (s) => !CONSUMED.includes(s),
       );
-      const home = process.env.HOME || "/";
+      const json = flag("json");
+      const emit = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
 
       if (flag("help") || flag("h")) {
         // Reached only in-process: `f <uck> --help` is routed to `f help <uck>`, which
         // prints the desc, not this. Keep the usage in the desc too.
         process.stdout.write(
-          "usage: f doctor [--all] [uck ...]\n" +
+          "usage: f doctor [--all] [--json] [uck ...]\n" +
             "  f doctor              probe the capability layer (tools, dirs, buckets, creds)\n" +
-            "  f doctor <uck>...     is a uck live? register() shape + does it print usage?\n" +
+            "  f doctor <uck>...     is a uck live? register() shape + flags honoured + usage?\n" +
             "  f doctor --all        audit EVERY uck in the buckets for the SILENT contract\n" +
             "                        (a uck that returns results without writing stdout is mute)\n" +
+            "  f doctor --json       machine-readable rows (with --all: {mode,summary,rows});\n" +
+            "                        branch on .state, never on a row's presence\n" +
             "exit: 0 healthy, 1 anything degraded. trust only the OK rows.\n",
         );
         return;
@@ -124,11 +147,7 @@ export function register(_ctx) {
       // `--all` closes the audit loop: instead of hand-listing every uck each run, audit
       // every uck in the buckets for the contract that causes silence.
       if (flag("all")) {
-        const roots = [
-          path.join(home, ".f/ucks/kensand-fcli-ucks"),
-          path.join(home, ".f/ucks/official-ucks-src"),
-          path.join(home, ".f/ucks/ucks"),
-        ].filter((d) => existsSync(d));
+        const roots = BUCKET_DIRS.map((d) => path.join(HOME, d)).filter((d) => existsSync(d));
         const names = new Set();
         for (const root of roots) {
           let entries = [];
@@ -147,14 +166,13 @@ export function register(_ctx) {
       }
 
       if (rest.length) {
-        let bad = 0;
+        const uckRows = [];
         for (const name of rest) {
+          const fail = (detail) => {
+            uckRows.push({ state: "FAIL", cmd: name, detail });
+          };
           let found;
-          for (const bucketDir of [
-            path.join(home, ".f/ucks/kensand-fcli-ucks"),
-            path.join(home, ".f/ucks/official-ucks-src"),
-            path.join(home, ".f/ucks/ucks"),
-          ]) {
+          for (const bucketDir of BUCKET_DIRS.map((d) => path.join(HOME, d))) {
             const p = path.join(bucketDir, name, "index.js");
             if (existsSync(p)) {
               found = { p, bucket: path.basename(bucketDir) };
@@ -162,16 +180,14 @@ export function register(_ctx) {
             }
           }
           if (!found) {
-            console.log(`MISSING ${name}\tno index.js in any bucket`);
-            bad++;
+            fail("no index.js in any bucket");
             continue;
           }
           let shape;
           try {
             const mod = await import(`file://${found.p}`);
             if (typeof mod.register !== "function") {
-              console.log(`FAIL\t${name}\tregister is not a function (${found.bucket})`);
-              bad++;
+              fail(`register is not a function (${found.bucket})`);
               continue;
             }
             const r = mod.register({});
@@ -182,18 +198,15 @@ export function register(_ctx) {
               skills: Array.isArray(r?.skills) ? r.skills.length : 0,
             };
           } catch (err) {
-            console.log(`FAIL\t${name}\timport: ${err.message.split("\n")[0]}`);
-            bad++;
+            fail(`import: ${err.message.split("\n")[0]}`);
             continue;
           }
           if (shape.name !== name) {
-            console.log(`FAIL\t${name}\tregister() name is ${JSON.stringify(shape.name)}`);
-            bad++;
+            fail(`register() name is ${JSON.stringify(shape.name)}`);
             continue;
           }
           if (shape.run !== "function") {
-            console.log(`FAIL\t${name}\trun is ${shape.run}, not a function`);
-            bad++;
+            fail(`run is ${shape.run}, not a function`);
             continue;
           }
           // Flag blindness. `args` is only a flag-parsed object if the uck declares an
@@ -213,8 +226,12 @@ export function register(_ctx) {
           // first version of this gate was itself silently broken. Test it against a
           // known-bad uck (SKILL.md) before trusting an all-OK run.
           let flagBlind = [];
+          // Read the source ONCE, in the loop scope: the flag-blindness gate and the
+          // --json gate below both need it, and a `const` inside the try block was invisible
+          // to the second gate (ReferenceError on every named-uck check).
+          let src = "";
           try {
-            const src = readFileSync(found.p, "utf8");
+            src = readFileSync(found.p, "utf8");
             const declaredHook = new RegExp(["argv", "\\s*:", "[\\s\\S]{0,20}?[\\(A-Za-z_$]"].join("")).test(src);
             // Does the uck compare tokens to "--flag" anywhere? Quote-agnostic substring test.
             const tokenises = src.includes('=== "--') || src.includes("=== '--") || src.includes("=== `--") ||
@@ -237,16 +254,46 @@ export function register(_ctx) {
             /* unreadable source is not evidence; leave the row alone */
           }
           if (flagBlind.length) {
-            console.log(
-              `FAIL\t${name}\treads args.${flagBlind.slice(0, 4).join("/")} but declares no argv hook and never tokenises raw argv, so those flags are always undefined (${found.bucket})`,
+            fail(
+              `reads args.${flagBlind.slice(0, 4).join("/")} but declares no argv hook and never tokenises raw argv, so those flags are always undefined (${found.bucket})`,
             );
-            bad++;
             continue;
+          }
+          // Second half of the contract, added because this uck violated it itself: a flag
+          // that is PARSED but never changes the output is still answered wrongly. Any uck
+          // documenting `--json` must actually produce JSON, otherwise it replies to a
+          // structured-data question with prose and exits 0.
+          // A uck that advertises `--json` must be able to emit JSON. This gate exists
+          // because doctor itself advertised --json, silently consumed it as a TARGET NAME,
+          // and printed a fabricated `MISSING --json  no index.js in any bucket` row.
+          //
+          // Deliberately COARSE: is a serializer reachable from stdout at all? Three
+          // guard-matching variants were tried and all three false-failed healthy ucks —
+          // kuma/slop/ddg use `if (flags.json)`, grafana uses `has(argv,"--json")` with the
+          // serializer in an `out()` helper several lines away, providers stashes the guard
+          // in a variable (`const dump = a.includes("--json")`) and stringifies inside a
+          // later branch. Guard syntax is not a stable signal; "can this uck produce JSON on
+          // stdout" is. A gate that calls healthy tools broken is worse than no gate, and a
+          // loose gate here still catches the real bug (a uck with no serializer at all).
+          if (src && /--json/.test(src)) {
+            const stringifiesInline = /process\.stdout\.write\([\s\S]{0,80}?JSON\.stringify/.test(src);
+            const stringifiesInWriter =
+              /(function|const)\s+(out|emit)\s*[=(][\s\S]{0,200}?JSON\.stringify/.test(src);
+            const reachesJson = stringifiesInline || stringifiesInWriter;
+            if (!reachesJson) {
+              fail(`documents --json but has no JSON serializer on stdout (${found.bucket})`);
+              continue;
+            }
           }
           // The trap this uck exists for: a uck can be valid, registered and listed
           // in `f` and still answer nothing at the CLI. Probe the BARE invocation and
           // require content -- exit codes are useless here, because a failing CLI makes
           // `f` exit non-zero for reasons unrelated to the uck under test.
+          //
+          // One probe per uck, and it is the BARE one on purpose: an invocation with flags
+          // can mutate state, and `f <uck> --help` is routed to `f help <uck>` rather than
+          // reaching the uck. So this loop can never OBSERVE a --json path working; the gate
+          // above is a static check and must be labelled as such, not as proof.
           let cli = "";
           let errored = "";
           try {
@@ -260,14 +307,36 @@ export function register(_ctx) {
             cli = ((err.stdout || "") + (err.stderr || "")).trim();
           }
           if (!cli) {
-            console.log(
-              `FAIL\t${name}\tregisters ok (${found.bucket}) but \`f ${name}\` ${errored || "exit 0"} and printed nothing — no usage path`,
+            fail(
+              `registers ok (${found.bucket}) but \`f ${name}\` ${errored || "exit 0"} and printed nothing — no usage path`,
             );
-            bad++;
             continue;
           }
           const how = errored ? `no --help path; try \`f help ${name}\` (${errored})` : "prints usage";
-          console.log(`OK\t${name}\t${JSON.stringify(shape.desc)} — ${how}: ${cli.split("\n")[0].slice(0, 50)}`);
+          uckRows.push({
+            state: "OK",
+            cmd: name,
+            detail: `${JSON.stringify(shape.desc)} — ${how}: ${cli.split("\n")[0].slice(0, 50)}`,
+            bucket: found.bucket,
+            skills: shape.skills,
+            // Honest about what this loop did NOT verify: it ran the bare uck only, so a
+            // --json path was matched statically, never executed. Consumers must not read
+            // an OK row as "every flag of this uck works".
+            verified: "bare invocation + static source gates",
+            jsonMode: src ? /--json/.test(src) : null,
+          });
+        }
+        const bad = uckRows.filter((r) => r.state !== "OK").length;
+        if (json) {
+          emit({
+            mode: "ucks",
+            health: bad ? "DEGRADED" : "HEALTHY",
+            ok: uckRows.length - bad,
+            total: uckRows.length,
+            rows: uckRows,
+          });
+        } else {
+          for (const r of uckRows) console.log(`${r.state}\t${r.cmd}\t${r.detail}`);
         }
         process.exitCode = bad ? 1 : 0;
         return;
@@ -318,7 +387,7 @@ export function register(_ctx) {
       }
 
       for (const d of DIRS) {
-        const abs = path.join(home, d);
+        const abs = path.join(HOME, d);
         rows.push({
           cmd: d,
           state: existsSync(abs) ? "OK" : "MISSING",
@@ -327,7 +396,7 @@ export function register(_ctx) {
       }
 
       for (const f of FILES) {
-        const abs = path.join(home, f);
+        const abs = path.join(HOME, f);
         rows.push({
           cmd: f,
           state: existsSync(abs) ? "OK" : "MISSING",
@@ -335,7 +404,7 @@ export function register(_ctx) {
         });
       }
 
-      const ucksRoot = path.join(home, ".f/ucks");
+      const ucksRoot = path.join(HOME, BUCKETS_ROOT);
       let buckets = [];
       try {
         buckets = readdirSync(ucksRoot, { withFileTypes: true })
@@ -347,18 +416,33 @@ export function register(_ctx) {
       }
       for (const b of await Promise.all(buckets.map(bucket))) rows.push(b);
 
-      const bad = rows.filter((r) => r.state !== "OK");
       // A probe that cannot run must never report a healthy layer.
       if (rows.length === 0) {
-        console.log("FAIL\tdoctor\tno checks ran — cannot claim the layer is healthy");
-        process.exitCode = 1;
-        return;
+        rows.push({
+          cmd: "doctor",
+          state: "FAIL",
+          detail: "no checks ran — cannot claim the layer is healthy",
+        });
       }
-      for (const r of rows) console.log(`${r.state}\t${r.cmd}\t${r.detail}`);
-      console.log(
-        `${bad.length ? "DEGRADED" : "HEALTHY"}\t${rows.length - bad.length}/${rows.length} checks ok` +
-          (bad.length ? ` — trust only the OK rows this run` : ""),
-      );
+      const bad = rows.filter((r) => r.state !== "OK");
+      const health = bad.length ? "DEGRADED" : "HEALTHY";
+      if (json) {
+        emit({
+          mode: "layer",
+          health,
+          ok: rows.length - bad.length,
+          total: rows.length,
+          generatedAt: new Date().toISOString(),
+          home: HOME,
+          rows,
+        });
+      } else {
+        for (const r of rows) console.log(`${r.state}\t${r.cmd}\t${r.detail}`);
+        console.log(
+          `${health}\t${rows.length - bad.length}/${rows.length} checks ok` +
+            (bad.length ? ` — trust only the OK rows this run` : ""),
+        );
+      }
       process.exitCode = bad.length ? 1 : 0;
     },
     skills: [

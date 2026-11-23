@@ -14,9 +14,26 @@ trusting any observation you did not make in this run.
 f doctor              # capability layer: tools, dirs, git buckets, credential health
 f doctor --all        # audit EVERY uck in every bucket (22 ucks, ~90s: forks one CLI each)
 f doctor ha-ws kuma   # is a specific uck actually live?
+f doctor --json       # machine-readable: one JSON object, {mode,health,ok,total,rows}
 ```
 
 Exit `0` = everything answered. Exit `1` = something is degraded; trust only the `OK` rows.
+
+## `--json` shape
+
+`f doctor --json` prints exactly **one** JSON object on stdout (nothing on stderr) and never
+mixes prose into it. With `--all` it is `{mode:"ucks",…}`, otherwise `{mode:"layer",…}`:
+
+```jsonc
+{ "mode": "layer", "health": "DEGRADED", "ok": 13, "total": 15,
+  "generatedAt": "…", "home": "/home/kenny",
+  "rows": [ { "state": "RISK", "cmd": "creds", "detail": "…" } ] }
+```
+
+**Branch on `.state`, never on whether a row is present** — `state` is the verdict and every
+check always emits a row. Uck rows add `bucket`, `skills`, `jsonMode`, and `verified`, which
+states honestly what was checked ("bare invocation + static source gates") so an `OK` row is
+never mistaken for "every flag of this uck works".
 
 ## States
 
@@ -28,7 +45,7 @@ Exit `0` = everything answered. Exit `1` = something is degraded; trust only the
 | `MISSING` | Not on PATH / dir absent | Check *whose* PATH probed it before concluding "not installed" |
 | `RISK` | Bucket `f up` would reset away, or credentials that will expire | Fix before it becomes an outage |
 
-## The four traps this exists for
+## The five traps this exists for
 
 1. **`SILENT` is not `OK`.** A uck can pass `f uck check`, appear in the `f` command
    table, and still print literally nothing with exit 0. f's dispatcher does
@@ -51,6 +68,13 @@ Exit `0` = everything answered. Exit `1` = something is degraded; trust only the
    (never `list`/`get`: those can trigger a login, and a 400 repeated enough can lock the
    account). When re-auth is refused while cached mirror tokens still resolve, the row is
    `RISK`: Forgejo/GitHub patrol **looks green** and goes dark when the cache expires.
+5. **A flag that is *recognised* but not *honoured* is still flag blindness.** This uck
+   shipped that bug: `--all` was stripped from the target list but `--json` was not, so
+   `f doctor --json` resolved the string `--json` as a **uck name** and printed a fabricated
+   `MISSING --json  no index.js in any bucket` row, while `f doctor --all --json` mixed free
+   text with JSON. A flag must change the output **shape**, not merely survive parsing. Every
+   accepted flag belongs in the strip list *and* in an output branch. `f doctor --all` now
+   gates this class: any uck documenting `--json` must reach a JSON serializer on stdout.
 
 ## What `--all` does NOT claim
 
@@ -59,22 +83,41 @@ never proves a subcommand returns true data. An all-`OK` run means "every uck an
 nothing is structurally mute or flag-blind" — nothing more. Per-subcommand correctness is
 still your job.
 
+It also cannot **execute** a flag. Each uck gets exactly one probe — the **bare** invocation
+— because a flagged probe could mutate real state and `f <uck> --help` is routed to
+`f help <uck>` instead of reaching the uck. So the `--json` check is a static source gate, and
+`verified` on each uck row records that limit. Do not upgrade "it parses flags" into "its
+flags work".
+
 ## Test a probe against known-bad AND known-good before trusting it
 
 The first version of the flag-blindness check contained an inline-backtick character class
 in a regex literal; it matched nothing, so **every uck passed and the gate was silently
-broken**. That is the same bug class the uck exists to detect, reproduced inside the
-detector. Before believing an all-`OK` audit, drop two throwaway ucks into a bucket and
+broken**. Every later revision of the `--json` gate also failed **in the opposite direction**:
+three guard-matching variants each false-failed healthy ucks, because the buckets use three
+different flag idioms (`if (flags.json)`, `has(argv,"--json")` with the serializer in a
+helper, `const dump = a.includes("--json")` feeding a later branch). A gate that calls healthy
+tools broken is worse than no gate — so the shipped test is deliberately coarse (can this uck
+serialize JSON to stdout at all?). Fuzz both directions: a known-bad fixture **must** FAIL,
+and every real uck **must** PASS.
+
+Before believing an all-`OK` audit, drop two throwaway ucks into a bucket and
 confirm each bug class is caught:
 
 ```bash
 cd ~/.f/ucks/kensand-fcli-ucks
-mkdir -p fbad1 fbad2
+mkdir -p fbad1 fbad2 fbad3
 printf 'export function register(_c){return {name:"fbad1",desc:"d",run:async()=>{return "prints nothing";}};}\nexport default {register};\n' > fbad1/index.js
 printf 'const U="usage: f fbad2 <cmd>\\n  --json   structured\\n";\nexport function register(_c){return {name:"fbad2",desc:"d",run:async(_a,args)=>{if(args.json){console.log("[]");return 0;}console.log(U);return 0;}};}\nexport default {register};\n' > fbad2/index.js
-f doctor fbad1 fbad2   # expect TWO FAIL rows (mute, flag-blind) — then:
-rm -rf fbad1 fbad2
+# recognised flag, no serializer anywhere -> must FAIL the --json gate
+printf 'export function register(_c){return {name:"fbad3",desc:"d",run:async(a)=>{if((a||[]).includes("--json")){process.stdout.write("here is your json!\\n");return 0;}process.stdout.write("default\\n");return 0;}};}\nexport default {register};\n' > fbad3/index.js
+f doctor fbad1 fbad2 fbad3   # expect THREE FAIL rows (mute, flag-blind, fake --json) — then:
+rm -rf fbad1 fbad2 fbad3
+f doctor ddg doctor grafana kuma slop creds providers   # expect 7 OK (false-positive control)
 ```
+
+A fixture whose `register().name` does not match its directory fails the **name** check and
+never reaches the gate under test — make them match or you will "verify" nothing.
 
 Also re-run every terminal path of the thing you changed: `f doctor --help`,
 `f doctor --all`, `f doctor <uck>`, and bare `f doctor`. Usage handling that sits before
