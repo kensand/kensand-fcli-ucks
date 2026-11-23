@@ -23,12 +23,16 @@ const DEFAULT_HOST = "https://grafana.kensand.net";
 
 const USAGE = `f grafana — Grafana API (https://grafana.kensand.net)
 
-  f grafana health                     server health (no auth)
-  f grafana ds [name]                  datasources
-  f grafana dash ls [query]            dashboards
-  f grafana dash get <uid> [--json]    panels of one dashboard
-  f grafana query '<promql>' [--ds N]  instant PromQL (default ds: prometheus)
-  f grafana <METHOD> <path> [json]     raw API call, e.g. GET /api/org
+  f grafana health [--json]              server health (no auth)
+  f grafana ds [name] [--json]           datasources
+  f grafana dash ls [query] [--json]     dashboards
+  f grafana dash get <uid> [--json]      panels of one dashboard
+  f grafana query '<promql>' [--ds N] [--json]  instant PromQL (default ds: prometheus)
+  f grafana <METHOD> <path> [json]       raw API call, e.g. GET /api/org
+
+--json emits exactly one JSON document on stdout and exits 0 even when the
+answer is "nothing matched" — so it is safe to pipe into jq. Exit 1 is reserved
+for real errors (no token, HTTP failure, bad usage).
 
 Creds: grafana-host, grafana-token (Admin service-account key) — or
 --url/--token flags, GRAFANA_URL/GRAFANA_TOKEN env.`;
@@ -86,7 +90,7 @@ function flag(argv, name) {
 function has(argv, name) { return argv.includes(name); }
 
 async function api({ url, token }, path, { method = "GET", body, auth = true } = {}) {
-  if (auth && !token) err("no grafana-token cred — create a service-account token (Admin) in Grafana and store it: f creds put grafana-token");
+  if (auth && !token) err("no grafana-token cred — create a service-account token (Admin) in Grafana and store it: f creds set grafana-token <token>");
   const headers = { Accept: "application/json" };
   if (auth && token) headers.Authorization = "Bearer " + token;
   if (body != null) headers["Content-Type"] = "application/json";
@@ -132,31 +136,42 @@ export function register(_ctx) {
     run: async (argv) => {
       if (!argv.length || argv[0] === "-h" || argv[0] === "--help") { out(USAGE); return; }
       const cfg = { url: null, token: null };
-      const [cmd, ...rest] = argv;
+      // Flags are stripped BEFORE the positional walk. f gives a uck
+      // `args === { _: argv }` unless it declares an argv hook, so a flag left
+      // in the token stream is indistinguishable from a positional argument —
+      // the FLAG BLINDNESS class. Here it was actively manufacturing wrong
+      // data: `f grafana dash ls --json` fed "--json" to the dashboard SEARCH
+      // and printed `(no dashboards)` exit 0 while two dashboards exist, and
+      // `f grafana ds --json` answered `no datasource: --json`.
+      const [cmd, ...rest] = argv.filter((t) => t !== "--json");
+      const json = argv.includes("--json");
       if (cmd === "health") {
         const h = await api(resolve(argv), "/api/health", { auth: false });
+        if (json) return out(h);
         return out(`database=${h.database} version=${h.version}`);
       }
       Object.assign(cfg, resolve(argv));
       if (cmd === "ds") {
         const all = await api(cfg, "/api/datasources");
         const q = rest[0];
-        if (!q) return outLines_(all.map((d) => `${d.uid}  ${d.type}  ${d.name}  ${d.url || ""}  access=${d.access}`));
+        if (!q) return json ? out(all) : outLines_(all.map((d) => `${d.uid}  ${d.type}  ${d.name}  ${d.url || ""}  access=${d.access}`));
         const d = all.find((x) => x.uid === q || (x.name || "").toLowerCase().includes(q.toLowerCase()));
-        return out(d || err("no datasource: " + q));
+        if (!d) err("no datasource: " + q);
+        return out(d);
       }
       if (cmd === "dash") {
         const sub = rest[0];
         if (sub === "ls" || !sub) {
           const q = rest[1] || "";
           const r = await api(cfg, "/api/search?type=dash-db&query=" + encodeURIComponent(q));
+          if (json) return out(r);
           if (!r.length) return out("(no dashboards)");
           return outLines_(r.map((d) => `${d.uid}  [${d.folderTitle || "/"}]  ${d.title}`));
         }
         if (sub === "get") {
           const uid = rest[1] || err("usage: f grafana dash get <uid>");
           const d = await api(cfg, "/api/dashboards/uid/" + encodeURIComponent(uid));
-          if (has(argv, "--json")) return out(d);
+          if (json) return out(d);
           const p = d.dashboard?.panels || [];
           const head = `uid=${uid} title=${JSON.stringify(d.dashboard?.title)} version=${d.dashboard?.version} panels=${p.length}`;
           return outLines_([head, ...p.map((x) => `  ${x.id}  ${x.type}  ${JSON.stringify(x.title)}`)]);
@@ -165,7 +180,7 @@ export function register(_ctx) {
       }
       if (cmd === "query") {
         const promql = rest[0] || err("usage: f grafana query '<promql>' [--ds name] [--json]");
-        return query(cfg, promql, flag(argv, "--ds"), has(argv, "--json"));
+        return query(cfg, promql, flag(argv, "--ds"), json);
       }
       if (/^(GET|POST|PUT|PATCH|DELETE)$/.test(cmd)) {
         const p = rest[0] || err("usage: f grafana " + cmd + " /api/path [json-body]");
