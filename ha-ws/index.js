@@ -93,6 +93,22 @@ function connect(url) {
         resolve(makeSocket(sock));
       }
     );
+    // Node delivers a successful 101 on the `upgrade` event, NOT the response
+    // callback: the response callback only fires for non-101 answers. Listening
+    // to just one of the two means a HEALTHY server looks like a hang — every
+    // invocation of this uck printed nothing and exited 0 while curl got its 101
+    // in single-digit milliseconds. The `head` argument is the first bytes of the
+    // WS stream, so it must be fed back into the socket or the first frame is lost.
+    req.on("upgrade", (res, sock, head) => {
+      if (res.statusCode !== 101) {
+        sock.destroy();
+        reject(new Error(`upgrade failed: HTTP ${res.statusCode}`));
+        return;
+      }
+      sock.setNoDelay(true);
+      sock.setNoDelay(true);
+      resolve(makeSocket(sock, head));
+    });
     req.on("error", reject);
     req.setTimeout(25000, () => req.destroy(new Error("ws connect timeout")));
     req.end();
@@ -112,9 +128,12 @@ async function initRequire() {
   _require = createRequire(import.meta.url);
 }
 
-/** Wrap a raw TLS/plain socket in the handful of WS ops we need. */
-function makeSocket(sock) {
-  let buf = Buffer.alloc(0);
+/** Wrap a raw TLS/plain socket in the handful of WS ops we need. `seed` carries
+ * the bytes the `upgrade` event delivered alongside the socket — they have
+ * already left the kernel by the time any `data` listener could attach, so they
+ * must be prepended here or the first frame (HA's auth_required hello) is lost. */
+function makeSocket(sock, seed) {
+  let buf = Buffer.concat([Buffer.alloc(0), seed && seed.length ? seed : Buffer.alloc(0)]);
   const waiters = [];
 
   sock.on("data", (chunk) => {
