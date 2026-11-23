@@ -3,6 +3,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { readdirSync, existsSync, readFileSync } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
@@ -392,13 +393,82 @@ export function register(_ctx) {
                 .map((m) => ({ name: m[1], at: Date.parse(m[2]) }))
                 .filter((m) => Number.isFinite(m.at));
               const now = Date.now();
+              // VERIFY THE RISK ROW BEFORE REPORTING IT. An expired mirror stamp is
+              // metadata; what kenny cares about is whether the value still resolves.
+              // Two heartbeats reported "N mirrors EXPIRED — patrol goes dark" for
+              // items that still answered `f creds get`, i.e. a false alarm that trains
+              // the operator to skim the RISK rows. So resolve each expired mirror and
+              // only escalate the ones that actually fail.
+              //
+              // Read the creds SOCKET, not a nested `f creds get`: doctor already
+              // spawns `f vaultwarden status` and `f creds ls --all`, and CONTRACT N12
+              // stops at two nested `f` calls. The socket is what `f creds get` itself
+              // reads, and the daemon answers STRUCTURALLY — {ok:true,value} when it
+              // answers, {ok:false,error:"no such cred: X"} when the item is gone — so
+              // a deleted vault item is never mislabelled a dead credential, and no
+              // nested command here can trip a vault re-auth (a 400 retry can lock the
+              // account). The daemon answers exact keys only, so `mirror:<name>` is
+              // asked explicitly.
+              const askSocket = (key) =>
+                new Promise((resolve) => {
+                  let buf = "";
+                  let done = false;
+                  const finish = (v) => {
+                    if (done) return;
+                    done = true;
+                    try {
+                      c.destroy();
+                    } catch {
+                      /* already closed */
+                    }
+                    resolve(v);
+                  };
+                  const c = net.connect(path.join(HOME, ".f", ".creds.sock"), () => {
+                    c.write(JSON.stringify({ op: "get", name: key }));
+                  });
+                  c.setTimeout(5000, () => finish("unreachable"));
+                  c.on("data", (d) => (buf += d));
+                  c.on("end", () => {
+                    try {
+                      const r = JSON.parse(buf);
+                      if (r && r.ok && r.value != null && r.value !== "") finish("resolves");
+                      else if (/no such cred/i.test(String(r && r.error))) finish("absent");
+                      else finish("unresolvable");
+                    } catch {
+                      finish("unreachable");
+                    }
+                  });
+                  c.on("error", () => finish("unreachable"));
+                });
               const expired = mirrors.filter((m) => m.at <= now);
+              const verdicts = await Promise.all(
+                expired.map(async (m) => ({ m, v: await askSocket(m.name) })),
+              );
+              // `absent` (the vault item was deleted) and `unreachable` (the whole store
+              // is down — the vault rows already say that) are NOT "this credential
+              // died", so they never become a RISK here.
+              const dead = verdicts.filter((x) => x.v === "unresolvable").map((x) => x.m);
+              const healed = verdicts.filter((x) => x.v === "resolves");
               const soon = mirrors.filter((m) => m.at > now && m.at - now < 48 * 3600 * 1000);
-              if (expired.length) {
+              if (dead.length) {
                 rows.push({
                   cmd: "creds-mirror",
                   state: "RISK",
-                  detail: `${expired.length} provider mirror(s) EXPIRED (${expired.map((m) => m.name.replace("mirror:", "")).join(", ")}) — anything depending on them resolves only until the value is re-fetched`,
+                  detail:
+                    `${dead.length} provider mirror(s) EXPIRED and UNRESOLVABLE (` +
+                    dead.map((m) => m.name.replace("mirror:", "")).join(", ") +
+                    `) — these are values a consumer can no longer read. Re-fetch from the ` +
+                    `provider; check with f vaultwarden status and NEVER retry a 400 login (lockout).`,
+                });
+              }
+              if (healed.length) {
+                rows.push({
+                  cmd: "creds-mirror",
+                  state: "INFO",
+                  detail:
+                    `${healed.length} mirror(s) past their expiry stamp but STILL RESOLVE from the ` +
+                    `creds socket (${healed.map((x) => x.m.name.replace("mirror:", "")).join(", ")}) — ` +
+                    `the stamp is stale metadata, not a dead credential. Not a fault, do not act.`,
                 });
               }
               if (soon.length) {
