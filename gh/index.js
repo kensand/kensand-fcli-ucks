@@ -113,10 +113,32 @@ async function resolveCreds(flagToken, flagUrl, credsApi, opts = {}) {
     return "error";
   };
   const read = async (name) => {
-    if (credsApi && typeof credsApi.get === "function") {
+    // Prefer creds' own resolver: it is the sanctioned interface (CONTRACT §6.1)
+    // and it knows the provider layer, which the raw socket read below does not.
+    if (credsApi && typeof credsApi.resolveCred === "function") {
+      try {
+        const r = await credsApi.resolveCred({ names: [name] });
+        if (r && r.token) return r.token;
+        if (r && r.reason === "locked") return { locked: true };
+        // missing / no-store: fall through to the raw read. One miss is weak
+        // evidence and the local store may still hold the name.
+      } catch (e) { if (classify(e) === "locked") return { locked: true }; /* unreachable != unset */ }
+    } else if (credsApi && typeof credsApi.get === "function") {
       try { return await credsApi.get(name); } catch (e) { if (classify(e) === "locked") return { locked: true }; return null; }
     }
-    try { const r = await daemonCall({ op: "get", name }, state.socket || CRED_SOCKET); if (r && r.ok) return r.value; return null; } catch { return null; }
+    // The daemon answers ONLY the exact key asked for, and a provider-backed
+    // (vault) cred is stored under `mirror:<name>` — so a bare read of a
+    // mirror-only name is a MISS even though `f creds get <name>` prints it.
+    // Measured 2026-11-23: `gh-token` bare=true/mirror=false, while `gh-fcli`
+    // and `npm-token` are bare=false/mirror=true. Reading one shape only
+    // silently hides whichever half you did not ask for.
+    for (const key of [name, "mirror:" + name]) {
+      try {
+        const r = await daemonCall({ op: "get", name: key }, state.socket || CRED_SOCKET);
+        if (r && r.ok && r.value != null && r.value !== "") return r.value;
+      } catch { /* store unreachable: not the same as "not configured" */ }
+    }
+    return null;
   };
   if (flagToken) return { token: flagToken, src: "--token", base: resolveBase(flagUrl) };
   if (process.env.GITHUB_TOKEN) return { token: process.env.GITHUB_TOKEN, src: "GITHUB_TOKEN", base: resolveBase(flagUrl) };

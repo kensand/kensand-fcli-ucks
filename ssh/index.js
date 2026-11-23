@@ -227,12 +227,20 @@ async function readCred(name, credsApi) {
 
   // b64, not utf8: a stored key keeps its exact bytes, including any trailing
   // newline the daemon would otherwise have trimmed.
-  const r = await daemonCall({ op: "get", name, b64: true }, state.socket);
-  if (r?.ok && (r.value != null || r.b64 != null)) {
-    const raw = r.b64 != null ? Buffer.from(r.b64, "base64").toString("utf8") : r.value;
-    return raw ? { value: raw, src: `creds:${name}` } : { missing: true };
+  //
+  // Both key shapes are tried. The daemon answers ONLY the exact name asked
+  // for, and a provider-backed (vault) cred lives under `mirror:<name>`, so a
+  // bare read of a mirror-only cred is a MISS while `f creds get <name>` still
+  // prints it — the same mirror-blindness that made `f gh` tell kenny to store
+  // a token that already existed. A key stored in the vault should be readable.
+  for (const key of [name, "mirror:" + name]) {
+    const r = await daemonCall({ op: "get", name: key, b64: true }, state.socket);
+    if (r?.ok && (r.value != null || r.b64 != null)) {
+      const raw = r.b64 != null ? Buffer.from(r.b64, "base64").toString("utf8") : r.value;
+      if (raw) return { value: raw, src: `creds:${name}` };
+    }
+    if (r && r.ok === false && /locked/i.test(r.error ?? "")) return { locked: true };
   }
-  if (r && r.ok === false && /locked/i.test(r.error ?? "")) return { locked: true };
   return { missing: true };
 }
 
