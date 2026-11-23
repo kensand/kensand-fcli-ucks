@@ -1,4 +1,9 @@
 {
   "name": "kensand-fcli-ucks-pi-models",
-  "type": "module"
+  "type": "module",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT",
+  "description": "f pi-models: save/restore ~/.pi/agent/models.json in the f creds store"
 }

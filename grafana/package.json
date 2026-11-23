@@ -2,5 +2,9 @@
   "name": "kensand-fcli-ucks-grafana",
   "type": "module",
   "description": "f grafana: Grafana health, datasources, dashboards, PromQL queries",
-  "main": "index.js"
+  "main": "index.js",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT"
 }

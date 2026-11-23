@@ -1,4 +1,9 @@
 {
   "name": "kensand-fcli-ucks-ssh",
-  "type": "module"
+  "type": "module",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT",
+  "description": "f ssh: ssh/scp/rsync with a private key from the f creds store, never on disk"
 }

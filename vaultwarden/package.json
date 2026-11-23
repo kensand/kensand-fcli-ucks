@@ -1,4 +1,9 @@
 {
   "name": "kensand-fcli-ucks-vaultwarden",
-  "type": "module"
+  "type": "module",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT",
+  "description": "f vaultwarden: read secrets from a Vaultwarden vault; credential provider for f creds"
 }

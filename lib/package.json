@@ -1,4 +1,10 @@
 {
   "name": "kensand-fcli-ucks-lib",
-  "type": "module"
+  "type": "module",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT",
+  "description": "kensand-fcli-ucks-lib: shared helpers for the personal fcli ucks (not a command)",
+  "private": true
 }

@@ -5,5 +5,9 @@
   "main": "index.js",
   "dependencies": {
     "mqtt": "^5.16.1"
-  }
+  },
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT"
 }

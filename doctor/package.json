@@ -2,5 +2,9 @@
   "name": "kensand-fcli-ucks-doctor",
   "type": "module",
   "description": "f doctor: probe whether tools, buckets and ucks actually answer (degraded != error)",
-  "main": "index.js"
+  "main": "index.js",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT"
 }

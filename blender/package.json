@@ -1,1 +1,8 @@
-{"type":"module"}
+{
+  "type": "module",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT",
+  "description": "f blender: drive a headless Blender 5.x instance (scene graph, modifiers, exports)"
+}

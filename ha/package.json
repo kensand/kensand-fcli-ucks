@@ -2,5 +2,9 @@
   "name": "kensand-fcli-ucks-ha",
   "type": "module",
   "description": "f ha: Home Assistant REST API (states, services, scenes, automations, history, weather, calendars)",
-  "main": "index.js"
+  "main": "index.js",
+  "keywords": [
+    "fcli-uck"
+  ],
+  "license": "MIT"
 }
