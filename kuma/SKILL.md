@@ -9,8 +9,15 @@ Uptime-kuma (default `https://uptime.kensand.net`) as a cheap health watch.
 Uses ONLY the two public tokenless endpoints — no creds, no API key:
 
 - `f kuma watch` — one line per monitor (status, last ping, last-check time), problems first, `N/M UP` summary. Exit 0 whenever the fetch succeeded.
-- `f kuma down` — prints only DOWN/PENDING/UNKNOWN monitors and exits 1; all green = no output + exit 0. This is the scripted check / watcher primitive — use this, not `watch`, in scripts and heartbeat monitors.
-- `f kuma raw` — raw heartbeat JSON (debug).
+- `f kuma down` — prints only DOWN/PENDING/UNKNOWN monitors and exits 1; all green = no output + exit 0. This is the scripted check / watcher primitive — use this, not `watch`, in scripts and heartbeat monitors. **Silence + exit 0 means ALL GREEN, not a failure**, and exit 1 with rows is a real signal.
+- `f kuma raw [endpoint]` — raw JSON for debugging: `heartbeats` (default) or `status` (monitor id → name). Anything else is rejected; the uck only ever reaches those two endpoints, because other uptime-kuma paths return misleading 200 HTML.
+
+## Exit codes vs machine output
+
+`--json` **always exits 0** — the payload carries the verdict (`.label`, and `.code` 0/1/2), so
+`f kuma down --json | jq` never looks like a crash. Only the **bare** `f kuma down` is an
+exit-code signal. Never treat a non-zero exit as "the command broke" or a zero exit as "all
+green" once `--json` is involved, and never trust `$?` straight after a pipe.
 - `--json` on watch/down emits structured records `{id,name,label,ping,time,msg}`.
 - `--base <url>` / `KUMA_URL` point at another instance.
 

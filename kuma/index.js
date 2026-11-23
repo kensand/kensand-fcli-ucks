@@ -15,9 +15,10 @@
 //
 // Commands:
 //   f kuma watch [--json]    every monitor: UP/DOWN + last ping + summary (exit 0)
-//   f kuma down  [--json]    only DOWN/PENDING/UNKNOWN monitors; exit 1 if any,
+//   f kuma down  [--json]    only DOWN/PENDING/UNKNOWN monitors; exit 1 if any (bare only:
+//                            --json always exits 0 and the payload carries the verdict),
 //                            silent clean exit 0 when all green (CI/watch-gateable)
-//   f kuma raw               raw heartbeat JSON (debug)
+//   f kuma raw [endpoint]    raw JSON: heartbeats (default) | status (id->name)
 //
 // Exit codes: 0 ok · 1 down-detected or fetch/parse error · 2 usage.
 
@@ -36,15 +37,20 @@ const USAGE = `f kuma — uptime-kuma service health (public status page, tokenl
 usage:
   f kuma watch [--json]     one line per monitor: status, last ping, last check
                             (problems first) + "N/M UP" summary; exit 0
-  f kuma down  [--json]     print only DOWN/PENDING/UNKNOWN monitors, exit 1;
+  f kuma down  [--json]     print only DOWN/PENDING/UNKNOWN monitors, exit 1
+                            (bare only — with --json exit is 0 and .label is the verdict);
                             all green = no output, exit 0 (use this in scripts)
-  f kuma raw                raw heartbeat JSON (debug)
+  f kuma raw     [endpoint] raw JSON for debugging: heartbeats (default) | status (id->name)
+                            anything else is refused rather than silently ignored
 
 flags:
   --json          structured JSON records instead of text
   --base <url>    uptime-kuma base ($KUMA_URL, default ${DEFAULT_BASE})
 
 exit: 0 ok · 1 down/error · 2 usage
+Machine output (--json) always exits 0; the payload carries the verdict.
+Bare 'f kuma down' IS the exit-code signal: 1 = something is not UP.
+Bare down printing nothing with exit 0 means ALL GREEN, not a failure.
 `;
 
 // jq does the join: heartbeat keys are monitor-id strings; the status page
@@ -163,15 +169,40 @@ export function register(_ctx) {
       if (cmd === "watch" || cmd === "down" || cmd === "raw") {
         const base = String(flags.base || process.env.KUMA_URL || DEFAULT_BASE).replace(/\/+$/, "");
         if (cmd === "raw") {
-          try { process.stdout.write(JSON.stringify(await fetchJson(`${base}/api/status-page/heartbeat/status`), null, 2) + "\n"); }
+          // The endpoint is an ARGUMENT, not a fixed value. `raw` used to ignore whatever
+          // followed it and always return heartbeats, so any other path looked like a success
+          // that returned the wrong document — a probe of a nonsense URL came back with
+          // plausible heartbeats and read as "yes, that endpoint exists". Only the two
+          // endpoints this uck actually knows are accepted; unknown ones are an error, never
+          // a silent fallthrough to the default document.
+          // pos[0] IS the subcommand, so the endpoint is pos[1] — reading pos[0] here made
+          // the bare `f kuma raw` (the only invocation that ever worked) fail as an unknown
+          // endpoint named "raw". Re-run the exact command that used to work after any fix.
+          const want = pos[1] || "heartbeats";
+          const path =
+            want === "heartbeats" || want === "heartbeat" || want === "/api/status-page/heartbeat/status"
+              ? "/api/status-page/heartbeat/status"
+              : want === "status" || want === "/api/status-page/status"
+                ? "/api/status-page/status"
+                : null;
+          if (!path) {
+            fail(
+              `unknown endpoint ${JSON.stringify(want)} — raw serves 'heartbeats' (default) or 'status' (id->name)`,
+            );
+          }
+          try { process.stdout.write(JSON.stringify(await fetchJson(base + path), null, 2) + "\n"); }
           catch (e) { fail(e.message); }
           return;
         }
         const rows = await gather(base);
         const bad = rows.filter((r) => r.label !== "UP");
         if (flags.json) {
+          // `--json` exits 0 even when monitors are DOWN: the payload carries the verdict
+          // (.label/.status), and a non-zero code makes `f kuma down --json | jq` look like a
+          // crash and makes `out=$(f kuma down --json)` capture valid JSON then discard the
+          // branch. `f kuma watch` is already exit-0-with-DOWN, so this is the documented
+          // convention for machine output here. Use the BARE `f kuma down` for an exit code.
           process.stdout.write(JSON.stringify(cmd === "down" ? bad : rows, null, 2) + "\n");
-          if (cmd === "down" && bad.length) process.exit(1);
           return;
         }
         if (cmd === "watch") {
