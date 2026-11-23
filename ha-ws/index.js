@@ -30,6 +30,16 @@ const _here = path.dirname(_f2p(import.meta.url));
 
 const DEFAULT_BASE = "https://ha.kensand.net";
 
+// ---- output ----
+// f's dispatcher does NOT print what run() returns (dist/index.js only reads a
+// numeric return as exitCode), so a uck that only returns strings prints nothing
+// and exits 0 — the SILENT signature. Every result must be written here.
+function out(o) {
+  if (o == null) return;
+  if (typeof o === "string") { process.stdout.write(o.endsWith("\n") ? o : o + "\n"); return; }
+  process.stdout.write(JSON.stringify(o, null, 2) + "\n");
+}
+
 function parseBase(raw) {
   if (!raw) return null;
   let u = String(raw).replace(/\/+$/, "");
@@ -303,10 +313,10 @@ export function register(_ctx) {
       }
       const credsApi = (ctx && ctx.registry && ctx.registry.creds && ctx.registry.creds.credsApi) || null;
       const [cmd, ...rest] = pos;
-      if (!cmd) return usage();
+      if (!cmd) { out(usage()); return 0; }
 
       try {
-        return await withHa(flagUrl, flagToken, credsApi, async (call) => {
+        out(await withHa(flagUrl, flagToken, credsApi, async (call) => {
           if (cmd === "whoami") {
             const r = await call("auth/current_user");
             const u = r.result || {};
@@ -388,9 +398,11 @@ export function register(_ctx) {
           }
 
           return usage();
-        });
+        }));
+        return 0;
       } catch (e) {
-        return `f ha-ws: ${e.message ?? e}`;
+        out(`f ha-ws: ${e.message ?? e}`);
+        return 1;
       }
     },
   };
