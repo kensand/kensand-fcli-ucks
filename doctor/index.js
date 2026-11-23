@@ -359,7 +359,6 @@ export function register(_ctx) {
             encoding: "utf8",
           });
           const text = stdout || "";
-          const expires = text.match(/mirror ttl\s+(\S+)/);
           const refused = /token refresh failed|session failed|HTTP 400/.test(text);
           if (refused) {
             rows.push({
@@ -371,10 +370,29 @@ export function register(_ctx) {
                 "Do not retry login (lockout risk); needs operator `f vaultwarden config`",
             });
           } else {
+            // The mirror TTL line says nothing about durability: it was `3600s`
+            // both while re-auth was broken and after it recovered. What decides
+            // whether provider creds keep resolving is the per-name mirror source
+            // expiry in ~/.f/.creds-cache.json, so read that instead.
+            let mirrorNote = "";
+            try {
+              const cache = JSON.parse(readFileSync(path.join(HOME, ".f", ".creds-cache.json"), "utf8"));
+              const now = Date.now();
+              const src = Object.entries(cache).filter(([k]) => k.startsWith("src:mirror:"));
+              const live = src.filter(([, v]) => v?.expiresAt > now);
+              if (src.length) {
+                const soon = live.filter(([, v]) => v.expiresAt - now < 24 * 3600 * 1000);
+                mirrorNote = soon.length
+                  ? ` — ${soon.length}/${src.length} mirror source(s) expire <24h (${soon.map(([k]) => k.slice("src:mirror:".length)).join(", ")})`
+                  : ` — ${live.length}/${src.length} mirror source(s) valid >24h`;
+              }
+            } catch {
+              /* no cache file: nothing to report, the vault row above already answered */
+            }
             rows.push({
               cmd: "creds",
               state: "OK",
-              detail: `vault answers${expires ? `, mirror ttl ${expires[1]}` : ""}`,
+              detail: `vault answers${mirrorNote}`,
             });
           }
         } catch (err) {
