@@ -455,6 +455,47 @@ export function register(_ctx) {
       }
       for (const b of await Promise.all(buckets.map(bucket))) rows.push(b);
 
+      // MIRROR BLINDNESS — a measured gate, not a source regex.
+      // The creds daemon answers ONLY the exact key asked for, and a
+      // provider-backed (vault) cred is stored under `mirror:<name>`. A uck that
+      // falls back to a hand-rolled `daemonCall({op:"get",name})` therefore reads
+      // a live vault credential as *unset* — which is how `f gh` told the
+      // operator to store a token that already existed. A regex over the bucket
+      // cannot decide this (fj/ha/grocy read lists through creds' own
+      // `rawCredRead`, and CONTRACT C3 says an absent creds uck is EXPECTED to
+      // read the socket), so ask the store directly instead.
+      try {
+        const { stdout: lsAll } = await run("f", ["creds", "ls", "--all"], {
+          timeout: 30000,
+          encoding: "utf8",
+        });
+        const mirrorOnly = (lsAll || "")
+          .split("\n")
+          .map((l) => l.match(/^(mirror:([^\t ]+))\s*\(mirror;/))
+          .filter(Boolean)
+          .map((m) => ({ key: m[1], name: m[2] }))
+          .filter((m) => {
+            // "mirror-only" means the bare key does not also exist locally.
+            const bare = new RegExp("^" + m.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\t", "m");
+            return !bare.test(lsAll || "");
+          });
+        if (mirrorOnly.length) {
+          // INFORMATIONAL, deliberately not FAIL/DEGRADED: a mirror-only shape is
+          // the NORMAL result of a vault-backed cred, not a fault. RISK is the
+          // layer's signal-to-kenny vocabulary; raising DEGRADED here would make
+          // `f doctor` exit 1 forever on a healthy box and train everyone to
+          // ignore the exit code — a gate that calls healthy tools broken is
+          // worse than no gate. Consumers are judged by `f doctor <uck>`.
+          rows.push({
+            cmd: "creds-mirror-shape",
+            state: "INFO",
+            detail: `${mirrorOnly.length} cred(s) resolve ONLY as \`mirror:<name>\` (${mirrorOnly.map((m) => m.name).join(", ")}) — the daemon answers exact keys, so a consumer reading the bare key (or a hand-rolled socket client that skipped creds' rawCredRead) sees these as UNSET. gh/ssh/ha verified mirror-aware.`,
+          });
+        }
+      } catch {
+        /* creds unreachable: the vault row above already answered */
+      }
+
       // A probe that cannot run must never report a healthy layer.
       if (rows.length === 0) {
         rows.push({
@@ -463,7 +504,7 @@ export function register(_ctx) {
           detail: "no checks ran — cannot claim the layer is healthy",
         });
       }
-      const bad = rows.filter((r) => r.state !== "OK");
+      const bad = rows.filter((r) => r.state !== "OK" && r.state !== "INFO");
       const health = bad.length ? "DEGRADED" : "HEALTHY";
       if (json) {
         emit({

@@ -44,6 +44,7 @@ never mistaken for "every flag of this uck works".
 | `FAIL` | Non-zero / threw / timed out, or a uck violates the output/flag contract | Record as a tool failure, not as data about the world |
 | `MISSING` | Not on PATH / dir absent | Check *whose* PATH probed it before concluding "not installed" |
 | `RISK` | Bucket `f up` would reset away, or credentials that will expire | Fix before it becomes an outage |
+| `INFO` | A shape worth knowing that is **not** a fault (e.g. mirror-only creds) | Read it; it never changes the exit code |
 
 ## The five traps this exists for
 
@@ -122,6 +123,30 @@ never reaches the gate under test — make them match or you will "verify" nothi
 Also re-run every terminal path of the thing you changed: `f doctor --help`,
 `f doctor --all`, `f doctor <uck>`, and bare `f doctor`. Usage handling that sits before
 the main block is the path people miss.
+
+## Credential key shapes (`INFO creds-mirror-shape`)
+
+The creds daemon answers **only the exact key asked for**, and a provider-backed
+(vaultwarden) cred is stored under `mirror:<name>`. So a credential can be live and
+printable via `f creds get <name>` while a **bare** store read of it is a MISS. Measured
+on this store:
+
+```
+gh-token   bare=true  mirror=false     (local)
+ha-token   bare=true  mirror=false     (local)
+gh-fcli    bare=false mirror=true      (mirror-only)
+npm-token  bare=false mirror=true      (mirror-only)
+```
+
+That asymmetry is how `f gh` once told the operator to store a GitHub token that already
+existed: its fallback was a hand-rolled `daemonCall({ op: "get", name })` on the bare key.
+`f doctor` prints the mirror-only set as `INFO` — **informational, never `DEGRADED`**,
+because mirror-only is the normal shape of a vault cred and a gate that exits 1 on a
+healthy box teaches everyone to ignore the exit code.
+
+Consumer rule: ask creds' own `resolveCred` first (CONTRACT §6.1), and if you must read the
+socket, read **both** `name` and `mirror:name`. `gh`, `ssh` and `ha` are verified
+mirror-aware. A single miss is weak evidence, not proof of absence.
 
 ## Buckets (`RISK`)
 
