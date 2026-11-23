@@ -370,24 +370,45 @@ export function register(_ctx) {
                 "Do not retry login (lockout risk); needs operator `f vaultwarden config`",
             });
           } else {
-            // The mirror TTL line says nothing about durability: it was `3600s`
-            // both while re-auth was broken and after it recovered. What decides
-            // whether provider creds keep resolving is the per-name mirror source
-            // expiry in ~/.f/.creds-cache.json, so read that instead.
+            // What decides whether provider creds keep resolving is the per-name
+            // mirror expiry, and `f creds ls --all` prints those dates authoritatively
+            // (it knows which entries are mirrors and when each one dies). The vault's
+            // own "mirror ttl 3600s" line is a config default, NOT an expiry: it read
+            // the same while re-auth was broken and after it recovered, so it implied a
+            // deadline it had not measured. Never parse ~/.f/.creds-cache.json here —
+            // `src:mirror:<name>` in that file is a provider-attribution record whose
+            // expiresAt is unrelated to the mirror's life (it claimed forgejo expired
+            // 2026-10-13 while the mirror actually runs to 2026-11-28).
             let mirrorNote = "";
             try {
-              const cache = JSON.parse(readFileSync(path.join(HOME, ".f", ".creds-cache.json"), "utf8"));
+              const { stdout: ls } = await run("f", ["creds", "ls", "--all"], {
+                timeout: 30000,
+                encoding: "utf8",
+              });
+              const mirrors = (ls || "")
+                .split("\n")
+                .map((l) => l.match(/^(mirror:[^\t ]+).*?expires\s+([0-9T:.Z-]+)/))
+                .filter(Boolean)
+                .map((m) => ({ name: m[1], at: Date.parse(m[2]) }))
+                .filter((m) => Number.isFinite(m.at));
               const now = Date.now();
-              const src = Object.entries(cache).filter(([k]) => k.startsWith("src:mirror:"));
-              const live = src.filter(([, v]) => v?.expiresAt > now);
-              if (src.length) {
-                const soon = live.filter(([, v]) => v.expiresAt - now < 24 * 3600 * 1000);
-                mirrorNote = soon.length
-                  ? ` — ${soon.length}/${src.length} mirror source(s) expire <24h (${soon.map(([k]) => k.slice("src:mirror:".length)).join(", ")})`
-                  : ` — ${live.length}/${src.length} mirror source(s) valid >24h`;
+              const expired = mirrors.filter((m) => m.at <= now);
+              const soon = mirrors.filter((m) => m.at > now && m.at - now < 48 * 3600 * 1000);
+              if (expired.length) {
+                rows.push({
+                  cmd: "creds-mirror",
+                  state: "RISK",
+                  detail: `${expired.length} provider mirror(s) EXPIRED (${expired.map((m) => m.name.replace("mirror:", "")).join(", ")}) — anything depending on them resolves only until the value is re-fetched`,
+                });
+              }
+              if (soon.length) {
+                mirrorNote = ` — ${soon.length} mirror(s) expire <48h (${soon.map((m) => `${m.name.replace("mirror:", "")} @${new Date(m.at).toISOString().slice(0, 16)}Z`).join(", ")})`;
+              } else if (mirrors.length) {
+                const next = mirrors.reduce((a, b) => (a.at < b.at ? a : b));
+                mirrorNote = ` — ${mirrors.length} mirror(s), next expiry ${next.name.replace("mirror:", "")} @${new Date(next.at).toISOString().slice(0, 16)}Z`;
               }
             } catch {
-              /* no cache file: nothing to report, the vault row above already answered */
+              /* creds unavailable: the vault row above already answered */
             }
             rows.push({
               cmd: "creds",

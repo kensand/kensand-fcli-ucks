@@ -166,18 +166,19 @@ async function resolveHa(flagUrl, flagToken, credsApi, opts = {}) {
     return "error";
   };
   const read = async (name) => {
-    // Provider-backed creds live under a prefixed key (`mirror:<name>`), so a
-    // bare-store read answers "no such cred" for a secret `f creds get` prints
-    // happily. That is the SILENT failure class applied to credentials: a
-    // configured token reads as unset, and `f ha` then demands a token that
-    // already exists. Ask the creds API for the NAME; only fall back to a bare
-    // store read when no creds uck is reachable.
+    // Ask creds for the NAME (one name per call), then never trust a single miss:
+    // fall through to raw store reads. The `mirror:<name>` form is included
+    // because that is where a provider-backed cred actually lives — a bare-store
+    // read of `ha-token` is a miss even though `f creds get ha-token` prints it.
+    //
+    // Measured `resolveCred` behaviour (creds v3, 2026-11-23): `["ha-token"]` ->
+    // token, `["ha","ha-token"]` -> token, `["ha"]` -> missing. So a candidate LIST
+    // is not inherently unsafe; what broke `f ha` was reading only through
+    // `credsApi.get` + a bare daemon `get`, both of which miss the mirror layer.
+    // The instability seen while debugging this was ~5-minute `miss:<name>` entries
+    // in ~/.f/.creds-cache.json, which were observable but did NOT reproduce as a
+    // suppression — so treat one miss as weak evidence and keep trying below.
     if (credsApi && typeof credsApi.resolveCred === "function") {
-      // ONE name per call, deliberately. resolveCred takes a candidate list, but a
-      // provider miss on an early candidate is answered `missing` for the whole
-      // call, so `["ha", "ha-token"]` reports nothing while `["ha-token"]` returns
-      // the token. Probing each name separately is the only ordering-independent
-      // read: a user's `ha` cred must not be able to hide their `ha-token`.
       try {
         const r = await credsApi.resolveCred({ names: [name], waitMs: opts.waitMs || 0 });
         if (r && r.token) return r.token;

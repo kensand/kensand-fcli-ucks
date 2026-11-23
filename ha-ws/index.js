@@ -237,10 +237,10 @@ async function withHa(flagUrl, flagToken, credsApi, fn) {
       "ha-token",
       "ha",
     ])];
-    // Probe candidates ONE NAME AT A TIME. resolveCred takes a list, but a
-    // provider miss on an early candidate is answered `missing` for the whole
-    // call: `["ha", "ha-token"]` reported no token while `["ha-token"]` alone
-    // returned it. So a bare `ha` cred must never be allowed to shadow `ha-token`.
+    // Probe candidates one name at a time, then read the mirror layer too. A
+    // provider-backed cred is stored as `mirror:<name>`, so a bare-name read misses
+    // while `f creds get <name>` prints the value; asking for the prefixed keys is
+    // what makes a vault-backed token visible to this uck.
     let res = { token: null, reason: "no-store" };
     if (credsApi && typeof credsApi.resolveCred === "function") {
       let firstBad = null;
