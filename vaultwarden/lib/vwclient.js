@@ -322,11 +322,48 @@ export function unwrapOrgKeys(profile, privateKeyPem) {
  * one appears depends on the client that created the cipher, so honour the reported type
  * rather than assuming one.
  */
-export function decryptItemKey(encryptedKey, privateKeyPem) {
+/**
+ * Unwrap a cipher's per-item key.
+ *
+ * Two wrappers exist in the wild and BOTH must be handled, because a vault that
+ * mixes them otherwise reports its collection items as `(undecryptable)` with no
+ * cause visible:
+ *   3/4  RSA-OAEP  — the item key wrapped to the ACCOUNT public key. The classic
+ *                    shape for personal items.
+ *   2    AES-256-CBC-HMAC — the item key wrapped SYMMETRICALLY with the
+ *                    ORGANIZATION key. This is what an official client writes for
+ *                    an item created in an organization collection, so org items
+ *                    carry a type-2 item key while personal ones carry type 3/4.
+ *                    Verifying the HMAC is the integrity signal: a wrong org key
+ *                    cannot produce a false pass, so there is no silent-garbage
+ *                    path here.
+ * `orgKeys` is the decrypted { encKey, macKey } for this cipher's organization
+ * (from `unwrapOrgKeys`); pass it whenever the cipher has an organizationId.
+ */
+export function decryptItemKey(encryptedKey, privateKeyPem, orgKeys = null) {
   const env = parseEnvelope(encryptedKey);
   if (!env) throw new Error(`unrecognised item-key envelope: ${String(encryptedKey).slice(0, 24)}…`);
+
+  if (env.type === ENC.AES_256_CBC_HMAC) {
+    if (!orgKeys?.encKey || !orgKeys?.macKey) {
+      throw new Error(
+        "item key is wrapped with its organization's key (type 2) but that org key is unavailable " +
+          "(account has no key pair, or the org is not in profile.organizations)",
+      );
+    }
+    if (!env.mac) throw new Error("item key envelope is type 2 without a MAC tag");
+    const want = crypto.createHmac("sha256", orgKeys.macKey).update(env.iv).update(env.ct).digest();
+    if (!tagEqual(want, env.mac)) {
+      throw new Error("item key will not unwrap with this organization's key (MAC verification failed)");
+    }
+    const d = crypto.createDecipheriv("aes-256-cbc", orgKeys.encKey, env.iv);
+    const raw = Buffer.concat([d.update(env.ct), d.final()]);
+    if (raw.length !== 64) throw new Error(`unexpected item key length ${raw.length} (want 64)`);
+    return { encKey: raw.subarray(0, 32), macKey: raw.subarray(32, 64) };
+  }
+
   if (env.type !== ENC.RSA_2048_OAEP_SHA256 && env.type !== ENC.RSA_2048_OAEP_SHA1) {
-    throw new Error(`item key uses unsupported envelope type ${env.type} (want 3 = RSA-OAEP-SHA256 or 4 = RSA-OAEP-SHA1)`);
+    throw new Error(`item key uses unsupported envelope type ${env.type} (want 2 = org-wrapped AES, 3 = RSA-OAEP-SHA256 or 4 = RSA-OAEP-SHA1)`);
   }
   const oaepHash = env.type === ENC.RSA_2048_OAEP_SHA1 ? "sha1" : "sha256";
   let raw;
@@ -955,7 +992,9 @@ export function decryptVault(payload, keys, opts = {}) {
       });
     }
     try {
-      const itemKeys = decryptItemKey(c.key, keys.privateKeyPem);
+      // An org cipher's item key is wrapped with the ORG key (type 2), not the account
+      // key; passing orgKey here is what makes organization-collection items readable.
+      const itemKeys = decryptItemKey(c.key, keys.privateKeyPem, orgKey);
       const item = new VaultItem(c, itemKeys, opts);
       // Writes (set-totp) MUST re-encrypt with the same key the fields carry; handing
       // them the account key would store ciphertext no client can read back.

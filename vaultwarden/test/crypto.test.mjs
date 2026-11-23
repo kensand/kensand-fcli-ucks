@@ -664,5 +664,49 @@ await t("mutation guard: an org cipher is NOT openable with the account key, and
   assert.match(item.errors.name, /MAC verification failed/, "a wrong key must read as a wrong key");
 });
 
+// The real-world shape that made a live vault report its credential as (undecryptable):
+// an item in an ORGANIZATION COLLECTION that also carries a per-item key. Official clients
+// wrap that item key with the ORG key as a type-2 AES-CBC-HMAC envelope, so the item key is
+// NOT RSA-OAEP even though the account has a perfectly good key pair. Only the TITLE being
+// unreadable is visible from outside, which is why this reads as "the item is missing".
+// The inner item key is the RAW 64 bytes (enc||mac) — Bitwarden encrypts the bytes, not a
+// base64 of them. Wrapping a base64 string here yields 86 bytes and is the fixture bug to avoid.
+const itemWrappedKey = refEncrypt(
+  Buffer.concat([okeys.encKey, okeys.macKey]),
+  okeys.encKey, okeys.macKey,
+);
+const orgCipherWithItemKey = {
+  id: "cipher-org-itemkey", type: 1, folderId: null, favorite: false,
+  organizationId: "org-1",
+  key: itemWrappedKey,
+  name: refEncrypt("npm-token", okeys.encKey, okeys.macKey),
+  notes: null,
+  login: {
+    username: null,
+    password: refEncrypt("npm_abc123", okeys.encKey, okeys.macKey),
+    totp: null, uris: [],
+  },
+  fields: [],
+};
+
+await t("org cipher whose PER-ITEM KEY is type 2 (org-wrapped) decrypts — the collection-item shape", () => {
+  const keysWithOrg = { ...acctKeys, privateKeyPem: rsaPem, orgKeys: { "org-1": okeys } };
+  const item = C.decryptVault({ ciphers: [orgCipherWithItemKey] }, keysWithOrg)[0];
+  assert.equal(item.name, "npm-token", "title must decrypt, or the item looks absent");
+  assert.equal(item.login.password, "npm_abc123");
+  assert.ok(!item.errors.key, `no key error expected, got ${JSON.stringify(item.errors)}`);
+});
+
+await t("mutation guard: a type-2 item key without its org key fails LOUDLY, never silently", () => {
+  const item = C.decryptVault({ ciphers: [orgCipherWithItemKey] }, { ...acctKeys, privateKeyPem: rsaPem })[0];
+  assert.equal(item.name, "(undecryptable)");
+  assert.match(item.errors.key, /organization's key/, "the cause must name the org key, not 'unsupported envelope'");
+  // And a WRONG org key must be rejected by the MAC, not produce garbage.
+  const bogus = { ...acctKeys, privateKeyPem: rsaPem, orgKeys: { "org-1": { encKey: crypto.randomBytes(32), macKey: crypto.randomBytes(32) } } };
+  const bad = C.decryptVault({ ciphers: [orgCipherWithItemKey] }, bogus)[0];
+  assert.equal(bad.name, "(undecryptable)");
+  assert.match(bad.errors.key, /MAC verification failed/);
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
