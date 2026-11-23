@@ -88,6 +88,8 @@ export function register(_ctx) {
       const home = process.env.HOME || "/";
 
       if (args.help || args.h) {
+        // Reached only in-process: `f <uck> --help` is routed to `f help <uck>`, which
+        // prints the desc, not this. Keep the usage in the desc too.
         process.stdout.write(
           "usage: f doctor [uck ...]\n" +
             "  f doctor              probe the capability layer (tools, dirs, buckets)\n" +
@@ -148,29 +150,30 @@ export function register(_ctx) {
             continue;
           }
           // The trap this uck exists for: a uck can be valid, registered and listed
-          // in `f` and still answer nothing at the CLI.
-          let cli;
+          // in `f` and still answer nothing at the CLI. Probe the BARE invocation and
+          // require content -- exit codes are useless here, because a failing CLI makes
+          // `f` exit non-zero for reasons unrelated to the uck under test.
+          let cli = "";
+          let errored = "";
           try {
-            const { stdout, stderr } = await run("f", [name, "--help"], {
+            const { stdout, stderr } = await run("f", [name], {
               timeout: 20000,
               encoding: "utf8",
             });
             cli = ((stdout || "") + (stderr || "")).trim();
           } catch (err) {
-            console.log(`FAIL\t${name}\tf ${name} --help errored: ${err.message.split("\n")[0]}`);
-            bad++;
-            continue;
+            errored = err.code === 124 ? "timed out" : `exited ${err.code ?? "non-zero"}`;
+            cli = ((err.stdout || "") + (err.stderr || "")).trim();
           }
           if (!cli) {
             console.log(
-              `SILENT\t${name}\tregisters ok (${found.bucket}) but \`f ${name} --help\` prints nothing — invoke it and see`,
+              `FAIL\t${name}\tregisters ok (${found.bucket}) but \`f ${name}\` ${errored || "exit 0"} and printed nothing — no usage path`,
             );
             bad++;
             continue;
           }
-          console.log(
-            `OK\t${name}\t${JSON.stringify(shape.desc)} — ${cli.split("\n")[0].slice(0, 60)}`,
-          );
+          const how = errored ? `no --help path; try \`f help ${name}\` (${errored})` : "prints usage";
+          console.log(`OK\t${name}\t${JSON.stringify(shape.desc)} — ${how}: ${cli.split("\n")[0].slice(0, 50)}`);
         }
         process.exitCode = bad ? 1 : 0;
         return;
@@ -216,6 +219,12 @@ export function register(_ctx) {
       for (const b of await Promise.all(buckets.map(bucket))) rows.push(b);
 
       const bad = rows.filter((r) => r.state !== "OK");
+      // A probe that cannot run must never report a healthy layer.
+      if (rows.length === 0) {
+        console.log("FAIL\tdoctor\tno checks ran — cannot claim the layer is healthy");
+        process.exitCode = 1;
+        return;
+      }
       for (const r of rows) console.log(`${r.state}\t${r.cmd}\t${r.detail}`);
       console.log(
         `${bad.length ? "DEGRADED" : "HEALTHY"}\t${rows.length - bad.length}/${rows.length} checks ok` +
