@@ -166,7 +166,28 @@ async function resolveHa(flagUrl, flagToken, credsApi, opts = {}) {
     return "error";
   };
   const read = async (name) => {
-    if (credsApi && typeof credsApi.get === "function") {
+    // Provider-backed creds live under a prefixed key (`mirror:<name>`), so a
+    // bare-store read answers "no such cred" for a secret `f creds get` prints
+    // happily. That is the SILENT failure class applied to credentials: a
+    // configured token reads as unset, and `f ha` then demands a token that
+    // already exists. Ask the creds API for the NAME; only fall back to a bare
+    // store read when no creds uck is reachable.
+    if (credsApi && typeof credsApi.resolveCred === "function") {
+      // ONE name per call, deliberately. resolveCred takes a candidate list, but a
+      // provider miss on an early candidate is answered `missing` for the whole
+      // call, so `["ha", "ha-token"]` reports nothing while `["ha-token"]` returns
+      // the token. Probing each name separately is the only ordering-independent
+      // read: a user's `ha` cred must not be able to hide their `ha-token`.
+      try {
+        const r = await credsApi.resolveCred({ names: [name], waitMs: opts.waitMs || 0 });
+        if (r && r.token) return r.token;
+        if (r && r.reason === "locked") return { locked: true };
+        // missing / no-store: fall through to the raw store read below.
+      } catch (e) {
+        if (classify(e) === "locked") return { locked: true };
+        /* store unreachable: not the same as "not configured" */
+      }
+    } else if (credsApi && typeof credsApi.get === "function") {
       try {
         return await credsApi.get(name);
       } catch (e) {
@@ -174,11 +195,28 @@ async function resolveHa(flagUrl, flagToken, credsApi, opts = {}) {
         return null;
       }
     }
-    try {
-      const r = await daemonCall({ op: "get", name }, state.socket || CRED_SOCKET);
-      if (r && r.ok) return r.value;
-      return null;
-    } catch { return null; }
+    // The mirror layer keeps provider-backed secrets (vaultwarden here) under a
+    // prefixed key, `mirror:<name>`. A bare read of `ha-token` is therefore a
+    // MISS even though `f creds get ha-token` prints the value: creds resolves the
+    // prefix, a raw `get` does not. Proving this was the whole difference between
+    // `f creds get ha-token` working and `f ha` claiming no token existed — the
+    // SILENT failure class applied to credentials, where a configured secret reads
+    // as unset. Read the prefixed key too, whenever the store is reachable.
+    if (state) {
+      for (const key of [name, "mirror:" + name]) {
+        try {
+          const r = await daemonCall({ op: "get", name: key }, state.socket || CRED_SOCKET);
+          if (r && r.ok && r.value != null && r.value !== "") return r.value;
+        } catch { /* store unreachable: not the same as "not configured" */ }
+      }
+    }
+    if (credsApi && typeof credsApi.rawCredRead === "function") {
+      try {
+        const r = await credsApi.rawCredRead([name, "mirror:" + name]);
+        if (r && r.token) return r.token;
+      } catch { /* nothing more to try without a store */ }
+    }
+    return null;
   };
 
   // combined cred (`ha` or host-named): `url|token`

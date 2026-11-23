@@ -237,12 +237,30 @@ async function withHa(flagUrl, flagToken, credsApi, fn) {
       "ha-token",
       "ha",
     ])];
-    const res =
-      credsApi && typeof credsApi.resolveCred === "function"
-        ? await credsApi.resolveCred({ names: candidates })
-        : credsApi && typeof credsApi.rawCredRead === "function"
-          ? await credsApi.rawCredRead(candidates)
-          : { token: null, reason: "no-store" };
+    // Probe candidates ONE NAME AT A TIME. resolveCred takes a list, but a
+    // provider miss on an early candidate is answered `missing` for the whole
+    // call: `["ha", "ha-token"]` reported no token while `["ha-token"]` alone
+    // returned it. So a bare `ha` cred must never be allowed to shadow `ha-token`.
+    let res = { token: null, reason: "no-store" };
+    if (credsApi && typeof credsApi.resolveCred === "function") {
+      let firstBad = null;
+      for (const one of candidates) {
+        const r = await credsApi.resolveCred({ names: [one] });
+        if (r && r.token != null) { res = r; break; }
+        if (!firstBad || (r && r.reason === "locked")) firstBad = r;
+        if (r && r.reason === "locked") break;
+      }
+      if (res.token == null && firstBad) res = firstBad;
+    }
+    // Same mirror-layer rule as `f ha`: a vault-backed cred is stored as
+    // `mirror:<name>`, so a bare-name read misses while `f creds get <name>`
+    // prints the value. Ask for the prefixed keys too.
+    if (res.token == null && credsApi && typeof credsApi.rawCredRead === "function") {
+      try {
+        const r = await credsApi.rawCredRead(candidates.flatMap((n) => [`mirror:${n}`]));
+        if (r && r.token != null) res = r;
+      } catch { /* no store reachable: report the original reason */ }
+    }
     if (res.token != null) {
       const v = String(res.token);
       // A combined `url|token` value is stored under `ha`/`<host>`; take the token part.
