@@ -537,7 +537,8 @@ export function register(_ctx) {
             c.on("error", () => finish("unreachable"));
           });
           // REDACTION SHAPE — `f creds get` REDACTS BY DEFAULT: it prints a fixed
-          // placeholder (`[redacted — pass --secrets to reveal]`, 37 bytes) and exits 0
+          // placeholder (`[redacted — pass --secrets to reveal]`: 37 CHARACTERS but 39 BYTES,
+          // because the em-dash is 3 bytes) and exits 0
           // whether or not the subject is a secret. Measured on this box: plain
           // `f creds get <cred> | wc -c` answers **37 for every cred**, so a "how many
           // bytes does this cred yield" check measures the WRAPPER, never the value. The
@@ -553,11 +554,49 @@ export function register(_ctx) {
           // `f creds ls --all` prints them as a BARE column — the list was empty and the
           // gate was vacuous while printing nothing. An empty probe set is therefore a
           // FAIL row, never a pass.
-          try {
-            const { stdout: lsAll } = await run("f", ["creds", "ls", "--all"], {
-              timeout: 30000,
-              encoding: "utf8",
+          // F_CREDS_LOCK_DIAG is a DIAGNOSTIC-INJECTION POINT for this gate only, for the
+          // same reason F_VW_FIXTURE_FILE exists above: the failure this branch reports is a
+          // LOCKED STORE, which no harness can produce without mutating the real creds store.
+          // It substitutes the execFile REJECTION (same shape: empty stdout, reason on stderr)
+          // so the FAIL direction can be PROVEN. No production path sets it.
+          let lsAll;
+          let lsAllReason = "";
+          if (process.env.F_CREDS_LOCK_DIAG) {
+            lsAllReason =
+              "injected: store unreadable (diagnostic only, no production path sets this)";
+          } else {
+            try {
+              lsAll = (
+                await run("f", ["creds", "ls", "--all"], {
+                  timeout: 30000,
+                  encoding: "utf8",
+                })
+              ).stdout;
+            } catch (e) {
+              // MISSING-VIA-THROW: `run` REJECTS on non-zero, `e.stdout` is then EMPTY and the
+              // reason lives only on stderr. The old code let this rejection fall through to the
+              // OUTER catch, which returned early -- so the empty-target-list FAIL below was
+              // UNREACHABLE in production and a locked store printed NO ROW AT ALL.
+              lsAllReason = String(((e && e.stderr) || (e && e.message) || "").toString())
+                .replace(/\s+$/, "")
+                .slice(0, 200);
+            }
+          }
+          if (lsAll === undefined) {
+            // The reason is pushed here rather than returned, because `rows` is the shared
+            // accumulator this whole function writes to and the enclosing block is not a
+            // function -- an early `return` here would skip every remaining gate. A MISSING
+            // row is indistinguishable from a healthy run, so the verdict must be a ROW.
+            rows.push({
+              cmd: "creds-redaction",
+              state: "FAIL",
+              detail:
+                "could not list local creds, so the redaction surface was NOT checked at " +
+                "all -- this is a COULD-NOT-READ verdict (not 'no creds configured', and " +
+                "never a pass). A locked or unreachable store produces exactly this. " +
+                (lsAllReason ? `Reason: ${lsAllReason}` : "Reason: <none captured>"),
             });
+          } else {
             const localNames = (lsAll || "")
               .split("\n")
               .map((l) => l.trim())
@@ -612,8 +651,8 @@ export function register(_ctx) {
                     "`f creds get` and exit 0 (" +
                     placeholder.map((g) => g.n).join(", ") +
                     "). All of them RESOLVE on the socket, so nothing is broken — but do " +
-                    "NOT pipe the CLI output onward: it is 37 chars of prose with an " +
-                    "em-dash (code 8212), and storing it yields a cred that resolves, " +
+                    "NOT pipe the CLI output onward: it is 37 characters (39 bytes) of prose " +
+                    "with an em-dash (code 8212), and storing it yields a cred that resolves, " +
                     "exits 0, then fails at the service. Use `--secrets`, or read the " +
                     "socket.",
                 });
@@ -642,8 +681,6 @@ export function register(_ctx) {
                 });
               }
             }
-          } catch {
-            /* creds unreachable: the vault row above already answered */
           }
         try {
           const { stdout } = await run("f", ["vaultwarden", "status"], {
