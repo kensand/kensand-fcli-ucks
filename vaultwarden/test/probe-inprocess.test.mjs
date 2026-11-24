@@ -172,12 +172,13 @@ async function freshModule({ mutate = null, mutateCfg = null } = {}) {
   // copying over the same path would hand back the previously-instantiated
   // module with its depth counter already dirty.
   const dir = path.join(TMP, `m${copySeq++}`);
-  // Copy into <root>/uck/vaultwarden so the uck's `../lib/uckmain.js` import
-  // still resolves — a lone copy of vaultwarden/ fails for a reason that has
-  // nothing to do with what is under test.
+  // Copy into <root>/vaultwarden. It deliberately has NO sibling `lib/`: the
+  // uck's probe guard is the inlined CONTRACT §P4 expression, so it imports
+  // nothing outside its own directory, and a copy that needs a bucket-level
+  // `lib/` would silently test a layout no published package can have.
+  // Re-derive the invariant with:
+  //   grep -rn 'from "\.\./' <bucket>/vaultwarden/*.js   (must print nothing)
   const root = path.join(dir, "root");
-  fs.mkdirSync(path.join(root, "lib"), { recursive: true });
-  fs.cpSync(path.join(UCK, "..", "lib"), path.join(root, "lib"), { recursive: true });
   const dest = path.join(root, "vaultwarden");
   fs.cpSync(UCK, dest, { recursive: true });
 
