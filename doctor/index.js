@@ -354,6 +354,147 @@ export function register(_ctx) {
 
       // Half-degraded credential layer: cache masks a dead issuer until the cache dies.
       if (seen.has("f")) {
+
+        const askSocket = (key) =>
+          new Promise((resolve) => {
+            let buf = "";
+            let done = false;
+            const finish = (v) => {
+              if (done) return;
+              done = true;
+              try {
+                c.destroy();
+              } catch {
+                /* already closed */
+              }
+              resolve(v);
+            };
+            const c = net.connect(path.join(HOME, ".f", ".creds.sock"), () => {
+              c.write(JSON.stringify({ op: "get", name: key }));
+            });
+            c.setTimeout(5000, () => finish("unreachable"));
+            c.on("data", (d) => (buf += d));
+            c.on("end", () => {
+              try {
+                const r = JSON.parse(buf);
+                if (r && r.ok && r.value != null && r.value !== "") finish("resolves");
+                else if (/no such cred/i.test(String(r && r.error))) finish("absent");
+                else finish("unresolvable");
+              } catch {
+                finish("unreachable");
+              }
+            });
+            c.on("error", () => finish("unreachable"));
+          });
+          // REDACTION SHAPE — `f creds get` REDACTS BY DEFAULT: it prints a fixed
+          // placeholder (`[redacted — pass --secrets to reveal]`, 37 bytes) and exits 0
+          // whether or not the subject is a secret. Measured on this box: plain
+          // `f creds get <cred> | wc -c` answers **37 for every cred**, so a "how many
+          // bytes does this cred yield" check measures the WRAPPER, never the value. The
+          // class has real damage behind it: `f creds get X | f creds set X` once stored
+          // that placeholder as a live credential, and every consumer then died with a
+          // ByteString error on code 8212 (the em-dash). `--secrets` DOES reveal the value
+          // (verified: gh-token 40B `ghp…`, grafana-token 46B `glsa…`, ha-host 31B), so
+          // the row below is about the DEFAULT path a script is most likely to pipe.
+          //
+          // REACHABILITY IS ASSERTED, not assumed. A gate whose target list is silently
+          // empty prints byte-identical output to one that checked everything and found
+          // nothing. My first version parsed local names with a `^name\t` regex, but
+          // `f creds ls --all` prints them as a BARE column — the list was empty and the
+          // gate was vacuous while printing nothing. An empty probe set is therefore a
+          // FAIL row, never a pass.
+          try {
+            const { stdout: lsAll } = await run("f", ["creds", "ls", "--all"], {
+              timeout: 30000,
+              encoding: "utf8",
+            });
+            const localNames = (lsAll || "")
+              .split("\n")
+              .map((l) => l.trim())
+              .filter(
+                (n) =>
+                  n &&
+                  !n.startsWith("mirror:") &&
+                  !/[\t ]/.test(n) &&
+                  !/^[#-]/.test(n) &&
+                  !/^[a-z-]+\.[a-z-]+$/i.test(n), // drop `vaultwarden.*` metadata rows
+              )
+              .slice(0, 3);
+            if (localNames.length === 0) {
+              rows.push({
+                cmd: "creds-redaction",
+                state: "FAIL",
+                detail:
+                  "found no local cred names to probe — cannot claim the redaction " +
+                  "surface is healthy (an empty target list is a broken probe, not a pass)",
+              });
+            } else {
+              // One BARE argv per name (what a script pipes) plus the socket verdict for
+              // the same key. Never print a value: shape and length only.
+              const got = await Promise.all(
+                localNames.map(async (n) => {
+                  let out = "";
+                  try {
+                    out = (
+                      await run("f", ["creds", "get", n], {
+                        timeout: 20000,
+                        encoding: "utf8",
+                      })
+                    ).stdout;
+                  } catch (e) {
+                    out = (e && e.stdout) || "";
+                  }
+                  return {
+                    n,
+                    out: (out || "").replace(/\r?\n$/, ""),
+                    sock: await askSocket(n),
+                  };
+                }),
+              );
+              const placeholder = got.filter((g) => /^\[redacted/.test(g.out));
+              if (placeholder.length) {
+                rows.push({
+                  cmd: "creds-redaction",
+                  state: "INFO",
+                  detail:
+                    `${placeholder.length}/${got.length} local cred(s) print the ` +
+                    "`[redacted — pass --secrets to reveal]` placeholder on bare " +
+                    "`f creds get` and exit 0 (" +
+                    placeholder.map((g) => g.n).join(", ") +
+                    "). All of them RESOLVE on the socket, so nothing is broken — but do " +
+                    "NOT pipe the CLI output onward: it is 37 chars of prose with an " +
+                    "em-dash (code 8212), and storing it yields a cred that resolves, " +
+                    "exits 0, then fails at the service. Use `--secrets`, or read the " +
+                    "socket.",
+                });
+              }
+              // CONTRADICTION: the store holds a value but the CLI hands back something
+              // that is neither the placeholder nor plausibly the secret. A SIZE check
+              // alone would miss a redaction regression (both sides short, non-empty), so
+              // compare CONTENT against the socket verdict.
+              const contradicted = got.filter(
+                (g) =>
+                  g.sock === "resolves" &&
+                  !/^\[redacted/.test(g.out) &&
+                  g.out.length > 0 &&
+                  g.out.length < 8,
+              );
+              if (contradicted.length) {
+                rows.push({
+                  cmd: "creds-redaction",
+                  state: "RISK",
+                  detail:
+                    `${contradicted.length} cred(s) RESOLVE on the socket but ` +
+                    "`f creds get` returned a tiny string (" +
+                    contradicted.map((g) => `${g.n}=${g.out.length}B`).join(", ") +
+                    ") — neither a secret nor the known placeholder, so the CLI is not " +
+                    "handing consumers the value the store holds.",
+                });
+              }
+            }
+          } catch {
+            /* creds unreachable: the vault row above already answered */
+          }
         try {
           const { stdout } = await run("f", ["vaultwarden", "status"], {
             timeout: 30000,
@@ -426,37 +567,7 @@ export function register(_ctx) {
               // nested command here can trip a vault re-auth (a 400 retry can lock the
               // account). The daemon answers exact keys only, so `mirror:<name>` is
               // asked explicitly.
-              const askSocket = (key) =>
-                new Promise((resolve) => {
-                  let buf = "";
-                  let done = false;
-                  const finish = (v) => {
-                    if (done) return;
-                    done = true;
-                    try {
-                      c.destroy();
-                    } catch {
-                      /* already closed */
-                    }
-                    resolve(v);
-                  };
-                  const c = net.connect(path.join(HOME, ".f", ".creds.sock"), () => {
-                    c.write(JSON.stringify({ op: "get", name: key }));
-                  });
-                  c.setTimeout(5000, () => finish("unreachable"));
-                  c.on("data", (d) => (buf += d));
-                  c.on("end", () => {
-                    try {
-                      const r = JSON.parse(buf);
-                      if (r && r.ok && r.value != null && r.value !== "") finish("resolves");
-                      else if (/no such cred/i.test(String(r && r.error))) finish("absent");
-                      else finish("unresolvable");
-                    } catch {
-                      finish("unreachable");
-                    }
-                  });
-                  c.on("error", () => finish("unreachable"));
-                });
+              // askSocket is hoisted above, shared with the redaction gate.
               const expired = mirrors.filter((m) => m.at <= now);
               const verdicts = await Promise.all(
                 expired.map(async (m) => ({ m, v: await askSocket(m.name) })),
