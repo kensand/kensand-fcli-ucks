@@ -13,7 +13,7 @@ trusting any observation you did not make in this run.
 ```
 f doctor              # capability layer: tools, dirs, git buckets, credential health
 f doctor --all        # audit EVERY uck in every bucket (22 ucks, ~90s: forks one CLI each)
-f doctor ha-ws kuma   # is a specific uck actually live?
+f doctor ha kuma      # is a specific uck actually live?
 f doctor --json       # machine-readable: one JSON object, {mode,health,ok,total,rows}
 ```
 
@@ -51,8 +51,10 @@ never mistaken for "every flag of this uck works".
 1. **`SILENT` is not `OK`.** A uck can pass `f uck check`, appear in the `f` command
    table, and still print literally nothing with exit 0. f's dispatcher does
    `const result = await uck.run(...)` and only reads a **number** return, so a uck that
-   *returns* its result strings instead of writing stdout is mute on every path (`ha-ws`
-   did exactly this). Only a content check catches it: `f doctor <uck>`.
+   *returns* its result strings instead of writing stdout is mute on every path (a uck
+   of ours did exactly this, and the fix commit is the only record of which one — name
+   the MECHANISM here, not a uck that may not exist next month). Only a content check
+   catches it: `f doctor <uck>`.
 2. **A flag can be silently ignored — which is worse than silence, because the output
    looks fine.** f hands a uck `run(rest, args, ctx)` where
    `args = uck.argv?.(rest) ?? { _: rest }`. Unless the uck declares an `argv:` hook

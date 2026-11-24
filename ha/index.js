@@ -992,6 +992,82 @@ async function cmdWs(base, token, rest) {
       err("helper subcommand must be ls|ls-all|new|update|rm");
     }
 
+    // ---- automation config over the WS config store ----
+    // Ported from the retired `ha-ws` uck. The message families differ on
+    // purpose: `conf` talks to /api/config/<type>/config/<id> (HA's HTTP config
+    // endpoints), this talks to config/automation/{list,get,create_update,
+    // delete} — two transports onto the same .storage records, kept distinct so a
+    // transport-level HA quirk stays attributable to one of them.
+    if (sub === "auto") {
+      const [asub, ...aa] = a;
+
+      if (!asub || asub === "ls") {
+        const r = await call("config/automation/list");
+        if (r.success) {
+          const items = r.result?.automations ?? r.result ?? [];
+          outLines(items.map((x) => `  ${x.id}  ${x.alias ?? ""}`));
+          return;
+        }
+        // HA has no config/automation/list on every version; the state machine
+        // still carries the .storage id, so enumerate there instead of failing.
+        const st = await call("get_states");
+        const autos = (st.result || []).filter((s) => s.entity_id.startsWith("automation."));
+        outLines([
+          `${autos.length} automations (via states; config/automation/list unsupported:`,
+          `  ${r.error?.message || "?"})`,
+          ...autos.map((s) => `  ${s.attributes?.id ?? "?"}  ${s.entity_id}  ${s.state}`),
+        ]);
+        return;
+      }
+
+      if (asub === "get") {
+        if (!aa[0]) err("ws auto get needs an automation id");
+        const r = await call("config/automation/get", { automation_id: aa[0] });
+        out(JSON.stringify(r.success ? r.result : r.error, null, 2));
+        return;
+      }
+
+      if (asub === "put") {
+        // Writes a real automation. Deliberately loud, and never implied by a
+        // bare name: `f ha auto <name>` TRIGGERS, so this lives under `ws`.
+        const id = aa[0];
+        if (!id) err("ws auto put needs an automation id");
+        let cfg;
+        try {
+          cfg = JSON.parse(aa.slice(1).join(" "));
+        } catch (e) {
+          err(`config must be JSON: ${e.message}`);
+        }
+        const r = await call("config/automation/create_update", { automation_id: id, ...cfg });
+        out(r.success ? `saved ${id}` : `error: ${JSON.stringify(r.error, null, 2)}`);
+        return;
+      }
+
+      if (asub === "del") {
+        if (!aa[0]) err("ws auto del needs an automation id");
+        const r = await call("config/automation/delete", { automation_id: aa[0] });
+        out(r.success ? `deleted ${aa[0]}` : `error: ${JSON.stringify(r.error, null, 2)}`);
+        return;
+      }
+
+      if (asub === "call") {
+        const svc = aa[0];
+        if (!svc || !svc.includes(".")) err("ws auto call needs <domain>.<service>");
+        const [domain, service] = svc.split(".", 2);
+        let data;
+        try {
+          data = JSON.parse(aa.slice(1).join(" ") || "{}");
+        } catch (e) {
+          err(`data must be JSON: ${e.message}`);
+        }
+        const r = await call("call_service", { domain, service, ...data });
+        out(r.success ? `ok ${domain}.${service}\n${JSON.stringify(r.result ?? {}, null, 2)}` : `error: ${JSON.stringify(r.error, null, 2)}`);
+        return;
+      }
+
+      err("ws auto subcommand must be ls|get|put|del|call");
+    }
+
     out(`f ha ws: unknown subcommand: ${sub}\n\n${wsUsage()}`);
   });
 }
@@ -1005,7 +1081,13 @@ function wsUsage() {
     "  ws helper ls [type]          list helpers\n" +
     "  ws helper new <type> <name> <json>\n" +
     "                               create helper (timer, input_*, counter, schedule)\n" +
-    "  ws helper rm <type> <name>   delete helper"
+    "  ws helper rm <type> <name>   delete helper\n" +
+    "  ws auto ls                   automations (config store, falls back to states)\n" +
+    "  ws auto get <id>             one automation's config\n" +
+    "  ws auto put <id> <json>      create/update automation config (WRITES)\n" +
+    "  ws auto del <id>             delete an automation (WRITES)\n" +
+    "  ws auto call <dom>.<svc> <json>\n" +
+    "                               call an action over ws, print response_data"
   );
 }
 
@@ -1030,6 +1112,8 @@ function usage() {
     "  conf validate <json>       check a config without saving (Admin)\n" +
     "  ws whoami|types|raw|sub      WebSocket API: helpers + registry views REST lacks\n" +
     "  ws helper ls|new|rm          create timer/input_* helpers (ws-only in HA)\n" +
+    "  ws auto [ls|get <id>|put <id> <json>|del <id>|call <dom>.<svc> <json>]\n" +
+    "                             automation config over the WS store (see `conf`)\n" +
     "  history <entity...> [-s start] [-e end] [--minimal]\n" +
     "                             state changes (times: ISO or 30m/2h/1d/1w ago)\n" +
     "  weather [entity]           current weather\n" +

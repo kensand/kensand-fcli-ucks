@@ -120,6 +120,21 @@ availability is genuinely per-build and per-domain.
 revalidates every field, so `name` must be resent or the update is rejected. Passing a
 partial config is the most common failure.
 
+### ws auto — automation config over the ws config store
+
+`f ha ws auto ls|get <id>|put <id> <json>|del <id>|call <domain>.<service> <json>` speaks
+`config/automation/{list,get,create_update,delete}` and `call_service`. This is a **second
+transport onto the same `.storage` records** that `conf` edits through
+`/api/config/automation/config/<id>` — not a capability `conf` lacks. On this build both
+`config/automation/list` and `config/automation/get` answer `unknown_command`, so `ls`
+falls back to enumerating `get_states` (where the `.storage` id survives as an attribute)
+and **prefer `conf get` for reading a config**. `put`/`del`/`call` are writes.
+
+Automation config never lives under `f ha auto`: `f ha auto <name>` *triggers* that
+automation, so a subcommand-shaped name there (`auto get`) would be a live actuation on a
+typo. Read/write verbs stay under `ws`/`conf`, where the only bare-name path is the
+documented trigger.
+
 The WebSocket client must handle the HTTP/1.1 101 response via `req.on("upgrade")`. Using
 the `https.request` response callback looks right and silently never fires, because Node
 routes 101s away from that callback — it presents as "connection hangs" with no error.
