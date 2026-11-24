@@ -31,8 +31,8 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-
-import { uckMain } from "../lib/uckmain.js";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { captureSsoCode } from "./lib/sso-callback.js";
 import {
@@ -1729,11 +1729,32 @@ async function probe(argv) {
 }
 
 // Dispatch: `f vaultwarden …` goes through run(); direct execution is a probe.
-uckMain(import.meta.url, async (argv) => {
+//
+// The entry guard is INLINED on purpose: it is the implied contract of CONTRACT §P4,
+// not a shared file. A `../lib/uckmain.js` import satisfies f when f imports this
+// module in-process, and breaks when the SAME module is spawned as a probe child,
+// because `node <uck>/index.js …` resolves node_modules (and `../`) from the UCK
+// directory (CONTRACT §P7). Re-derive the rule with:
+//   grep -rn 'from "\.\./' ~/.f/ucks/*/*/index.js
+const isMain = (metaUrl, argv = process.argv) => {
+  const self = argv[1];
+  if (!self) return false;
+  try {
+    return pathToFileURL(realpathSync(self)).href === metaUrl;
+  } catch {
+    return false;
+  }
+};
+
+if (isMain(import.meta.url)) {
+  // probeSubs is duplicated from run()'s dispatch on purpose: the probe path must not
+  // reach main(), and the list is short enough that a comment beats an indirection.
   const probeSubs = new Set(["resolve", "has", "status", "list", "--dump"]);
-  if (probeSubs.has(argv[0])) return probe(argv);
-  return main(argv);
-});
+  const argv = process.argv.slice(2);
+  Promise.resolve(probeSubs.has(argv[0]) ? probe(argv) : main(argv))
+    .then((code) => { if (typeof code === "number" && code !== 0) process.exitCode = code; })
+    .catch((e) => { process.stderr.write(`f: ${e?.message ?? e}\n`); process.exitCode = 1; });
+}
 
 export default { register, credentialProvider };
 
