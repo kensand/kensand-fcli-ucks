@@ -359,16 +359,33 @@ export function register(_ctx) {
             timeout: 30000,
             encoding: "utf8",
           });
-          const text = stdout || "";
+          // F_VW_FIXTURE_FILE is a DIAGNOSTIC-INJECTION POINT for this gate only: it lets the
+          // real decision code below run on captured/known-bad `status` output WITHOUT another
+          // vault login (a 400 must never be retried - lockout). No production path sets it.
+          const statusFixture = process.env.F_VW_FIXTURE_FILE;
+          const text = statusFixture
+            ? readFileSync(statusFixture, "utf8")
+            : stdout || "";
+          // `status` prints `provider vaultwarden ready` as its FIRST line and the failure
+          // further down, so "ready" is never the predicate -- the predicate is the ABSENCE of
+          // these markers in the same stdout. Distinguish the two shapes: a REFUSED LOGIN is
+          // kenny's to fix (and must not be retried), a TRANSPORT failure is this box's. They
+          // used to collapse into one row that asserted "cached mirrors still resolve", which is
+          // false whenever a mirror has already lapsed -- so report measured facts, not a guess.
           const refused = /token refresh failed|session failed|HTTP 400/.test(text);
-          if (refused) {
+          const transport = /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|fetch failed/i.test(text);
+          if (refused || transport) {
             rows.push({
               cmd: "creds",
               state: "RISK",
               detail:
-                "vault re-auth refused (HTTP 400) — cached mirrors still resolve, so " +
-                "Forgejo/GitHub patrol LOOKS green and goes dark when the cache expires. " +
-                "Do not retry login (lockout risk); needs operator `f vaultwarden config`",
+                (transport && !refused
+                  ? "vault unreachable (transport error) -- credential layer unverified"
+                  : "vault re-auth refused (HTTP 400)") +
+                " -- vault-side renewal is down, so an expired mirror CANNOT be re-fetched and a " +
+                "vault-only cred read with --no-cache fails outright. Cached/local creds keep " +
+                "working, which is why patrol can look green; the rows below name what is actually " +
+                "unreadable. Do not retry a login (lockout risk); needs operator `f vaultwarden config`",
             });
           } else {
             // What decides whether provider creds keep resolving is the per-name
