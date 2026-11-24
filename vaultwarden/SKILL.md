@@ -369,5 +369,5 @@ test suite did not catch it because the fixtures base64-wrapped the key exactly 
 the buggy code did. A fixture that agrees with the code it tests proves nothing;
 these ones are pinned to bytes read off a real server.
 
-If `f providers` does not list `vaultwarden`, the uck failed to load: run
+If `f search providers` finds no uck and `f creds status` omits `vaultwarden`, the uck failed to load: run
 `f vaultwarden status` and read the error.

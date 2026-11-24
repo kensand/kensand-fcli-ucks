@@ -215,9 +215,9 @@ contract, this one is one implementation of it. The parts that bite, in short:
   "not mine" from a network timeout would suppress `resolve` and make the vault look
   empty instead of broken.
 - `mirrorTtlSec: 3600` is a floor, clamped to the daemon's remaining unlocked lifetime.
-- Provider module scope must be side-effect free — `f providers --dump` evaluates it in
+- Provider module scope must be side-effect free — provider discovery evaluates it in
   every `f` process, including unrelated ones.
-- If `f providers` does not list `vaultwarden`, the uck failed to load. Run
+- If no provider surface lists `vaultwarden`, the uck failed to load. Run
   `f vaultwarden status` and read the error.
 
 ## How it works
@@ -295,7 +295,7 @@ second one mattered.
 
 ```bash
 f vaultwarden status              # readiness + what it can answer
-f providers                       # is the uck registered at all?
+f search providers                # which uck can answer provider questions?
 VW_TRACE=1 f vaultwarden <cmd>    # stack trace instead of one line
 ```
 

@@ -424,7 +424,7 @@ await t("provider probes must not re-enter discovery (fork bomb)", () => {
   const sample = setInterval(() => { peak = Math.max(peak, count()); }, 20);
   let probeOut;
   try {
-    // `status` is the probe `f providers` actually execs, and the entrypoint that
+    // `status` is the probe command the provider entrypoint actually handles, and the shape that
     // detonated. Run it exactly that way: node <entry> status.
     probeOut = execFileSync(process.execPath, [UCK_INDEX, "status"], { encoding: "utf8", timeout: 60000, env });
   } finally {
@@ -442,7 +442,7 @@ await t("provider probes must not re-enter discovery (fork bomb)", () => {
  * The bug was real: `f creds` status called a provider's status() probe, which
  * shelled out to `f creds` again, unbounded; one configured provider reached 2,638
  * live processes. The fix is the F_CREDS_NO_PROVIDER marker, honoured in
- * creds/providers.js and propagated to the `f providers --dump` it spawns.
+ * creds/providers.js and propagated to whatever command spawns this entrypoint.
  *
  * Every assertion we wrote for it passed with the fix removed, and we verified why:
  * reproducing the cycle needs the store UNLOCKED and a provider configured. With a
@@ -455,7 +455,7 @@ await t("provider probes must not re-enter discovery (fork bomb)", () => {
  *   f creds unlock
  *   f vaultwarden config --email <you>   # plus api key + master password
  *   watch -n0.2 'pgrep -c -f vaultwarden/index.js' &   # must stay in single digits
- *   f creds status; f providers; f vaultwarden status
+ *   f creds status; f search providers; f vaultwarden status
  * If the probe count climbs into the hundreds, the guard has regressed.
  */
 

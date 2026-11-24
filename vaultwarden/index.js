@@ -119,10 +119,10 @@ function saveVwConfig(patch) {
  * True when we are running *inside* credential-provider discovery.
  *
  * Without this the whole thing is a fork bomb. `status()` needs the creds store,
- * so it shells out to `f creds …`; but `f creds status` (and `f providers`)
+ * so it shells out to `f creds …`; but `f creds status` (and any provider-listing verb)
  * discovers providers, and discovery calls each provider's `status()` — which
  * shells out to `f` again. Every level spawns another, so a single
- * `f vaultwarden status` or `f providers` multiplies into thousands of processes
+ * `f vaultwarden status` or a provider-listing verb multiplies into thousands of processes
  * until the box stops responding. Observed for real: 2,643 live processes.
  *
  * The cycle: `status()` reads the creds store, which means spawning `f creds …`;
@@ -1025,7 +1025,13 @@ const describe = (i) => `${i.name} [${i.id}] ${i.fieldSummary().join(",")}`;
 /* ---------------------------------------------------------- provider API */
 
 /**
- * The provider object `f creds` discovers via `f providers --dump`.
+ * The provider object `f creds` discovers by IMPORTING this module — never by a
+ * verb name. Which surface can ANSWER depends on which tree `f` loads, so assert
+ * nothing about a verb; re-derive with `f search providers` (lists the uck that
+ * answers) plus, in the source repo, `git ls-tree -r --name-only origin/main |
+ * grep -E '^providers/'` (0 files = the standalone uck is gone; `f creds
+ * providers` is the source-tree form, and an installed bundle may still ship the
+ * old `providers` uck until it is rebuilt, so BOTH can resolve at once).
  *
  * resolve() throws on availability failures (locked store, wrong master
  * password, dns) so creds reports them instead of saying "no such cred".
@@ -1088,7 +1094,7 @@ async function providerStatus(cfg) {
     sso = !!(await credsGet(C_REFRESH));
   } catch (e) {
     // A throwing store read must not escape readiness: `f creds status` /
-    // `f providers` call this for EVERY provider, so one throw here took the
+    // the provider sweep calls this for EVERY provider, so one throw here took the
     // whole readiness line down. Degrade to a named, non-fatal state.
     const m = String(e?.message ?? e).replace(/^f:\s*/gm, "").trim();
     return { ready: false, reason: "store-error", note: `store-error: ${m.split("\n")[0].slice(0, 120)}`, hint: "f creds status   (is the daemon running?)" };
