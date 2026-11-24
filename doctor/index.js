@@ -352,6 +352,156 @@ export function register(_ctx) {
         seen.add(r.cmd);
       }
 
+      // PATROL CHANNELS. Every patrol lane resolves its server through a NAME before it
+      // touches the service, and a name can die while the service is perfectly healthy --
+      // which is exactly how `f ha` went dark for a whole run: `homeassistant.local` is
+      // mDNS-only (RFC 6762), never sent to unicast DNS, and this box has no mDNS
+      // responder, so `f ha ls` said `fetch failed` and read like an HA outage. HA was up
+      // at 10.1.5.5:8123 the entire time and `f kuma watch` reported 26/27 UP, so nothing
+      // else noticed. The existing rows cannot see this class: the vault/creds rows ask
+      // whether a SECRET resolves and the service rows ask whether an ENDPOINT answers --
+      // neither asks whether the host even NAMES, and "host unresolvable" and "service
+      // down" need different fixes (DNS/mDNS vs. the service).
+      //
+      // EMITS UNCONDITIONALLY. A gate that prints a row only when it finds something is
+      // indistinguishable from a gate that never ran, and I have been fooled by that twice.
+      // So this block always prints one row naming how many hosts it checked.
+      //
+      // ASKS ONLY FOR THE HOST, NEVER THE CREDENTIAL: `urls`-shaped verbs print a resolved
+      // base and exit before connecting (verified in ha/index.js and mqtt/index.js -- they
+      // `out()` then `return`), and grafana's base is a cred/env/DEFAULT_HOST read with no
+      // HTTP call. That keeps this block free of both service writes and vault logins, so
+      // running it can never trip a 400/429 login refusal. kuma has no `urls` verb and its
+      // base is a hardcoded default (overridable by KUMA_URL), read from source instead.
+      const channels = [];
+      {
+        const readBase = async (argv) => {
+          // Distinguish THREE outcomes, because collapsing them manufactures a false verdict:
+          // (a) stdout on success, (b) stderr when the CLI exits non-zero, (c) genuinely empty.
+          // execFile REJECTS on non-zero, and `e.stdout` is then EMPTY while the explanation is
+          // on stderr -- a gate that kept only stdout would report "no base url resolved" for a
+          // BROKEN TOOL, which is the same masking this whole block exists to prevent.
+          try {
+            const { stdout } = await run("f", argv, { timeout: 25000, encoding: "utf8" });
+            return { out: String(stdout || ""), err: "" };
+          } catch (e) {
+            return {
+              out: String((e && e.stdout) || ""),
+              err: String((e && e.stderr) || (e && e.message) || ""),
+            };
+          }
+        };
+        const hostOf = (s) => {
+          const m = String(s || "").match(/\bhttps?:\/\/([^/\s"',]+)/i);
+          return m ? m[1].split(":")[0] : null;
+        };
+        const resolves = (host) =>
+          new Promise((resolve) => {
+            run("getent", ["ahosts", host], { timeout: 8000, encoding: "utf8" })
+              .then((r) => resolve(/\S/.test(r.stdout || "") ? r.stdout.trim().split(/\s+/)[0] : null))
+              .catch(() => resolve(null));
+          });
+
+        const haOut = await readBase(["ha", "urls"]);
+        // grafana has NO `urls` verb (verified: `grep -n urls grafana/index.js` -> nothing),
+        // so its base is read the same way its own resolve() reads it -- a cred lookup, no
+        // HTTP call, no login. A bare read may be mirror-blind, hence the explicit mirror:
+        // key too. `--secrets` only: bare `f creds get` prints the 37-byte redaction
+        // placeholder, which would be parsed as a hostname.
+        let grafBase = { out: "", err: "" };
+        for (const nm of ["grafana-host", "mirror:grafana-host"]) {
+          const v = await readBase(["creds", "get", nm, "--secrets"]);
+          const s = v.out;
+          if (/^\[redacted/.test(s)) continue;
+          if (/no such cred|not found|^\s*$/i.test(s)) continue;
+          grafBase = v; break;
+        }
+        const mqttOut = await readBase(["mqtt", "urls"]);
+        // A lane whose command FAILED is NOT a lane with no config -- say which, using the
+        // CLI's own words rather than inventing a diagnosis.
+        const failed = [];
+        const kumaHost = hostOf(process.env.KUMA_URL || "https://uptime.kensand.net") || null;
+
+        const wanted = [
+          { lane: "ha", read: haOut, host: hostOf(haOut.out) },
+          { lane: "grafana", read: grafBase, host: hostOf(grafBase.out) || hostOf(process.env.GRAFANA_URL || "https://grafana.kensand.net") },
+          { lane: "kuma", read: null, host: kumaHost },
+          {
+            lane: "mqtt",
+            read: mqttOut,
+            host: (() => {
+              const l = String(mqttOut.out)
+                .split("\n")
+                .map((x) => x.trim())
+                .find((x) => x.startsWith("broker="));
+              return l ? l.slice(7).split(":")[0] : null;
+            })(),
+          },
+        ];
+        for (const w of wanted) {
+          if (w.read && !w.read.out && w.read.err)
+            failed.push(`${w.lane}: ${w.read.err.replace(/\r?\n/g, " ").split("Command failed")[0].trim().slice(0, 90) || "command failed"}`);
+          if (!w.host) {
+            channels.push({ lane: w.lane, host: null, ip: null });
+            continue;
+          }
+          channels.push({ lane: w.lane, host: w.host, ip: await resolves(w.host) });
+        }
+        if (failed.length) {
+          rows.push({
+            cmd: "patrol-channels",
+            state: "RISK",
+            detail:
+              `could not read the configured base for ` +
+              failed.join(" | ") +
+              " -- that is a BROKEN TOOL or an unreadable cred, NOT proof the lane is " +
+              "unconfigured, so no host-resolvability claim is made for it.",
+          });
+        }
+
+        const dead = channels.filter((c) => c.host && !c.ip);
+        const unknown = channels.filter((c) => !c.host);
+        if (dead.length) {
+          rows.push({
+            cmd: "patrol-channels",
+            state: "RISK",
+            detail:
+              `${dead.length} patrol lane(s) point at a host that DOES NOT RESOLVE ` +
+              "(" +
+              dead.map((d) => `${d.lane}=${d.host}`).join(", ") +
+              "). This is NOT an outage: the service may be healthy while the NAME is " +
+              "dead, and every consumer then reports `fetch failed`/`connect timeout`, " +
+              "which reads as the service being down. Check DNS, or mDNS -- a `.local` " +
+              "name is mDNS-only (RFC 6762) and is NEVER sent to unicast DNS, so it needs " +
+              "a responder like avahi. Fix the NAME first; any baseline measured through " +
+              "this lane is a quotation, not evidence, until it resolves.",
+          });
+        }
+        if (unknown.length) {
+          rows.push({
+            cmd: "patrol-channels",
+            state: "INFO",
+            detail:
+              `no base url resolved for ` +
+              unknown.map((u) => u.lane).join(", ") +
+              " -- that lane's host could not be audited (unset cred or no `urls` verb), " +
+              "which is not the same as it being healthy.",
+          });
+        }
+        const okHosts = channels.filter((c) => c.host && c.ip);
+        if (okHosts.length) {
+          rows.push({
+            cmd: "patrol-channels",
+            state: "INFO",
+            detail:
+              `${okHosts.length}/${channels.length} patrol host(s) RESOLVE (` +
+              okHosts.map((c) => `${c.lane}=${c.host}`).join(", ") +
+              "). Name resolution only -- a row here never claims the service answered, " +
+              "and a lane whose host is missing above was not checked at all.",
+          });
+        }
+      }
+
       // Half-degraded credential layer: cache masks a dead issuer until the cache dies.
       if (seen.has("f")) {
 
