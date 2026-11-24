@@ -150,6 +150,35 @@ Consumer rule: ask creds' own `resolveCred` first (CONTRACT §6.1), and if you m
 socket, read **both** `name` and `mirror:name`. `gh`, `ssh` and `ha` are verified
 mirror-aware. A single miss is weak evidence, not proof of absence.
 
+## Patrol channels (`patrol-channels`)
+
+Every patrol lane resolves its server through a **name** before it touches the service, and a
+name can die while the service is perfectly healthy. `f ha` went dark for a whole heartbeat
+this way: `homeassistant.local` is mDNS-only (RFC 6762), never sent to unicast DNS, and this
+box has no mDNS responder — so `f ha ls` answered `fetch failed` and read like an HA outage
+while HA was up at `10.1.5.5:8123` and `f kuma watch` reported 26/27 UP. Neither the creds
+rows (does a SECRET resolve) nor the service rows (does an ENDPOINT answer) can see this,
+and "host unresolvable" and "service down" need different fixes.
+
+So this gate asks `getent ahosts <host>` for each lane's resolved base (`ha urls`, `mqtt
+urls`, a `grafana-host` cred read, kuma's configured default) and reports:
+
+- **`RISK` host does not resolve** — check DNS, or mDNS for a `.local` name. NOT an outage.
+- **`RISK` could not read the configured base** — the lane's command FAILED, which means a
+  broken tool or an unreadable cred. That is deliberately NOT reported as "unconfigured":
+  `execFile` rejects on non-zero and leaves `e.stdout` empty, so a stdout-only gate would
+  silently rename "broken" into "not set up".
+- **`INFO` N hosts resolve** — name resolution only; it never claims the service answered.
+
+It **emits unconditionally**, because a gate that prints a row only when it finds something is
+indistinguishable from a gate that never ran. It asks only for the HOST, never the credential:
+the `urls`-shaped verbs print a resolved base and return before connecting, and grafana's base
+is a cred/env/default read with no HTTP call — so running this gate can never trip a service
+write or a vault login.
+
+Consequence worth remembering: **a patrol baseline is a claim about its transport.** While a
+lane's host is unresolvable, every number measured through it is a quotation, not evidence.
+
 ## Buckets (`RISK`)
 
 `f up` resets every clean git bucket to origin. `f doctor` flags the state that actually
