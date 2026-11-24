@@ -25,7 +25,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath as _f2p } from "node:url";
-import { resolveCred } from "../lib/credsresolve.js";
+// Vendored copy, deliberately not `../lib/credsresolve.js`. CONTRACT §P7: a probe/child
+// invocation resolves paths from the UCK directory, so a bucket-level `../` import works
+// when f imports this module in-process and throws ERR_MODULE_NOT_FOUND when the module is
+// reached as a child -- and a uck whose import throws silently disappears from `f`.
+// Re-derive who still imports the shared dir with:
+//   grep -rn 'from "\.\./' ~/.f/ucks/*/*/index.js
+import { resolveCred } from "./credsresolve.js";
 
 const _here = path.dirname(_f2p(import.meta.url));
 

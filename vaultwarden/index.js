@@ -29,11 +29,9 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import readline from "node:readline";
-import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { execFileSync, spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
 import { captureSsoCode } from "./lib/sso-callback.js";
 import {
   VaultwardenApi,
