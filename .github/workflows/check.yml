@@ -1,0 +1,99 @@
+name: check
+
+# What this bucket is: independent CLI ucks, no build step, no shared runtime lib.
+# So CI has exactly two things worth asserting, and both are cheap:
+#   1. every uck still parses and still exposes register(ctx) -> {name, desc, run}
+#   2. every uck that declares dependencies can install them from a CLEAN checkout --
+#      lockfiles are gitignored in this bucket, so a fresh clone of gh/fj/mqtt has no
+#      node_modules and nothing else on this repo ever proved a bare `npm install`
+#      works there. That had been assumed.
+#
+# Deliberately NOT here: publishing. Nothing in this bucket is an npm package.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # Premise first: print what the next steps assert over. A uck missing from this
+      # list would make a green run mean nothing.
+      - name: enumerate ucks
+        run: |
+          for d in */; do
+            [ -f "$d/index.js" ] && echo "${d%/}"
+          done | tee /tmp/ucks.txt
+          n=$(wc -l < /tmp/ucks.txt)
+          echo "found $n uck(s)"
+          test "$n" -ge 1
+
+      - name: register() contract
+        run: |
+          # A real script, not `node -e` per uck. The inline form had to interpolate
+          # the dir name into a JS string AND hand-build a file:// URL, and on its
+          # first local run that imported nothing but MODULE_NOT_FOUND for all 14
+          # ucks -- a CI that fails for the wrong reason is worse than no CI.
+          cat > "$RUNNER_TEMP/regcheck.mjs" <<'SCRIPT'
+          import path from "node:path";
+          const [dir, self] = process.argv.slice(2);
+          const mod = await import(path.resolve(dir, "index.js"));
+          if (typeof mod.register !== "function") throw new Error("no register() export");
+          const u = mod.register({ registry: {}, self, ucks: {} });
+          for (const k of ["name", "desc", "run"]) {
+            if (!(k in u)) throw new Error(`register() result is missing '${k}'`);
+          }
+          if (typeof u.run !== "function") throw new Error("'run' is not a function");
+          if (!u.name) throw new Error("empty name");
+          SCRIPT
+          fails=0
+          # Bare dir names, one per line -- read straight into $d. An earlier version
+          # wrote "uck: <name>" and stripped it with ${line#uck:}, which leaves the
+          # LEADING SPACE, so every path became " ha" and all 14 ucks "failed" with
+          # MODULE_NOT_FOUND. A CI whose first run fails for a reason unrelated to the
+          # code is worse than no CI, so both steps now avoid string surgery entirely.
+          while read -r d; do
+            [ -n "$d" ] || continue
+            if node "$RUNNER_TEMP/regcheck.mjs" "$d" "$d" 2>/tmp/err.txt; then
+              echo "ok   ${d}"
+            else
+              echo "FAIL ${d}: $(head -c 300 /tmp/err.txt | tr '\n' ' ')"
+              fails=$((fails+1))
+            fi
+          done < /tmp/ucks.txt
+          echo "---- register() failures: $fails"
+          test "$fails" -eq 0
+
+      # Deps are gitignored here, so this is the only place a clean install is proven.
+      - name: dependency install from a clean checkout
+        run: |
+          fails=0; tried=0
+          while read -r d; do
+            [ -n "$d" ] || continue
+            deps=$(node -e '
+              const p = require("./'"$d"'/package.json");
+              console.log(Object.keys({ ...(p.dependencies || {}) }).length);
+            ' 2>/dev/null || echo 0)
+            if [ "$deps" = "0" ]; then echo "skip ${d} (no deps)"; continue; fi
+            tried=$((tried+1))
+            if (cd "$d" && npm install --no-audit --no-fund --loglevel=error) 2>/tmp/dep.txt; then
+              echo "ok   ${d} (${deps} dep(s) installed)"
+            else
+              echo "FAIL ${d}: npm install failed"
+              head -c 600 /tmp/dep.txt
+              fails=$((fails+1))
+            fi
+          done < /tmp/ucks.txt
+          echo "---- dep installs tried: $tried, failures: $fails"
+          test "$fails" -eq 0
+          # Guard the guard: if no uck declared deps, this step proved nothing it
+          # exists to prove, and a green check would be a lie about the deps.
+          test "$tried" -ge 1 || { echo "no uck declared deps - dep check is vacuous"; exit 1; }
