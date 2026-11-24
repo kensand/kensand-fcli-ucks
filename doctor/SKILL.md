@@ -150,6 +150,30 @@ Consumer rule: ask creds' own `resolveCred` first (CONTRACT §6.1), and if you m
 socket, read **both** `name` and `mirror:name`. `gh`, `ssh` and `ha` are verified
 mirror-aware. A single miss is weak evidence, not proof of absence.
 
+## Redaction surface (`creds-redaction`) and proving a branch that needs a locked store
+
+The creds CLI **redacts by default**: bare `f creds get <name>` prints
+`[redacted — pass --secrets to reveal]` — **37 characters / 39 bytes** (the em-dash is U+2014,
+3 bytes), plus a trailing newline, so `f creds get <cred> | wc -c` answers **40** — and it exits 0
+whether or not the subject is a secret. So "how many bytes does this cred yield?" measures the
+wrapper, never the value — and
+`f creds get X | f creds set X` once stored that placeholder as a live credential, after which
+every consumer died on code 8212 (the em-dash). The gate probes a few local names **bare** (what
+a script pipes) and cross-checks each against the creds **socket**, which answers structurally.
+
+A row here is one of: `INFO` (they all print the placeholder — expected, nothing broken),
+`RISK` (a cred resolves on the socket but the CLI hands back a tiny non-placeholder string), or
+`FAIL` (**could not list local creds at all** — the gate did not run, which is never a pass).
+
+The `FAIL` case needs a locked or unreachable store, which no harness can create without
+mutating the real one. `F_CREDS_LOCK_DIAG=1` substitutes that rejection at the call site so the
+branch is provable; no production path sets it. Test it the way the bug was found — patch the
+`f creds ls --all` call to reject with empty `stdout` and the reason on `stderr` in **both** the
+shipped file and a baseline copy of it, then compare rows. Baseline answered **zero
+`creds-redaction` rows** (a swallowed rejection is indistinguishable from a healthy box);
+shipped code answers the `FAIL` row. Any gate whose failure path is only reachable via a state
+you cannot produce is a gate you cannot test — make the unreachable state injectable instead.
+
 ## Patrol channels (`patrol-channels`)
 
 Every patrol lane resolves its server through a **name** before it touches the service, and a

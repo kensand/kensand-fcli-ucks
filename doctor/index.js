@@ -406,8 +406,9 @@ export function register(_ctx) {
         // grafana has NO `urls` verb (verified: `grep -n urls grafana/index.js` -> nothing),
         // so its base is read the same way its own resolve() reads it -- a cred lookup, no
         // HTTP call, no login. A bare read may be mirror-blind, hence the explicit mirror:
-        // key too. `--secrets` only: bare `f creds get` prints the 37-byte redaction
-        // placeholder, which would be parsed as a hostname.
+        // key too. `--secrets` only: bare `f creds get` prints the redaction placeholder
+        // (40 bytes including its newline, 37 characters without it -- see the
+        // creds-redaction gate below), which would be parsed as a hostname.
         let grafBase = { out: "", err: "" };
         for (const nm of ["grafana-host", "mirror:grafana-host"]) {
           const v = await readBase(["creds", "get", nm, "--secrets"]);
@@ -537,10 +538,16 @@ export function register(_ctx) {
             c.on("error", () => finish("unreachable"));
           });
           // REDACTION SHAPE — `f creds get` REDACTS BY DEFAULT: it prints a fixed
-          // placeholder (`[redacted — pass --secrets to reveal]`, 37 bytes) and exits 0
-          // whether or not the subject is a secret. Measured on this box: plain
-          // `f creds get <cred> | wc -c` answers **37 for every cred**, so a "how many
-          // bytes does this cred yield" check measures the WRAPPER, never the value. The
+          // placeholder (`[redacted — pass --secrets to reveal]`) and exits 0
+          // whether or not the subject is a secret. Its EXACT shape, re-measured on this box
+          // 2026-11-24 07:33Z: the string is **37 CHARACTERS / 39 BYTES** (the em-dash is
+          // U+2014, 3 bytes) and `f creds get <cred>` ends in a newline, so the literal
+          // command `f creds get <cred> | wc -c` answers **40 for every cred** -- 40 is the
+          // wrapper's answer too, which is exactly the point: a "how many bytes does this
+          // cred yield" check measures the WRAPPER, never the value. An earlier revision of
+          // this comment said `wc -c` answers 37; that was the CHARACTER count mislabelled as
+          // bytes, and anyone running the command it named would have seen 40 and concluded
+          // the gate's premise was broken. The
           // class has real damage behind it: `f creds get X | f creds set X` once stored
           // that placeholder as a live credential, and every consumer then died with a
           // ByteString error on code 8212 (the em-dash). `--secrets` DOES reveal the value
